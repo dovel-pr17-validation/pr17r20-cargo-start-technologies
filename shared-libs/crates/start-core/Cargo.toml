@@ -42,7 +42,7 @@ ts = [
 unstable = ["backtrace-on-stack-overflow"]
 
 [dependencies]
-aes = "0.9.1"
+aes = "0.9.3"
 async-compression = { version = "0.4.32", features = [
   "brotli",
   "gzip",
