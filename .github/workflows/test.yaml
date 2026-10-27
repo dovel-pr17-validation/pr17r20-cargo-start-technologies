@@ -1,0 +1,231 @@
+name: Automated Tests
+
+on:
+  workflow_call:
+  push:
+    branches:
+      - master
+      - integration/*
+    # A docs-only push to master needs no re-check — the PR that produced it
+    # already ran the prettier gate below. Pull requests intentionally do NOT
+    # ignore *.md (see the `prettier` job) so docs formatting is always checked.
+    paths-ignore:
+      - '**/*.md'
+  pull_request:
+    # The jobs below skip drafts, and `ready_for_review` is not a default
+    # activity type, so without it a draft marked ready is never checked.
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches:
+      - master
+      - integration/*
+      - live-docs
+
+concurrency:
+  group: automated-tests-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODEJS_VERSION: '24.17.0'
+  ENVIRONMENT: dev-unstable
+
+jobs:
+  # Fast (~20s) prettier gate: no docker, no npm ci, no paths filter. Runs on
+  # every non-draft PR (including docs-only ones) and on non-docs pushes, so an
+  # unformatted file is caught in seconds. The heavy jobs below `needs:` this, so
+  # a formatting slip short-circuits them instead of burning the full matrix.
+  prettier:
+    name: Prettier
+    if: github.event.pull_request.draft != true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check pull request retarget coverage
+        run: .github/scripts/check-pr-retarget-workflows.py
+      - name: Check Rust builder selection
+        run: bash build/tests/rust-builder-selection-test.sh
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODEJS_VERSION }}
+      - name: Check formatting
+        run: npx --yes --package="prettier@$(node -p "require('./package.json').devDependencies.prettier")" -- npm run format:check
+
+  changelog:
+    name: Changelog fragments & versions
+    if: github.event.pull_request.draft != true && github.base_ref != 'live-docs'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODEJS_VERSION }}
+      - name: Validate fragments and release severity
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --tags origin
+          if [ -n "$PR_BASE_SHA" ]; then
+            git fetch --no-tags origin "$PR_BASE_SHA"
+            products=$(node scripts/changelog.mjs changed "$PR_BASE_SHA")
+          else
+            products=$(node scripts/changelog.mjs projects)
+          fi
+          for product in $products; do
+            node scripts/changelog.mjs check-version "projects/${product#projects/}"
+          done
+      - name: Check changelog and release tooling
+        run: make release-notes-test
+
+  # On pull requests, the expensive jobs below only run when a non-docs file
+  # changed. Markdown-only PRs run formatting and changelog validation, skipping
+  # make test / the rustfmt container / the artifact regen here. Every
+  # live-docs PR is limited to the published books by its separate guard and
+  # only needs the prettier gate. On push/dispatch this guard is bypassed and
+  # the expensive jobs always run.
+  changes:
+    name: Detect non-docs changes
+    if: github.event_name == 'pull_request' && github.event.pull_request.draft != true && github.base_ref != 'live-docs'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - name: Check changed paths
+        id: filter
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          files="$(gh api --paginate \
+            "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
+            --jq '.[].filename')"
+          code="$(printf '%s\n' "$files" | grep -vE '(\.md$|^$)' || true)"
+          if [ -n "$code" ]; then
+            echo "Non-docs files changed:"; printf '  %s\n' "$code"
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Only docs (*.md) changed; heavy jobs skipped (prettier still ran)."
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  test:
+    name: Run Automated Tests
+    needs: [prettier, changes]
+    if: >-
+      !cancelled() && needs.prettier.result == 'success'
+      && github.event.pull_request.draft != true
+      && (github.event_name != 'pull_request' || needs.changes.outputs.code == 'true')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-build
+        with:
+          nodejs-version: ${{ env.NODEJS_VERSION }}
+          free-space: 'false'
+          setup-docker: 'false'
+          setup-sccache: 'false'
+
+      - name: Validate upload action
+        run: |
+          npm --prefix .github/actions/upload-each ci
+          npm --prefix .github/actions/upload-each test
+          npm --prefix .github/actions/upload-each run build
+          test -z "$(git status --porcelain --untracked-files=all -- .github/actions/upload-each/dist)"
+
+      - name: Install Bash completion test dependency
+        run: sudo apt-get install -y bash-completion
+
+      - name: Build And Run Tests
+        run: make test
+
+  format:
+    name: Formatting & Lockfiles
+    needs: [prettier, changes]
+    if: >-
+      !cancelled() && needs.prettier.result == 'success'
+      && github.event.pull_request.draft != true
+      && (github.event_name != 'pull_request' || needs.changes.outputs.code == 'true')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-build
+        with:
+          nodejs-version: ${{ env.NODEJS_VERSION }}
+          free-space: 'true'
+          setup-docker: 'false'
+          setup-sccache: 'false'
+      # `npm ci` fails if a lockfile is out of sync with its package.json, unlike the
+      # build's `npm i` which silently rewrites it. This is the lockfile-drift gate.
+      # web and the SDK both resolve start-core via file:shared-libs/ts-modules/start-core/dist,
+      # so it must exist before their npm ci.
+      - name: Build start-core
+        run: cd shared-libs/ts-modules/start-core && make dist
+      - name: Validate SDK lockfiles
+        run: |
+          npm --prefix shared-libs/ts-modules/start-core ci
+          npm --prefix projects/start-sdk ci
+      - name: Validate web lockfile
+        run: npm ci
+      - name: Validate package CI variants and forge operations
+        run: make package-ci-test
+      - name: Verify action entrypoints on Node 20
+        run: npm exec --yes --package=node@20.20.2 -- node --test .github/actions/tests/entrypoints.test.mjs
+      - name: Check formatting
+        run: make format-check
+
+  licenses:
+    name: Dependency Licenses
+    needs: [prettier, changes]
+    if: >-
+      !cancelled() && needs.prettier.result == 'success'
+      && github.event.pull_request.draft != true
+      && (github.event_name != 'pull_request' || needs.changes.outputs.code == 'true')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      # Checks the Cargo graph against deny.toml, so our binaries only ever link
+      # licenses whose obligations we can meet while shipping under MIT.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses
+
+  generated:
+    name: Generated Artifacts
+    needs: [prettier, changes]
+    if: >-
+      !cancelled() && needs.prettier.result == 'success'
+      && github.event.pull_request.draft != true
+      && (github.event_name != 'pull_request' || needs.changes.outputs.code == 'true')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-build
+        with:
+          nodejs-version: ${{ env.NODEJS_VERSION }}
+          free-space: 'true'
+          setup-docker: 'false'
+          setup-sccache: 'true'
+      # The bindings regen prettifies generated .ts via start-core's node deps.
+      - name: Install start-core node deps
+        run: npm --prefix shared-libs/ts-modules/start-core ci
+      - name: Check man pages up to date
+        run: make manpages-check
+      - name: Check TS bindings up to date
+        if: '!cancelled()'
+        run: make start-core-ts-bindings-check
+      # A failed gate leaves its regenerated files in the working tree.
+      - name: Upload regenerated artifacts
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: generated-artifacts
+          path: |
+            shared-libs/ts-modules/start-core/lib/osBindings
+            projects/start-cli/man
+            projects/start-registry/man
+            projects/start-tunnel/man
+            projects/start-os/man

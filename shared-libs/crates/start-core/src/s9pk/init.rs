@@ -1,0 +1,925 @@
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
+
+use clap::Parser;
+use ed25519_dalek::SigningKey;
+use futures::future::{BoxFuture, FutureExt};
+use serde::{Deserialize, Serialize};
+use tokio::process::Command;
+
+use crate::PackageId;
+use crate::context::CliContext;
+use crate::developer::{migrate_legacy_key_file, write_signing_key};
+use crate::prelude::*;
+use crate::util::Invoke;
+use crate::util::serde::IoFormat;
+
+/// Per-workspace state directory, created at the workspace root. Its presence is
+/// the marker that both `init-package` and start-cli walk up from cwd to find;
+/// `schema` (in config.yaml) lets a future change migrate the contract.
+pub const STARTOS_DIR: &str = ".startos";
+/// Workspace-scoped ed25519 signing key (PKCS#8 PEM). Generated once and never
+/// overwritten — it signs the packages built in this workspace.
+pub const BUILD_KEY_FILE: &str = "build.key.pem";
+/// Pre-1.1.0 name of [`BUILD_KEY_FILE`], still recognized on load.
+// TODO: remove this legacy-filename support after a few releases.
+pub const LEGACY_BUILD_KEY_FILE: &str = "build-key";
+/// Workspace config: named host and registry targets the packager switches
+/// between. The `host` block ships commented out: an unset host falls back to
+/// `http://localhost`, while a placeholder `.local` name is resolved eagerly by
+/// `CliContext::init` and its failure aborts *every* command — including
+/// `s9pk pack`, which never opens a socket.
+const CONFIG_FILE: &str = "config.yaml";
+const WORKSPACE_CONFIG_CONTENTS: &str = r#"schema: 1
+# The StartOS devices you install to. Uncomment and set `default` to your own
+# box's address — shown in its web interface — to enable `make install`.
+# host:
+#   default: https://server-name.local
+registry:
+  default: https://alpha-registry-x.start9.com
+  beta: https://beta-registry.start9.com
+  prod: https://registry.start9.com
+"#;
+
+/// Published packaging guide, surfaced when init-workspace refuses to scaffold inside
+/// a package repo.
+const DOCS_URL: &str = "https://docs.start9.com/packaging/environment-setup.html";
+
+/// Default source for the packaging guide (which also carries the package template).
+/// The guide lives in the start-technologies monorepo, and the clone takes the whole
+/// tree: past the guide, packagers get the SDK and StartOS source to answer questions
+/// the guide can't, and a repo they can open a fix PR from. `--filter=blob:none` keeps
+/// it cheap (blobs fetch on demand) while leaving full history, so `log`/`blame`/rebase
+/// all work. Re-point the `start-technologies` remote afterward to track a fork; the
+/// session-start sync follows whatever remote is configured.
+const MONOREPO_URL: &str = "https://github.com/Start9Labs/start-technologies.git";
+/// Workspace-relative path to the monorepo checkout that carries the guide.
+const MONOREPO_DIR: &str = "start-technologies";
+/// Branch the workspace tracks: what every product has published. master carries the
+/// SDK that has not shipped, whose guide and template describe a version npm cannot
+/// resolve.
+const MONOREPO_BRANCH: &str = "live-docs";
+/// Symlink target for the workspace `AGENTS.md` — the guide's canonical copy, so
+/// a sync keeps the workspace context current with no extra step. It is also a page
+/// of the published guide, so packagers can read it without scaffolding a workspace.
+const AGENTS_SYMLINK_TARGET: &str =
+    "start-technologies/projects/start-sdk/docs/src/agent-context.md";
+/// Where the workspace `AGENTS.md` pointed before the context became a guide page. Nothing
+/// lives there now, so a workspace scaffolded by an older start-cli has a dangling link;
+/// a re-run repoints it.
+const LEGACY_AGENTS_SYMLINK_TARGET: &str = "start-technologies/projects/start-sdk/docs/AGENTS.md";
+/// Path to the package template inside the cloned guide (joined onto MONOREPO_DIR).
+const TEMPLATE_SUBPATH: &str = "projects/start-sdk/docs/package-template";
+/// The packaging skills inside the cloned guide (joined onto MONOREPO_DIR). They live
+/// in the book's tree so a change to one reaches `live-docs` the way a page does.
+const SKILLS_SUBPATH: &str = "projects/start-sdk/docs/skills";
+/// Workspace directories whose `skills` entry is linked at the guide's skills, one per
+/// agent that discovers skills there: `.claude` for Claude Code, `.agents` for Codex.
+const SKILL_LINK_DIRS: &[&str] = &[".claude", ".agents"];
+/// Manifest naming the published `start-cli` (joined onto MONOREPO_DIR). The checkout
+/// tracks releases, so this is the version a packager should be running.
+const CLI_MANIFEST_SUBPATH: &str = "projects/start-cli/Cargo.toml";
+
+/// Claude Code does not auto-read `AGENTS.md`, so the workspace `CLAUDE.md`
+/// imports both it and the user's local prefs.
+const CLAUDE_MD_CONTENTS: &str = "@AGENTS.md\n@AGENTS.local.md\n";
+
+/// Created once and never overwritten by a sync — the user's own context.
+const AGENTS_LOCAL_STUB: &str = include_str!("AGENTS.local.md.template");
+
+#[derive(Deserialize, Serialize, Parser)]
+#[group(skip)]
+pub struct InitWorkspaceParams {
+    #[arg(help = "help.arg.workspace-path")]
+    path: Option<PathBuf>,
+}
+
+/// Prepare a directory so any AI assistant working in it has the latest packaging
+/// context in scope. Clones the guide, links the context files, and provisions
+/// `.startos/` (a workspace signing key + target config). Idempotent: a re-run only
+/// fills in what's missing; updates to the guide happen via the session-start sync
+/// documented in `AGENTS.md`.
+pub async fn init_workspace(
+    _: CliContext,
+    InitWorkspaceParams { path }: InitWorkspaceParams,
+) -> Result<(), Error> {
+    let root = if let Some(path) = path {
+        path
+    } else {
+        std::env::current_dir().with_kind(ErrorKind::Filesystem)?
+    };
+    tokio::fs::create_dir_all(&root)
+        .await
+        .with_ctx(|_| (ErrorKind::Filesystem, root.display().to_string()))?;
+    let root = tokio::fs::canonicalize(&root)
+        .await
+        .with_ctx(|_| (ErrorKind::Filesystem, root.display().to_string()))?;
+
+    // Refuse to turn a package repo into a workspace. A workspace is the *parent*
+    // directory that holds package repos; a `*-startos` package is not one. Point at
+    // the parent, which is where the workspace belongs.
+    if let Some(repo) = find_enclosing_package_repo(&root) {
+        let parent = repo.parent().unwrap_or(repo.as_path());
+        return Err(Error::new(
+            eyre!(
+                "{}",
+                t!(
+                    "s9pk.init.in-package-repo",
+                    path = repo.display().to_string(),
+                    parent = parent.display().to_string(),
+                    docs = DOCS_URL
+                )
+            ),
+            ErrorKind::InvalidRequest,
+        ));
+    }
+
+    // Nesting is allowed: a workspace inside a workspace is fine. When building,
+    // signing, or reading config, start-cli walks up from the cwd and uses the nearest
+    // `.startos/`, so a nested workspace transparently overrides an outer one — no need
+    // to look at, or refuse, an enclosing workspace here.
+
+    // Provision the guide. Clone only when absent — refreshing is the session-start sync's
+    // job, not this command's — so an existing checkout is left untouched. `exists()`
+    // follows symlinks, so pointing `start-technologies` at a checkout you already maintain
+    // skips the clone entirely.
+    let docs = root.join(MONOREPO_DIR);
+    if !docs.exists() {
+        eprintln!("{}", t!("s9pk.init.cloning-guide"));
+        Command::new("git")
+            .arg("clone")
+            .arg("--filter=blob:none")
+            .arg("--branch")
+            .arg(MONOREPO_BRANCH)
+            .arg(MONOREPO_URL)
+            .arg(&docs)
+            .capture(false)
+            .invoke(ErrorKind::Git)
+            .await?;
+    } else {
+        warn_if_guide_off_branch(&root);
+    }
+
+    // Symlink (not a copy) so a guide sync keeps the workspace AGENTS.md current.
+    // symlink_metadata treats a broken link as present, so a re-run never clobbers.
+    let agents = root.join("AGENTS.md");
+    if tokio::fs::read_link(&agents)
+        .await
+        .is_ok_and(|target| target == Path::new(LEGACY_AGENTS_SYMLINK_TARGET))
+    {
+        tokio::fs::remove_file(&agents)
+            .await
+            .with_ctx(|_| (ErrorKind::Filesystem, agents.display().to_string()))?;
+    }
+    if tokio::fs::symlink_metadata(&agents).await.is_err() {
+        tokio::fs::symlink(AGENTS_SYMLINK_TARGET, &agents)
+            .await
+            .with_ctx(|_| (ErrorKind::Filesystem, agents.display().to_string()))?;
+    }
+    write_if_absent(&root.join("AGENTS.local.md"), AGENTS_LOCAL_STUB).await?;
+    write_if_absent(&root.join("CLAUDE.md"), CLAUDE_MD_CONTENTS).await?;
+    link_guide_skills(&root)?;
+    // .startos/ marks the workspace and holds its signing key + target config. Written
+    // last, so only a fully provisioned directory counts as a workspace.
+    let startos = root.join(STARTOS_DIR);
+    tokio::fs::create_dir_all(&startos)
+        .await
+        .with_ctx(|_| (ErrorKind::Filesystem, startos.display().to_string()))?;
+    write_if_absent(&startos.join(CONFIG_FILE), WORKSPACE_CONFIG_CONTENTS).await?;
+    // Generated once and never regenerated — overwriting the build key would change
+    // the workspace's signing identity.
+    let build_key = startos.join(BUILD_KEY_FILE);
+    if tokio::fs::symlink_metadata(&build_key).await.is_err() {
+        // bind before the await so the !Send ThreadRng isn't held across it
+        let key = SigningKey::generate(&mut crate::util::crypto::os_rng());
+        write_signing_key(&key, &build_key).await?;
+    }
+
+    println!(
+        "{}",
+        t!(
+            "s9pk.init.workspace-ready",
+            path = root.display().to_string()
+        )
+    );
+    Ok(())
+}
+
+#[derive(Deserialize, Serialize, Parser)]
+#[group(skip)]
+pub struct InitPackageParams {
+    #[arg(help = "help.arg.package-display-name")]
+    name: String,
+}
+
+/// Scaffold a new package from the workspace's bundled template, interpolating the
+/// display name and a normalized ID, then `npm install` the result.
+pub async fn init_package(
+    _: CliContext,
+    InitPackageParams { name }: InitPackageParams,
+) -> Result<(), Error> {
+    let cwd = std::env::current_dir().with_kind(ErrorKind::Filesystem)?;
+    let root = find_workspace_root(&cwd)?.ok_or_else(|| {
+        Error::new(
+            eyre!("{}", t!("s9pk.init.not-in-workspace")),
+            ErrorKind::InvalidRequest,
+        )
+    })?;
+    warn_if_start_cli_outdated(&root);
+    warn_if_guide_off_branch(&root);
+
+    // Normalize to a candidate ID, then validate it through the manifest's own
+    // rules rather than re-implementing them.
+    let id = normalize_id(&name);
+    PackageId::from_str(&id).map_err(|_| {
+        Error::new(
+            eyre!(
+                "{}",
+                t!("s9pk.init.invalid-package-name", name = name.as_str())
+            ),
+            ErrorKind::InvalidId,
+        )
+    })?;
+
+    let dst = cwd.join(format!("{id}-startos"));
+    if dst.exists() {
+        return Err(Error::new(
+            eyre!(
+                "{}",
+                t!("s9pk.init.package-exists", path = dst.display().to_string())
+            ),
+            ErrorKind::InvalidRequest,
+        ));
+    }
+
+    let template = root.join(MONOREPO_DIR).join(TEMPLATE_SUBPATH);
+    if !template.exists() {
+        return Err(Error::new(
+            eyre!(
+                "{}",
+                t!(
+                    "s9pk.init.template-missing",
+                    path = template.display().to_string()
+                )
+            ),
+            ErrorKind::NotFound,
+        ));
+    }
+
+    copy_template_interpolated(&template, &dst, &id, &name).await?;
+
+    // A package is its own git repo — initialize one so version-hash stamping and the
+    // shipped CI workflows work. No commit is made; the first commit is the packager's.
+    Command::new("git")
+        .arg("init")
+        .arg("-q")
+        .current_dir(&dst)
+        .invoke(ErrorKind::Git)
+        .await?;
+
+    eprintln!("{}", t!("s9pk.init.installing-deps"));
+    Command::new("npm")
+        .arg("install")
+        .current_dir(&dst)
+        .capture(false)
+        .invoke(ErrorKind::Network)
+        .await?;
+
+    println!(
+        "{}",
+        t!(
+            "s9pk.init.package-created",
+            id = id,
+            path = dst.display().to_string()
+        )
+    );
+    Ok(())
+}
+
+/// Warn when the workspace names a newer `start-cli` than the one running. `start-cli`
+/// installs outside the workspace, so nothing else would ever say so: on Debian apt
+/// carries it forward, and everywhere else the installer is the only update path.
+///
+/// Best-effort, and at most once per process — a stale binary is worth a line, never an
+/// error, so every unreadable or unparseable case is silent.
+pub fn warn_if_start_cli_outdated(workspace: &Path) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        // Off `live-docs` the manifest names a version that has not shipped.
+        if guide_branch(workspace).as_deref() != Some(MONOREPO_BRANCH) {
+            return;
+        }
+        let Ok(manifest) =
+            std::fs::read_to_string(workspace.join(MONOREPO_DIR).join(CLI_MANIFEST_SUBPATH))
+        else {
+            return;
+        };
+        let published = serde_toml::from_str::<serde_toml::Table>(&manifest)
+            .ok()
+            .and_then(|manifest| {
+                semver::Version::parse(
+                    manifest
+                        .get("package")?
+                        .as_table()?
+                        .get("version")?
+                        .as_str()?,
+                )
+                .ok()
+            });
+        let (Some(published), Ok(running)) = (
+            published,
+            semver::Version::parse(crate::bins::cli_version()),
+        ) else {
+            return;
+        };
+        if published > running {
+            eprintln!(
+                "{}",
+                t!(
+                    "s9pk.init.start-cli-outdated",
+                    running = running.to_string(),
+                    published = published.to_string()
+                )
+            );
+        }
+    });
+}
+
+fn guide_branch(workspace: &Path) -> Option<String> {
+    let dot_git = workspace.join(MONOREPO_DIR).join(".git");
+    let git_dir = match std::fs::read_to_string(&dot_git) {
+        Ok(gitfile) => dot_git
+            .parent()?
+            .join(gitfile.strip_prefix("gitdir:")?.trim()),
+        Err(_) => dot_git,
+    };
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    Some(head.trim().strip_prefix("ref: refs/heads/")?.to_owned())
+}
+
+fn init_workspace_command(workspace: &Path) -> Option<String> {
+    Some(format!(
+        "start-cli s9pk init-workspace '{}'",
+        workspace.to_str()?.replace('\'', "'\\''")
+    ))
+}
+
+fn warn_if_guide_off_branch(workspace: &Path) {
+    let Some(branch) = guide_branch(workspace).filter(|branch| branch != MONOREPO_BRANCH) else {
+        return;
+    };
+    let docs = workspace.join(MONOREPO_DIR);
+    let next = match init_workspace_command(workspace) {
+        Some(command) => t!("s9pk.init.run-init-workspace", command = command).to_string(),
+        None => t!("s9pk.init.run-init-workspace-in-root").to_string(),
+    };
+    if std::fs::symlink_metadata(&docs).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        let target = std::fs::canonicalize(&docs).unwrap_or_else(|_| docs.clone());
+        eprintln!(
+            "{}",
+            t!(
+                "s9pk.init.guide-linked-off-branch",
+                path = docs.display().to_string(),
+                target = target.display().to_string(),
+                branch = branch,
+                expected = MONOREPO_BRANCH,
+                next = next
+            )
+        );
+    } else {
+        eprintln!(
+            "{}",
+            t!(
+                "s9pk.init.guide-off-branch",
+                path = docs.display().to_string(),
+                branch = branch,
+                expected = MONOREPO_BRANCH,
+                next = next
+            )
+        );
+    }
+}
+
+/// Walk up from `start` (inclusive) for the nearest workspace — a directory whose
+/// `.startos` is a provisioned marker (`build.key.pem` or a schema config). `init-package`
+/// scaffolds into whatever this returns, so with nested workspaces it targets the
+/// innermost one. A bare/legacy `.startos` (no build key, no schema) isn't a marker.
+fn find_workspace_root(start: &Path) -> Result<Option<PathBuf>, Error> {
+    let mut dir = start.to_path_buf();
+    loop {
+        let startos = dir.join(STARTOS_DIR);
+        match std::fs::metadata(&startos) {
+            Ok(meta) if meta.is_dir() && startos_dir_is_marker(&startos) => {
+                return Ok(Some(dir));
+            }
+            // Present but not a provisioned marker (e.g. the legacy global config) —
+            // keep walking up.
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            // EACCES (or any other IO error) on an ancestor — treat as "no
+            // accessible workspace here" and stop walking.
+            Err(_) => return Ok(None),
+        }
+        if !dir.pop() {
+            return Ok(None);
+        }
+    }
+}
+
+/// Minimal probe: a provisioned workspace `config.yaml` is schema-tagged; a bare or
+/// legacy flat config is not, so it fails to deserialize here.
+#[derive(Deserialize)]
+struct SchemaProbe {
+    #[allow(dead_code)]
+    schema: u64,
+}
+
+/// A `.startos` dir counts as a provisioned workspace once it holds a build key or a
+/// schema-tagged config.
+fn startos_dir_is_marker(startos: &Path) -> bool {
+    // TODO: remove the legacy-filename check after a few releases.
+    if startos.join(BUILD_KEY_FILE).exists() || startos.join(LEGACY_BUILD_KEY_FILE).exists() {
+        return true;
+    }
+    std::fs::File::open(startos.join(CONFIG_FILE))
+        .ok()
+        .and_then(|f| IoFormat::Yaml.from_reader::<_, SchemaProbe>(f).ok())
+        .is_some()
+}
+
+/// Heuristic for a StartOS package repo: a `package.json` that depends on the
+/// packaging SDK, or the scaffolded `startos/` source layout.
+fn is_package_repo(dir: &Path) -> bool {
+    if let Ok(pkg) = std::fs::read_to_string(dir.join("package.json")) {
+        if pkg.contains("@start9labs/start-sdk") {
+            return true;
+        }
+    }
+    let startos = dir.join("startos");
+    startos.join("manifest").is_dir() || startos.join("index.ts").is_file()
+}
+
+/// Walk up from `start` (inclusive) for the nearest enclosing package repo, so a
+/// workspace is never initialized inside one. Stops at a workspace marker: an enclosing
+/// workspace is fine (nesting is allowed) and bounds the walk.
+fn find_enclosing_package_repo(start: &Path) -> Option<PathBuf> {
+    let mut dir = start.to_path_buf();
+    loop {
+        if is_package_repo(&dir) {
+            return Some(dir);
+        }
+        let startos = dir.join(STARTOS_DIR);
+        if std::fs::metadata(&startos)
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
+            && startos_dir_is_marker(&startos)
+        {
+            return None;
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+/// The error to surface when an s9pk build/sign needs a workspace signing key but none
+/// exists above the cwd. We want packagers to run `init-workspace` (it also brings the
+/// guide + AGENTS.md/CLAUDE.md), so this points the way rather than falling back to any
+/// key. If the cwd is inside a package repo, it names the parent — where the workspace
+/// belongs — so an existing package repo is one `init-workspace` away from building.
+pub(crate) fn no_workspace_error() -> Error {
+    no_workspace_error_at(std::env::current_dir().ok().as_deref())
+}
+
+fn no_workspace_error_at(cwd: Option<&Path>) -> Error {
+    let msg = match cwd.and_then(find_enclosing_package_repo) {
+        Some(repo) => {
+            let parent = repo.parent().unwrap_or(repo.as_path());
+            t!(
+                "s9pk.init.no-workspace-in-package-repo",
+                repo = repo.display().to_string(),
+                parent = parent.display().to_string(),
+                docs = DOCS_URL
+            )
+            .to_string()
+        }
+        None => t!("s9pk.init.no-workspace", docs = DOCS_URL).to_string(),
+    };
+    Error::new(eyre!("{msg}"), ErrorKind::Uninitialized)
+}
+
+/// Normalize a human display name to a candidate package ID: lowercase ASCII
+/// alphanumerics, runs of whitespace/underscore/hyphen collapsed to a single
+/// hyphen, every other character dropped, no leading or trailing hyphen. Validity
+/// (non-empty, matches the manifest's ID rules) is the caller's check.
+fn normalize_id(name: &str) -> String {
+    let mut out = String::new();
+    let mut pending_sep = false;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            if pending_sep && !out.is_empty() {
+                out.push('-');
+            }
+            pending_sep = false;
+            out.push(ch.to_ascii_lowercase());
+        } else if ch.is_whitespace() || ch == '_' || ch == '-' {
+            pending_sep = true;
+        }
+        // any other character is dropped without forcing a separator
+    }
+    out
+}
+
+/// Recursively copy `src` to `dst`, replacing `{{id}}`/`{{name}}` in text files.
+/// `{{id}}` is already validated as safe; `{{name}}` is escaped for TypeScript
+/// string literals when writing `.ts` files. Non-UTF-8 files are copied verbatim.
+fn copy_template_interpolated<'a>(
+    src: &'a Path,
+    dst: &'a Path,
+    id: &'a str,
+    name: &'a str,
+) -> BoxFuture<'a, Result<(), Error>> {
+    async move {
+        tokio::fs::create_dir_all(dst)
+            .await
+            .with_ctx(|_| (ErrorKind::Filesystem, dst.display().to_string()))?;
+        let mut entries = tokio::fs::read_dir(src)
+            .await
+            .with_ctx(|_| (ErrorKind::Filesystem, src.display().to_string()))?;
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .with_kind(ErrorKind::Filesystem)?
+        {
+            let file_name = entry.file_name();
+            // Defensive: never carry build/VCS cruft into the scaffold.
+            if matches!(
+                file_name.to_str(),
+                Some("node_modules") | Some(".git") | Some("javascript")
+            ) {
+                continue;
+            }
+            let from = entry.path();
+            let to = dst.join(&file_name);
+            let file_type = entry.file_type().await.with_kind(ErrorKind::Filesystem)?;
+            if file_type.is_dir() {
+                copy_template_interpolated(&from, &to, id, name).await?;
+            } else if file_type.is_file() {
+                let bytes = tokio::fs::read(&from)
+                    .await
+                    .with_ctx(|_| (ErrorKind::Filesystem, from.display().to_string()))?;
+                let escape_for_ts = from.extension().and_then(|e| e.to_str()) == Some("ts");
+                let rendered = match String::from_utf8(bytes) {
+                    Ok(text) => interpolate(&text, id, name, escape_for_ts).into_bytes(),
+                    Err(e) => e.into_bytes(),
+                };
+                tokio::fs::write(&to, rendered)
+                    .await
+                    .with_ctx(|_| (ErrorKind::Filesystem, to.display().to_string()))?;
+            }
+            // symlinks (none expected in the template) are skipped
+        }
+        Ok(())
+    }
+    .boxed()
+}
+
+fn interpolate(content: &str, id: &str, name: &str, escape_for_ts: bool) -> String {
+    let name = if escape_for_ts {
+        name.replace('\\', "\\\\").replace('\'', "\\'")
+    } else {
+        name.to_owned()
+    };
+    content.replace("{{id}}", id).replace("{{name}}", &name)
+}
+
+/// Walk up from `start` (inclusive) for the nearest signing workspace: a directory whose
+/// `.startos` holds the build key, renaming a legacy-named key on the way. A config-only
+/// workspace is passed over, and an inaccessible ancestor ends the walk.
+pub fn find_signing_workspace(start: &Path) -> Option<PathBuf> {
+    let mut dir = start.to_path_buf();
+    loop {
+        let startos = dir.join(STARTOS_DIR);
+        let key = startos.join(BUILD_KEY_FILE);
+        migrate_legacy_key_file(&key, &startos.join(LEGACY_BUILD_KEY_FILE));
+        match key.try_exists() {
+            Ok(true) => return Some(dir),
+            Ok(false) => {}
+            Err(_) => return None,
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+/// Every command's pass over the signing workspace it runs in: say when start-cli is
+/// behind, and fill in what an older start-cli left out. Nothing here fails a command.
+pub fn complete_signing_workspace(start: &Path) -> Option<PathBuf> {
+    let root = find_signing_workspace(start)?;
+    warn_if_start_cli_outdated(&root);
+    let _ = link_guide_skills(&root);
+    Some(root)
+}
+
+/// Leaves an existing `skills` entry alone, a packager's own directory included, and
+/// links nothing while the guide checkout lacks the target: the sync brings it first.
+pub fn link_guide_skills(root: &Path) -> Result<(), Error> {
+    if !root.join(MONOREPO_DIR).join(SKILLS_SUBPATH).is_dir() {
+        return Ok(());
+    }
+    let target = Path::new("..").join(MONOREPO_DIR).join(SKILLS_SUBPATH);
+    for dir in SKILL_LINK_DIRS {
+        let dir = root.join(dir);
+        std::fs::create_dir_all(&dir)
+            .with_ctx(|_| (ErrorKind::Filesystem, dir.display().to_string()))?;
+        let link = dir.join("skills");
+        if std::fs::symlink_metadata(&link).is_err() {
+            std::os::unix::fs::symlink(&target, &link)
+                .with_ctx(|_| (ErrorKind::Filesystem, link.display().to_string()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Write `contents` to `path` only if nothing is there yet (a broken symlink
+/// counts as present, so a re-run never clobbers).
+async fn write_if_absent(path: &Path, contents: &str) -> Result<(), Error> {
+    if tokio::fs::symlink_metadata(path).await.is_err() {
+        tokio::fs::write(path, contents)
+            .await
+            .with_ctx(|_| (ErrorKind::Filesystem, path.display().to_string()))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    /// A fresh, empty temp dir unique to each call (no external crate needed).
+    fn tmp() -> PathBuf {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "s9pk-init-test-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn guide_branch_reads_the_checkouts_own_head() {
+        let ws = tmp();
+        assert_eq!(guide_branch(&ws), None);
+
+        let git = ws.join(MONOREPO_DIR).join(".git");
+        std::fs::create_dir_all(&git).unwrap();
+        std::fs::write(git.join("HEAD"), "ref: refs/heads/master\n").unwrap();
+        assert_eq!(guide_branch(&ws).as_deref(), Some("master"));
+
+        std::fs::write(git.join("HEAD"), "ref: refs/heads/live-docs\n").unwrap();
+        assert_eq!(guide_branch(&ws).as_deref(), Some(MONOREPO_BRANCH));
+
+        // detached
+        std::fs::write(
+            git.join("HEAD"),
+            "0123456789abcdef0123456789abcdef01234567\n",
+        )
+        .unwrap();
+        assert_eq!(guide_branch(&ws), None);
+    }
+
+    #[test]
+    fn guide_branch_follows_a_gitfile() {
+        // a linked worktree or submodule keeps HEAD where its `.git` file points
+        let ws = tmp();
+        let docs = ws.join(MONOREPO_DIR);
+        std::fs::create_dir_all(&docs).unwrap();
+        let git_dir = ws.join("elsewhere/.git/worktrees/x");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/feature/x\n").unwrap();
+
+        std::fs::write(
+            docs.join(".git"),
+            format!("gitdir: {}\n", git_dir.display()),
+        )
+        .unwrap();
+        assert_eq!(guide_branch(&ws).as_deref(), Some("feature/x"));
+
+        std::fs::write(docs.join(".git"), "gitdir: ../elsewhere/.git/worktrees/x\n").unwrap();
+        assert_eq!(guide_branch(&ws).as_deref(), Some("feature/x"));
+    }
+
+    #[test]
+    fn guide_skills_are_linked_for_every_agent_and_never_clobbered() {
+        let ws = tmp();
+        let skills = ws.join(MONOREPO_DIR).join(SKILLS_SUBPATH);
+        std::fs::create_dir_all(skills.join("package-service")).unwrap();
+        std::fs::create_dir_all(ws.join(".claude/skills/mine")).unwrap();
+
+        link_guide_skills(&ws).unwrap();
+        link_guide_skills(&ws).unwrap();
+
+        assert_eq!(
+            std::fs::read_link(ws.join(".agents/skills")).unwrap(),
+            Path::new("../start-technologies/projects/start-sdk/docs/skills")
+        );
+        assert!(ws.join(".agents/skills/package-service").is_dir());
+        // a packager's own skills directory is kept, not replaced by the link
+        assert!(ws.join(".claude/skills/mine").is_dir());
+        assert!(std::fs::read_link(ws.join(".claude/skills")).is_err());
+    }
+
+    // The links belong beside the key init-workspace provisioned, not in whichever
+    // config layer resolves first; nested cwd, an outer config-only workspace, and a
+    // legacy-named key all have to land in the same place.
+    #[test]
+    fn completion_lands_on_the_nearest_signing_workspace() {
+        let outer = tmp();
+        std::fs::create_dir_all(outer.join(STARTOS_DIR)).unwrap();
+        std::fs::write(
+            outer.join(STARTOS_DIR).join(CONFIG_FILE),
+            WORKSPACE_CONFIG_CONTENTS,
+        )
+        .unwrap();
+        std::fs::create_dir_all(outer.join(MONOREPO_DIR).join(SKILLS_SUBPATH)).unwrap();
+        let inner = outer.join("services");
+        std::fs::create_dir_all(inner.join(STARTOS_DIR)).unwrap();
+        std::fs::write(inner.join(STARTOS_DIR).join(LEGACY_BUILD_KEY_FILE), "key").unwrap();
+        std::fs::create_dir_all(inner.join(MONOREPO_DIR).join(SKILLS_SUBPATH)).unwrap();
+        let cwd = inner.join("registry/foo-startos/startos");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        assert_eq!(
+            complete_signing_workspace(&cwd).as_deref(),
+            Some(inner.as_path())
+        );
+
+        assert!(inner.join(STARTOS_DIR).join(BUILD_KEY_FILE).is_file());
+        assert!(inner.join(".claude/skills").is_dir());
+        assert!(inner.join(".agents/skills").is_dir());
+        assert!(!outer.join(".claude").exists());
+        assert!(!outer.join(".agents").exists());
+        assert!(!cwd.join(".claude").exists());
+
+        assert_eq!(find_signing_workspace(&outer), None);
+        assert_eq!(complete_signing_workspace(&tmp()), None);
+    }
+
+    #[test]
+    fn guide_skills_are_not_linked_before_the_checkout_carries_them() {
+        // a guide checkout from before the skills shipped: the sync brings them, and the
+        // next command links them
+        let ws = tmp();
+        std::fs::create_dir_all(ws.join(MONOREPO_DIR)).unwrap();
+        link_guide_skills(&ws).unwrap();
+        assert!(!ws.join(".claude").exists());
+        assert!(!ws.join(".agents").exists());
+
+        std::fs::create_dir_all(ws.join(MONOREPO_DIR).join(SKILLS_SUBPATH)).unwrap();
+        link_guide_skills(&ws).unwrap();
+        assert!(ws.join(".claude/skills").is_dir());
+        assert!(ws.join(".agents/skills").is_dir());
+    }
+
+    #[test]
+    fn init_workspace_command_quotes_the_path() {
+        assert_eq!(
+            init_workspace_command(Path::new("/w s/it's")).as_deref(),
+            Some("start-cli s9pk init-workspace '/w s/it'\\''s'")
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let bad = Path::new(std::ffi::OsStr::from_bytes(b"/ws/\xff"));
+            assert_eq!(init_workspace_command(bad), None);
+        }
+    }
+
+    #[test]
+    fn scaffolded_config_parses_as_workspace() {
+        // the config init-workspace writes must load as the unified ClientConfig (its
+        // schema marker + registry profile map), which is what the runtime reads
+        // — not merely as schema-tagged YAML.
+        let config = IoFormat::Yaml
+            .from_reader::<_, crate::context::config::ClientConfig>(
+                WORKSPACE_CONFIG_CONTENTS.as_bytes(),
+            )
+            .unwrap();
+        assert!(config.schema.is_some());
+        assert!(
+            config
+                .registry
+                .is_some_and(|registry| !registry.0.is_empty())
+        );
+        // And it must scaffold no host at all. A placeholder is not inert: a `.local`
+        // one is pinned eagerly by CliContext::init, whose failure aborts every
+        // command — `s9pk pack` included, which never opens a socket.
+        assert!(config.host.is_none());
+    }
+
+    #[test]
+    fn marker_requires_build_key_or_schema_config() {
+        // empty .startos — not a marker
+        let d = tmp();
+        let startos = d.join(STARTOS_DIR);
+        std::fs::create_dir_all(&startos).unwrap();
+        assert!(!startos_dir_is_marker(&startos));
+
+        // legacy flat config (no schema) — not a marker
+        std::fs::write(startos.join(CONFIG_FILE), "host: https://x\n").unwrap();
+        assert!(!startos_dir_is_marker(&startos));
+
+        // schema config — marker
+        std::fs::write(startos.join(CONFIG_FILE), WORKSPACE_CONFIG_CONTENTS).unwrap();
+        assert!(startos_dir_is_marker(&startos));
+
+        // build key alone — marker (even with a flat config)
+        let d2 = tmp();
+        let s2 = d2.join(STARTOS_DIR);
+        std::fs::create_dir_all(&s2).unwrap();
+        std::fs::write(s2.join(CONFIG_FILE), "host: https://x\n").unwrap();
+        std::fs::write(s2.join(BUILD_KEY_FILE), "key").unwrap();
+        assert!(startos_dir_is_marker(&s2));
+    }
+
+    #[test]
+    fn detects_package_repo() {
+        let d = tmp();
+        assert!(!is_package_repo(&d));
+
+        std::fs::write(
+            d.join("package.json"),
+            r#"{ "dependencies": { "@start9labs/start-sdk": "2.0.1" } }"#,
+        )
+        .unwrap();
+        assert!(is_package_repo(&d));
+
+        let d2 = tmp();
+        std::fs::create_dir_all(d2.join("startos").join("manifest")).unwrap();
+        assert!(is_package_repo(&d2));
+
+        let d3 = tmp();
+        std::fs::create_dir_all(d3.join("startos")).unwrap();
+        std::fs::write(d3.join("startos").join("index.ts"), "export {}").unwrap();
+        assert!(is_package_repo(&d3));
+    }
+
+    #[test]
+    fn enclosing_package_repo_walks_up_and_stops_at_workspace() {
+        // a package repo with a nested subdir
+        let repo = tmp();
+        std::fs::write(
+            repo.join("package.json"),
+            r#"{ "dependencies": { "@start9labs/start-sdk": "2.0.1" } }"#,
+        )
+        .unwrap();
+        let nested = repo.join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert_eq!(
+            find_enclosing_package_repo(&nested).and_then(|p| p.canonicalize().ok()),
+            repo.canonicalize().ok()
+        );
+
+        // a workspace marker between the dir and any package repo halts the walk
+        let ws = tmp();
+        std::fs::create_dir_all(ws.join(STARTOS_DIR)).unwrap();
+        std::fs::write(
+            ws.join(STARTOS_DIR).join(CONFIG_FILE),
+            WORKSPACE_CONFIG_CONTENTS,
+        )
+        .unwrap();
+        let inside = ws.join("pkgs");
+        std::fs::create_dir_all(&inside).unwrap();
+        assert_eq!(find_enclosing_package_repo(&inside), None);
+    }
+
+    #[test]
+    fn no_workspace_error_points_at_package_repo_parent() {
+        let repo = tmp();
+        std::fs::write(
+            repo.join("package.json"),
+            r#"{ "dependencies": { "@start9labs/start-sdk": "2.0.1" } }"#,
+        )
+        .unwrap();
+        let sub = repo.join("startos");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        // inside a package repo → the error names the parent (the workspace location)
+        let msg = format!("{}", no_workspace_error_at(Some(&sub)));
+        assert!(
+            msg.contains(&repo.parent().unwrap().display().to_string()),
+            "{msg}"
+        );
+        assert!(msg.contains("init-workspace"), "{msg}");
+
+        // not in a package repo → generic message, still directs to init-workspace
+        let msg = format!("{}", no_workspace_error_at(Some(&tmp())));
+        assert!(msg.contains("init-workspace"), "{msg}");
+    }
+}

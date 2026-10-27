@@ -1,0 +1,14 @@
+# {marker} config for {name}
+{inbound_marker}
+
+[Interface]
+Address = {addr}
+PrivateKey = {privkey}
+DNS = {dns}
+
+[Peer]
+PublicKey = {server_pubkey}
+PresharedKey = {psk}
+AllowedIPs = {allowed}
+Endpoint = {server_addr}
+PersistentKeepalive = 25

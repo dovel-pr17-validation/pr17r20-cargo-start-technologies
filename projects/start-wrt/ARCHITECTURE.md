@@ -1,0 +1,177 @@
+# Architecture
+
+StartWRT is an OpenWrt-based router OS for home self-hosting. It pairs a Rust backend with an Angular frontend to expose advanced networking — per-device security profiles, VPN chaining, WiFi schedules — through a clean web interface.
+
+## Tech Stack
+
+- **Backend:** Rust (async/Tokio, Axum web framework)
+- **Frontend:** Angular + TypeScript + Taiga UI
+- **Router OS:** OpenWrt (SpacemiT K1 / BananaPi F3 target)
+- **Config storage:** UCI files (`/etc/config/`) — no separate database
+- **API:** JSON-RPC 2.0 over HTTP POST at `/rpc/v1`
+- **Auth:** Password login enrolls a browser-held Ed25519 key that signs every request (`start-core` signature auth); the CLI on the router uses a local token
+
+## Project Structure
+
+```
+/
+├── backend/             # Rust crates (members of the root Cargo workspace)
+│   ├── ctrl/            # RPC server + CLI binary ("startwrt")
+│   ├── uciedit/         # UCI config parser/writer library
+│   ├── uciedit_macros/  # #[derive(TypedSection)] proc macro
+│   ├── firstboot_config/# Factory-default UCI configs (staged into the image)
+│   ├── hotplug/         # Interface hotplug scripts (shipped into the image)
+│   ├── nftables/        # fw4 include files (shipped into the image)
+│   ├── config_experiments/ # Reference UCI configs for testing
+│   └── notes/           # Research notes
+│
+├── web/                 # Angular SPA
+│   └── src/app/
+│       ├── services/    # API, auth, form, RPC, connection, system
+│       ├── components/  # Shared UI (footer, masked, copy, schedule, etc.)
+│       ├── routes/      # Feature pages (wan, wifi, profiles, etc.)
+│       ├── help/        # Route-keyed contextual help (5 locales)
+│       ├── i18n/        # Translation pipe + locale dictionaries
+│       └── utils/       # Validators, masks, schedules
+│
+├── openwrt/             # OpenWrt build workspace (gitignored, no git repo; rebuilt by build/openwrt-setup.sh)
+├── openwrt-patches/     # Start9 patches to upstream OpenWrt files (patch -p1 at setup)
+├── openwrt-overlay/     # Start9 additions to the OpenWrt tree (spacemit target, boot pkgs; rsynced at setup)
+├── build/               # Build scripts, OpenWrt diffconfig + version pin
+├── bench/               # Live-bench driver for a physical test router (see AGENTS.md "Live bench")
+├── docs/                # User-facing docs book (src/, book.toml) + cross-cutting specs/proposals
+└── API_CONTRACT.md      # Complete RPC endpoint contract with Rust types
+```
+
+## Components
+
+- **`backend/`** — Rust daemon and CLI. Produces a single binary `startwrt` that is symlinked as `startwrt-ctrld` (daemon) and `startwrt-cli` (CLI). Handles all backend logic: RPC API, security profiles, WiFi, Ethernet, VPN, authentication, and UCI config management. See [backend/ARCHITECTURE.md](backend/ARCHITECTURE.md).
+
+- **`web/`** — Angular SPA using Taiga UI. Signal-based state, zoneless change detection, standalone components. Communicates with the backend over JSON-RPC 2.0 at `/rpc/v1`, plus the streaming and continuation routes listed under Data Flow. Embeds contextual help on every page. See [web/ARCHITECTURE.md](web/ARCHITECTURE.md).
+
+- **`openwrt/`** — Disposable build workspace (plain directory, no git repo) rebuilt by `build/openwrt-setup.sh` from the sha256-pinned upstream OpenWrt release tarball (`build/openwrt-version`) plus the Start9 delta: `openwrt-patches/` modifies a handful of upstream files (build infrastructure and a few runtime scripts), `openwrt-overlay/` adds the SpacemiT K1 target (`target/linux/spacemit/`) and boot packages (`opensbi-spacemit`, `uboot-spacemit`). The build system compiles the Rust backend + Angular frontend, stages them into `openwrt/files/`, and produces a flashable image.
+
+## Data Flow
+
+```
+Browser (Angular SPA)
+  → HTTP POST /rpc/v1  (JSON-RPC 2.0, X-Start-Auth-Sig request signature)
+  → Axum router on port 80/443
+  → start-core Auth middleware (verifies signature or local token, rate-limits login)
+  → rpc-toolkit handler dispatch
+  → Handler reads/writes UCI files via uciedit (arena-based, atomic writes)
+  → Handler calls /etc/init.d/<service> reload to apply changes
+  → JSON-RPC response back to browser
+```
+
+Additional HTTP routes:
+
+- `POST /api/setup/flash` — NDJSON streaming for setup wizard
+- `GET|POST /rest/rpc/{guid}` — Continuation endpoint for backup/restore/diagnostics
+- `GET /ws/rpc/{guid}` — WebSocket continuation for update progress and live logs
+- `GET /static/local-root-ca.crt`, `GET /static/local-root-ca.mobileconfig` — Root CA download, as a certificate or an Apple configuration profile (no auth)
+- `/cgi-bin/*`, `/luci-static/*`, `/ubus/*` — LuCI reverse proxy (localhost:8080); `/luci` redirects to `/cgi-bin/luci`
+- Fallback — Serves embedded web UI
+
+The daemon also runs **port-control servers** (`ctrl/src/port_control.rs`) for
+automatic port forwarding: a PCP server (UDP 5351), a UPnP IGD server (SSDP
+responder on UDP 1900 + HTTP control on 49001), and a lease-expiry sweep. The
+protocol cores are shared from `start-core` (`net::port_map::server`, also used
+by StartTunnel); StartWRT's `GatewayBackend` impl maps forwards onto tagged UCI
+`redirect` sections (`_apf_*` options, invisible to manual published ports) and
+authorizes per device via a default-off DHCP-host flag (`_allow_pcp`). Renewals
+are tracked in memory to avoid flash writes; UCI is only written on
+create/change/remove. The OpenWrt image must **not** ship `miniupnpd` — it
+would conflict on these ports and manage forwards outside the UCI model.
+
+**Open problem — same-segment LAN source spoofing.** PCP authorization resolves
+the claimed UDP source address through the neighbor table. A request arriving on
+a different LAN bridge than the claimed device is rejected (the arrival interface
+comes from `IP_PKTINFO`), but a host on the same bridge can still act as an
+authorized neighbor: opening ports that expose _that_ device, or tearing its
+mappings down. StartTunnel avoids this only because WireGuard authenticates the
+source address; a LAN bridge has no equivalent within a segment, and no standard
+addresses it (RFC 6887 assumes a trusted internal network; RFC 7652
+authentication is unused in practice; miniupnpd does nothing here). Closing it
+needs L2 source guard, which the K1's single wired bridge cannot provide — the
+per-device, default-off permission bounds it to explicitly trusted devices, and
+untrusted devices belong in their own profile. Detail is in the
+`port_control.rs` module doc.
+
+## Security Profiles
+
+The core concept. Each profile creates:
+
+1. A **VLAN** on the LAN bridge (`br-lan`) with a unique tag
+2. A **network interface** bound to that VLAN with its own subnet
+3. A **firewall zone** with forwarding rules governing LAN/WAN access
+4. A **DHCP server** for the profile's subnet
+
+Devices receive a profile based on how they join the network:
+
+| Entry Point     | Mechanism                                                                                                                                                                                       |
+| --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **WiFi**        | One SSID, many passwords. Each password maps to a profile via `wpa_psk_file` with dynamic VLAN.                                                                                                 |
+| **Ethernet**    | Bridge VLAN port assignments — each physical port tagged to a profile's VLAN. OpenWrt maps UCI `bridge-vlan` config to DSA hardware tables or software bridge filtering depending on the board. |
+| **Inbound VPN** | Each WireGuard server interface bound to a profile.                                                                                                                                             |
+
+Profile orchestration spans five UCI configs: `startwrt`, `network`, `firewall`, `dhcp`, `wireless`.
+
+## Build Pipeline
+
+Targets live in `build.mk` (included by the root `Makefile`) and run from the **monorepo
+root**. The Rust crates are members of the root Cargo workspace, so the binary lands in the
+workspace-root `target/`. The riscv64 binary is cross-compiled in a dockerized cargo-zigbuild
+toolchain pinned to the SpaceMiT K1 ISA (`build/build-rust.sh` + `build/zigcc-k1.sh`).
+
+### Build Steps
+
+```
+1. npm run build:wrt               →  web/dist/startwrt/browser/ (Angular production build, embedded next)
+2. build/build-rust.sh             →  target/riscv64gc-unknown-linux-musl/release/startwrt
+3. build/stage-files.sh            →  openwrt/files/ (binary + configs + init scripts)
+4. make -C openwrt                 →  openwrt/bin/targets/spacemit/ (sdcard .img + sysupgrade .img.gz)
+5. gzip/cp to results/             →  release-named startwrt-<ver>-<hash>_spacemit-k1-{sdcard,sysupgrade}.img.gz
+```
+
+### Key Make Targets
+
+| Target                                          | Description                                                                        |
+| ----------------------------------------------- | ---------------------------------------------------------------------------------- |
+| `make start-wrt`                                | web → Rust binary (embeds the UI)                                                  |
+| `make start-wrt-image`                          | Full build: stage → OpenWrt image → `results/`                                     |
+| `make start-wrt-openwrt-setup`                  | Fetch/reset the pinned OpenWrt tree, apply the Start9 delta, feeds/config/download |
+| `make start-wrt-update STARTWRT_REMOTE=root@IP` | Deploy binary over SSH (atomic: temp → sync → rename → restart)                    |
+| `make start-wrt-clean`                          | Delete start-wrt build artifacts                                                   |
+
+### Deployment
+
+The `start-wrt-update` target pipes the binary over SSH with atomic replacement:
+
+```bash
+make start-wrt-update                        # Default: root@192.168.0.1
+make start-wrt-update STARTWRT_REMOTE=root@10.0.0.1   # Custom target
+```
+
+The binary is self-contained — the web UI is embedded via `include_dir`. Factory-default UCI configs from `firstboot_config/` are staged into the OpenWrt image at build time by `build/stage-files.sh`.
+
+## Key Design Decisions
+
+1. **One SSID, many passwords.** Per-password VLAN assignment via `wpa_psk_file` with dynamic VLAN. This is why the network is WPA2-PSK and not WPA3-SAE: the AP identifies which password a WPA2 client used by testing each candidate against the handshake MIC, but SAE requires the AP to commit to a single password before it can test anything — the same property that blocks offline dictionary attacks. hostapd can only select among several `sae_password`s by a cleartext password identifier (which mainstream client UIs don't expose) or a pre-registered MAC (defeated by MAC randomization), so WPA3 would break password-to-profile mapping.
+
+2. **VLANs for isolation.** Layer 2 isolation via bridge VLAN filtering. On boards with a hardware switch (DSA), filtering happens in silicon; on boards without (BPI-F3), it's done in the kernel's software bridge. The UCI `bridge-vlan` configuration is the same either way. An earlier nftables approach was abandoned because in-hardware switching bypasses the OS.
+
+3. **UCI as source of truth.** No separate database. The backend reads, modifies, and writes UCI files atomically with conflict detection.
+
+4. **Frontend knows nothing about UCI.** Clean RPC contract where the frontend sends domain objects and the backend handles all UCI serialization, service restarts, and system commands.
+
+5. **Typed UCI parsing.** `#[derive(TypedSection)]` eliminates runtime parsing errors. Define a struct, annotate with `#[uci(ty = "...")]`, derive, done.
+
+6. **Single binary.** `startwrt` is symlinked as `startwrt-ctrld` (daemon) and `startwrt-cli` (CLI). Both share handler code via the `CtrlContext` trait.
+
+## Further Reading
+
+- [backend/ARCHITECTURE.md](backend/ARCHITECTURE.md) — Rust backend internals
+- [web/ARCHITECTURE.md](web/ARCHITECTURE.md) — Angular frontend internals
+- [API_CONTRACT.md](API_CONTRACT.md) — Complete RPC endpoint contract
+- [docs/init-reflash.md](docs/init-reflash.md) — Manufacturing, setup, and reflash flows

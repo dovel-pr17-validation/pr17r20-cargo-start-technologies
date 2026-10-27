@@ -1,0 +1,59 @@
+.DS_Store
+.idea
+*.img
+*.img.gz
+*.img.xz
+*.zip
+/product_key.txt
+/*_product_key.txt
+.vscode/settings.json
+deploy_web.sh
+secrets.db
+.vscode/
+/build/env/*.txt
+*.deb
+/target
+*.squashfs
+/results
+/dpkg-workdir
+/compiled.tar
+/compiled-*.tar
+/projects/start-os/build/firmware
+/projects/start-os/build/lib/firmware
+tmp
+/.i18n-checked
+docs/USER.md
+*.local.md
+*.s9pk
+/projects/start-os/build/lib/migration-images
+/projects/start-os/build/lib/depends
+/projects/start-os/build/lib/conflicts
+.claude/*
+!.claude/settings.json
+!.claude/skills/
+
+# openwrt build workspace: disposable, rebuilt from the pinned upstream release
+# tarball by projects/start-wrt/build/openwrt-setup.sh (was a git submodule);
+# .new/.old are its transient swap dirs (only present if a run was interrupted)
+/projects/start-wrt/openwrt/
+/projects/start-wrt/openwrt.new/
+/projects/start-wrt/openwrt.old/
+
+# monorepo: per-product web build outputs
+/projects/start-os/web/dist/
+/projects/start-tunnel/web/dist/
+/projects/brochure-marketplace/dist/
+
+# migrated mdbook standalone build outputs
+/projects/start-os/docs/book/
+/projects/start-tunnel/docs/book/
+/projects/start-sdk/docs/book/
+/projects/start-wrt/docs/book/
+/projects/start-docs/docs/
+
+# Angular workspace now rooted at repo root
+/node_modules
+/.angular
+/out-tsc
+/config.json
+/proxy.conf.json

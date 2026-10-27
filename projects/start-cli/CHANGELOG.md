@@ -1,0 +1,386 @@
+# Changelog
+
+All notable changes to `start-cli` are documented here. The format is based on
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/). As of 1.0.0 the crate is
+versioned **independently** of the StartOS release line (it was previously pinned to
+the OS version).
+
+Because `start-cli` is a thin client over `start-core`, most user-visible CLI changes originate
+in `start-core`; record here anything that changes this crate's entrypoint, features, packaging,
+or the CLI's externally observable behavior.
+
+## [2.5.2]
+
+### Changed
+
+- Preserved image-provided `/etc/resolv.conf` symlinks and hardlinks when packing. Packages with symlinked resolvers need SDK 3.1.1 or later.
+
+## [2.5.1]
+
+### Fixed
+
+- Piping output into a command that stops reading early, such as `head`, no longer crashes the CLI.
+
+- Fixed macOS binaries aborting at launch on newer macOS versions.
+
+- Fixed services packed from an image whose `/etc/resolv.conf` is a symlink, such as a Nix-built image, failing to start on StartOS. Repack affected services with this version.
+
+## [2.5.0]
+
+### Added
+
+- **The identity key can live in gpg-agent.** Set `id-key-gpg: <key>` in the config (or pass `--id-key-gpg`) to a fingerprint, key ID, or user ID to sign with an Ed25519 key held by gpg-agent instead of `id.key.pem`. Requires GnuPG 2.3 or later. Servers running StartOS 0.4.0.3 or earlier cannot verify registry assets signed only by such a key.
+
+- The Debian package enables Bash tab completion automatically in new shells.
+
+- Add `server update-signers` commands to add, get, list, relabel, and remove trusted OS update signing keys.
+
+### Changed
+
+- **Registry signatures carry their actual scheme.** Signatures made with `id.key.pem` are Ed25519ph labeled with their own algorithm identifier. Publishing requires start-registry 1.2.0 or later; reading from older registries still works.
+
+- **Requests are signed with a new layout.** Managing a server or publishing to a registry requires StartOS 0.4.0.3, StartTunnel 1.4.0, or start-registry 1.2.0 or later.
+
+- Set DNS overrides per gateway with `net dns set-static <GATEWAY> [SERVERS]...`; omit servers to restore automatic gateway DNS.
+
+### Fixed
+
+- Bash tab completion works for nested subcommands and their options.
+
+- **`package start` records running intent while critical tasks block execution and prints a warning.** The service starts when those tasks clear. The `--force` flag is removed; remove it from scripts.
+
+### Security
+
+- **Update dependencies with security fixes**, including TLS certificate verification and handshake handling, HTTP/2 flow control, and XML parsing.
+
+## [2.4.2]
+
+### Fixed
+
+- `s9pk pack` needs less free disk space to import a container image from a tag or OCI layout.
+
+## [2.4.1]
+
+### Fixed
+
+- `s9pk pack` accepts container images whose layers store absolute or `..` paths, such as Tailscale's, resolving them against the image root.
+
+## [2.4.0]
+
+### Added
+
+- Pack images from local OCI layout directories or archives, selecting nested multi-platform images by platform and optional reference. Docker Buildx exports OCI directly; its selected builder must support OCI output. Registry tags still use Docker/Podman, with exported configuration replacing image inspection. Legacy image conversion no longer requires a container engine or binfmt registration.
+
+### Changed
+
+- **`s9pk pack` and `s9pk edit add-image` create SquashFS images natively**, without requiring `mksquashfs` or `tar2sqfs` on the packaging workstation. Packaged JavaScript files are readable and directories traversable by the service runtime without changing source permissions. Container filesystems are reconstructed from hash-verified image layers without Docker container initialization state, preserving image timestamps and hardlink identity across layers. JavaScript and asset timestamps are normalized to zero, including v1 conversion. An immutable platform-specific image configuration, identical writer options, and the locked codec produce identical SquashFS bytes.
+
+### Fixed
+
+- **`s9pk edit add-image` re-signs edited packages with the workspace build key**, keeping their signatures valid.
+
+- **Package manifest paths containing apostrophes work during packing and validation.**
+
+## [2.3.0]
+
+### Added
+
+- **`registry package get <ID> full --all-revisions` lists every revision of a package a registry
+  holds.** Without `--all-revisions`, a registry running start-registry 1.1.1 or later hides a
+  revision once a newer revision of the same upstream version runs on the same hardware.
+
+- **`registry info set-icon --clear` and `registry info set-description --clear` remove a
+  registry's icon and description.**
+
+### Fixed
+
+- **`s9pk pack` and `s9pk edit add-image` preserve the requested platform's image configuration**, including its default command, with Docker and Podman. Docker packaging requires Docker 28.1+ (API 1.49+).
+
+- **`s9pk edit add-image` signs the updated archive**, keeping the edited package readable and valid.
+
+- **`package install` reports a package missing from the registry it asked**, naming that
+  registry, instead of prompting to choose from an empty list of flavors.
+
+## [2.2.0]
+
+### Security
+
+- **Update shared dependencies with security fixes.** Replace the unmaintained YAML library while preserving configuration formats.
+
+### Added
+
+- **`server trust-ca --cert <PEM>` adds a CA root to the server's host trust store.** Pass
+  the PEM certificate text directly or use shell substitution to read a file. The command
+  prints its subject and SHA-256 fingerprint.
+
+- **`s9pk edit add-image` enables CPU emulation by default** when the server uses
+  another architecture. Use `--no-emulation` for images that require a native architecture.
+
+### Fixed
+
+- **`s9pk pack` and `s9pk edit add-image` accept a Docker image that declares no `CMD` or
+  `ENTRYPOINT`.**
+
+- **`s9pk pack` removes its temporary container and built image when packing fails.**
+
+## [2.1.0]
+
+### Added
+
+- **`s9pk init-workspace` links the guide's packaging skills into the workspace**, at `.claude/skills` for Claude Code and `.agents/skills` for Codex, so a session opened at the workspace root can run `package-service` and the guide sync keeps the skills current. An existing entry at either path is left alone. A workspace made by an earlier release gets the links the first time any `start-cli` command runs inside it after the update, so nothing needs re-running; `init-workspace` does the same on demand.
+
+- **`s9pk init-workspace` and `s9pk init-package` say when the workspace's `start-technologies`
+  checkout is on a branch other than `live-docs`.** The notice names the checkout and the branch
+  and says how to replace it.
+
+- **`completions <shell>` prints a completion script** for bash, zsh, fish, elvish or PowerShell;
+  `eval "$(start-cli completions bash)"` in a shell profile enables tab completion.
+
+- **A command the server refuses because this key is not logged in prompts for the server
+  password, logs in, and runs.** Only at a terminal; a script still gets the error, and
+  `auth login` still works on its own.
+
+- **`binding list` shows each binding's bridge address** (`10.0.3.1:<port>`, plain and TLS) under
+  `package host` and `server host`.
+
+### Changed
+
+- **`setup install-os` takes the stable disk paths that `setup disk list` reports as `stablePath`.**
+  A kernel device name such as `/dev/sda` is rejected, so the selected drive stays the installation
+  target when Linux reorders disk names.
+
+### Fixed
+
+- **The notice that `start-cli` is behind the published release is given only when the workspace's
+  `start-technologies` checkout is on `live-docs`.**
+
+- **`--address` on `binding set-address-enabled`, `set-range-address-enabled` and `set-gua-wan`
+  takes the address as the UI shows it** — an IP, `<name>.local` or a domain, with `:port` where
+  one address serves several ports — under `package host` and `server host` alike. An address the
+  binding doesn't have is refused with the list of those it has; a JSON `HostnameInfo` is still
+  accepted.
+
+## [2.0.0]
+
+### Added
+
+- **`server epp` shows or sets the CPU energy/performance preference.** The setting persists
+  across reboots and reports the values available on the server.
+
+- **`s9pk pack` packs the package's `README.md`.** It sits beside `instructions.md` in the
+  archive and is readable with `S9pk::readme()`. The point is what runs on the server: an AI
+  assistant administering a service can now read the package's technical reference from the
+  installed `.s9pk` — offline, and describing the version actually installed — instead of
+  fetching a repository's default branch, which has usually moved on. Unlike `instructions.md`
+  it is **optional**, so a package without one still builds; it is simply absent from the
+  archive and the accessor returns `None`. Nothing is packed for an s9pk built before this,
+  and v1 packages migrated forward carry no README either.
+
+- **An `s9pk` command says when `start-cli` is behind the published release.** It compares
+  itself against the `start-cli` version named by the workspace's `start-technologies`
+  checkout and prints a one-line notice. `start-cli` installs outside the workspace, so
+  nothing else would have told you: on Debian `apt upgrade` carries it forward, and
+  everywhere else re-running the installer is the only update path.
+
+### Changed
+
+- **`server governor` replaces `server experimental governor`.** Scripts that set or inspect
+  the CPU governor need to use the direct `server` subcommand.
+
+- **`server set-hostname` takes one required hostname, and `setup execute` no
+  longer takes `--name`.** A StartOS server carries a single name — its `.local`
+  hostname — where it used to carry a separate display label as well. Setting it
+  moves the address the server answers to. A provisioning script that passes
+  `--name` to `setup execute`, or a name and a hostname to `server set-hostname`,
+  needs updating. `server set-hostname` and `setup execute --hostname` also
+  reject a name longer than 32 characters, or one starting or ending with a
+  hyphen, which 1.1.0 accepted.
+
+- **`s9pk init-workspace` clones the monorepo's `live-docs` branch** rather than `master`, so a
+  workspace's packaging guide, package template, and SDK source describe the
+  `@start9labs/start-sdk` its packages install, and match the pages on docs.start9.com. An
+  existing workspace moves over with `git -C start-technologies checkout live-docs`.
+
+### Fixed
+
+- **`s9pk init-workspace` no longer scaffolds a placeholder host** — `dev-vm.local` resolved
+  nowhere, failing every command in a fresh workspace; comment it out in an existing one.
+
+- **`registry os asset remove` can be run.** Its `iso`/`img`/`squashfs` handlers were registered
+  as RPC-only, and — unlike `add`, `sign`, and `get`, which each pair their RPC handlers with a
+  CLI counterpart — nothing was registered in their place. `remove` was left parsing as a leaf
+  that accepts no arguments: it listed under `registry os asset --help` with a blank description,
+  and naming an asset type came back `unexpected argument 'iso' found` with exit 2. The three
+  subcommands now take `<VERSION> <PLATFORM>` and reach the registry directly, mirroring
+  `registry os asset get`, so a single platform's asset can be dropped without removing the whole
+  version and re-adding every other platform. Asking to remove a platform the version has no
+  asset for now says so instead of reporting success.
+
+- **The local authcookie now reaches a registry or tunnel daemon that listens on a
+  non-loopback address.** Run on the server itself, the CLI presents the daemon's local
+  authcookie as an `Authorization: Bearer` header — but it attached that header only when
+  the URL was literally loopback. With no `--registry`/`--tunnel` the CLI derives the URL
+  from the daemon's own `registry-listen`/`tunnel-listen`, which is commonly the wildcard
+  `0.0.0.0:5959`; that is not loopback, so the request went out unauthenticated and came
+  back `Unauthorized`. `start-cli registry admin list` on the registry host failed this way.
+  A wildcard listen address is now dialled over loopback — binding every interface is not a
+  destination — and an address derived from the daemon's own listen configuration counts as
+  naming this machine, so the token is attached. An explicit `--registry`/`--tunnel` target
+  is unchanged: the token still goes only to a loopback URL.
+
+## [1.1.0]
+
+### Changed
+
+- **Authentication moved from session cookies to per-device signing keys.** `auth login` now
+  enrolls the CLI's identity key with the server instead of opening a cookie session, and every
+  request is signed with that key (`X-Start-Auth-Sig`; unpadded base64url DER key and signature).
+  The signature is bound to the host identity from the configured URL — on Linux, where a `.local`
+  host is pinned to its resolved address to work around musl's lack of mDNS, the signature still
+  commits to the `.local` name, not the pinned IP. Requires a server with key-based auth
+  (StartOS ≥ 0.4.0-beta.10, StartTunnel ≥ 1.2.0). Cookies are gone from the client entirely:
+  when run on the server itself, the CLI presents the server's local authcookie as an
+  `Authorization: Bearer` header (only ever to a loopback address) instead of a `Cookie`, and
+  the `--cookie-path` flag and `.cookies.json` cache are removed.
+- **Key files renamed: `developer.key.pem` → `id.key.pem` and `.startos/build-key` →
+  `.startos/build.key.pem`.** The first is the CLI's identity for login and registry auth, not a
+  developer-only feature, and the build key gains a conventional extension. Existing files are
+  renamed automatically the first time the CLI loads them; `--developer-key-path` and the
+  `developer-key-path` config field remain accepted as aliases of `--id-key-path` /
+  `id-key-path`.
+
+## [1.0.3]
+
+### Added
+
+- **`host`/`registry` profiles work in every config file, not just the workspace.** A config
+  file's `host`/`registry` is a namespace of named profiles — `default`, `prod`, whatever you
+  like — and a bare URL is shorthand for the `default` profile, so a legacy flat
+  `host: https://box.local` still targets that URL. Profiles from a `-c` file, the workspace
+  `.startos/config.yaml`, `~/.startos/config.yaml`, and `/etc/startos/config.yaml` all **combine**
+  into one namespace, so you can keep reusable profiles in your home config and reach them from
+  anywhere — inside a packaging workspace or not. A profile's value can be a URL or the name of
+  another profile, and `-H`/`-r` just set the `default` profile for that invocation (`-H prod`
+  points `default` at your `prod` profile); resolution follows the chain to a URL. A value that
+  isn't a URL is reported only when it's the one resolved, so a stale ambient config never fails an
+  unrelated command.
+
+### Fixed
+
+- **`.local` (mDNS) hostnames resolve again.** Every command against a `.local` address — the
+  way most people reach their server — failed after ~5s with an opaque
+  `error sending request for url (...)`, while `curl` against the same URL succeeded instantly.
+  `start-cli` ships as a statically linked musl binary, and musl's `getaddrinfo` implements no
+  NSS: it ignores `/etc/nsswitch.conf`, so `mdns4_minimal` is never consulted and the lookup
+  falls through to unicast DNS, which dies on musl's hard-coded 5s timeout. A `.local` host is
+  now resolved through the system resolver (`getent`, the same path `curl` takes) when the
+  client context is built, so the HTTP client and the log/progress websockets alike are handed
+  an address. Linux only — macOS resolves `.local` natively. (#3469)
+
+- **An ambient config file no longer shadows the workspace `.startos/config.yaml`.** A `host`
+  set in `~/.startos/config.yaml` or `/etc/startos/config.yaml` was merged into the same field as
+  an explicit `-H`/`-r`, so it silently outranked the workspace's `default` profile — the opposite
+  of the documented layering, and a trap for anyone with a leftover pre-1.0 flat config in their
+  home directory. Profiles now layer in a strict order, highest precedence first: a command-line
+  flag (`-H`/`-r`), a config file named with `-c`, the workspace config, `~/.startos/config.yaml`,
+  then `/etc/startos/config.yaml`. Where the same profile name is defined at more than one level
+  the higher tier wins; what you name on the command line overrides the workspace, what you don't
+  is an ambient default beneath it. A `-H`/`-r` naming an unknown profile still errors rather than
+  quietly falling through to a lower tier.
+
+## [1.0.2]
+
+### Changed
+
+- **`s9pk init-workspace` clones the whole monorepo, not just the guide.** The checkout is no
+  longer sparse or shallow, so a packager has the SDK and StartOS source on hand when the guide
+  can't settle a question — and a repo they can open a fix PR from. `--filter=blob:none` keeps it
+  cheap: a few seconds and roughly 75 MB, with `git log`, `blame`, and rebase all working normally.
+  An existing workspace keeps its narrow checkout. Widen it in place by running
+  `sparse-checkout disable` in `start-technologies/`, plus `fetch --unshallow` if you want history.
+- **`init-workspace` uses an existing `start-technologies` if you point at one.** Symlink it into
+  the workspace before running, and the clone is skipped.
+- **`s9pk init-workspace` links `AGENTS.md` to the guide's Agent Context page.** The workspace
+  context file moved to `projects/start-sdk/docs/src/agent-context.md`, so it publishes with the
+  rest of the packaging guide instead of being reachable only by scaffolding a workspace or
+  browsing the monorepo. A `start-technologies/` that is a symlink to a monorepo checkout you
+  maintain yourself is now a supported layout, and the guide says so.
+- **The scaffolded `AGENTS.local.md` explains what belongs in it.** The stub now names the split:
+  your box, your registry, your packages, and any departure from the scaffolded layout go there,
+  while anything that would help every packager belongs upstream in the guide.
+
+### Fixed
+
+- `init-workspace` repoints a workspace `AGENTS.md` left over from an earlier release. Those
+  symlinks target a path that no longer exists; re-running `init-workspace` in such a workspace
+  replaces the dangling link. Everything else it finds is still left untouched.
+
+## [1.0.1]
+
+- **`s9pk init-package` initializes a git repository in the new package.** Packages are
+  their own git repos — the template ships a `.gitignore` and GitHub Actions workflows —
+  so `init-package` now runs `git init` in the scaffold. No commit is made; your first
+  commit is yours.
+- **`s9pk pack` no longer requires a committed git repository.** It still stamps the
+  manifest with the repo's commit hash when one exists (suffixed `-modified` if the tree
+  is dirty), but a freshly scaffolded package — a `git init` with no commit yet, or a
+  non-git directory — now builds with the hash simply omitted, instead of failing with
+  `fatal: not a git repository`. The hash appears once you make your first commit. This
+  is what lets a brand-new package build immediately after `init-package`.
+- **`s9pk init-workspace` no longer fails when a `.startos` exists above the target.**
+  A leftover global `~/.startos` (or any enclosing workspace) used to trip a
+  "Cannot create a workspace inside an existing one" guard and block workspace creation
+  anywhere under it. Nesting is now allowed: `init-workspace` just creates the workspace,
+  paying no attention to outer ones. When building, signing, or reading config, start-cli
+  walks up from the current directory and uses the nearest `.startos/`, so a nested
+  workspace transparently overrides an outer one (conceptually a deep merge of every
+  `.startos/` on the path). The one refusal that remains is running **inside a package
+  repo** — a workspace holds package repos; it isn't one. (There is no automatic
+  migration from an older global `~/.startos`; copy `developer.key.pem` to a workspace's
+  `.startos/build-key` yourself to reuse a signing key.)
+- **Better "no workspace" errors when building/signing.** `s9pk pack` (and therefore
+  `make` / `make publish`) needs a workspace signing key; when none is found above the
+  cwd it now explains that packaging happens inside a workspace (which also brings the
+  AI guide) and points to `init-workspace`. If you're **inside a package repo**, the
+  error names the parent directory to run it in (`cd <parent> && start-cli s9pk
+init-workspace`), so an existing package repo is one command away from building. The
+  `init-workspace`-inside-a-package-repo refusal points at the same parent.
+- **`--version` now reports `start-cli`'s own version** (`1.0.1`) rather than the StartOS
+  platform version it was previously wired to.
+
+## [1.0.0]
+
+- **`package start --force`.** `start-cli package start <id> --force` starts a service
+  even if it has an unresolved critical task (the backend gate lives in `start-core`).
+- **Independent versioning.** `start-cli` now carries its own version (starting at
+  `1.0.0`) in its `Cargo.toml`, decoupled from the StartOS release line.
+- **Debian package.** `start-cli` is now packaged as a `.deb` (`make start-cli-deb`), so it
+  can be installed and updated via apt. The build version is read from the crate
+  manifest. `make start-cli-install` now stages the binary into `DESTDIR` for packaging; for
+  a local PATH install run `build-cli.sh --install`.
+
+## [0.4.0-beta.10]
+
+- Client for the StartOS RPC API, built as a thin bin over the shared `start-core` crate
+  (package `start-core`, lib `start_core`).
+- Remote command surface dispatched over HTTPS: `server`, `package`, `net`, `auth`, `db`,
+  `ssh`, `wifi`, `disk`, `notification`, `backup`, `diagnostic`, `init`, `setup`, `kiosk`,
+  `registry`, `tunnel`.
+- Local developer tooling: `s9pk` packaging, `init-key`/`pubkey` developer keys, `util` helpers.
+- `STARTOS_USE_PODMAN` toggles the local container backend for `s9pk` packaging (defaults to Docker).
+- Deprecated `embassy-cli` alias retained for backward compatibility.
+
+### Added
+
+- **Packaging workspace commands (#3251).** `s9pk init-workspace [PATH]` provisions an AI-ready packaging workspace (shallow-clones start-docs, links `AGENTS.md`/`CLAUDE.md`, generates an ed25519 build key and a multi-profile `.startos/config.yaml`), and `init-package "<Name>"` scaffolds a package from the template. s9pk signing now uses the workspace build key, and `-H`/`-r` accept a profile name from the workspace config or a literal URL.
+
+### Fixed
+
+- The publish cookie store locks on a stable file to stop a publish race (#3291).
+- `ws_continuation` honors `--root-ca` / `--insecure` (#3274).
+- `choose` falls back to a generic non-tty prompt instead of failing when stdin isn't a terminal (#3265).
+
+[1.0.3]: https://github.com/Start9Labs/start-technologies/releases/tag/start-cli/v1.0.3
+[1.0.2]: https://github.com/Start9Labs/start-technologies/releases/tag/start-cli/v1.0.2
+[1.0.1]: https://github.com/Start9Labs/start-technologies/releases/tag/start-cli/v1.0.1
+[1.0.0]: https://github.com/Start9Labs/start-technologies/releases/tag/start-cli/v1.0.0

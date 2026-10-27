@@ -1,0 +1,27 @@
+[package]
+edition = "2024"
+license = "MIT"
+name = "start-os"
+repository = "https://github.com/Start9Labs/start-technologies"
+# Root package.json owns the OS version; this SemVer label cannot express a fourth segment.
+version = "0.4.0-rev.4" # VERSION_BUMP
+
+[[bin]]
+name = "startbox"
+path = "src/bin/startbox.rs"
+
+[[bin]]
+name = "start-container"
+path = "src/bin/start-container.rs"
+
+[features]
+beta = ["start-core/beta"]
+console = ["start-core/console"]
+default = []
+dev = ["start-core/dev"]
+test = ["start-core/test"]
+unstable = ["start-core/unstable"]
+
+[dependencies]
+include_dir = "0.7.3"
+start-core = { path = "../../shared-libs/crates/start-core" }

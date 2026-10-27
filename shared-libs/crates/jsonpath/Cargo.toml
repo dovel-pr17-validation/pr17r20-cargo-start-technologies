@@ -1,0 +1,32 @@
+[package]
+authors = ["Changseok Han <freestrings@gmail.com>"]
+name = "jsonpath_lib"
+publish = false
+version = "0.3.0"
+
+description = "A JsonPath engine written in Rust."
+readme = "README.md"
+
+categories = ["parser-implementations", "api-bindings"]
+keywords = ["jsonpath", "json", "lua", "query"]
+
+documentation = "https://docs.rs/jsonpath_lib/0.3.0/jsonpath_lib"
+license = "MIT"
+repository = "https://github.com/freestrings/jsonpath"
+
+[badges]
+travis-ci = { repository = "freestrings/jsonpath", branch = "master" }
+
+[dependencies]
+imbl-value = { path = "../imbl-value" }
+log = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+
+[dev-dependencies]
+env_logger = "0.11"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+name = "jsonpath_lib"
+path = "src/lib.rs"

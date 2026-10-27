@@ -1,0 +1,271 @@
+import { ServiceInterfaceBuilder } from '@start9labs/start-core/interfaces/ServiceInterfaceBuilder'
+import { Effects } from '@start9labs/start-core/Effects'
+import { MAX_BIND_PORT_RANGE_SIZE } from '@start9labs/start-core/interfaces/Host'
+import { sdk } from '../test/output.sdk'
+
+describe('host', () => {
+  test('Testing that the types work', () => {
+    async function test(effects: Effects) {
+      const foo = sdk.MultiHost.of(effects, 'foo')
+      const fooOrigin = await foo.bindPort(80, {
+        protocol: 'http' as const,
+        preferredExternalPort: 80,
+      })
+      const fooInterface = new ServiceInterfaceBuilder({
+        effects,
+        name: 'Foo',
+        id: 'foo',
+        description: 'A Foo',
+        type: 'ui',
+        username: 'bar',
+        path: '/baz',
+        query: { qux: 'yes' },
+        schemeOverride: null,
+        masked: false,
+      })
+
+      await fooOrigin.export([fooInterface])
+    }
+  })
+
+  describe('Origin.export', () => {
+    async function uiOrigin(effects: Effects) {
+      return sdk.MultiHost.of(effects, 'ui').bindPort(80, {
+        protocol: 'http' as const,
+        preferredExternalPort: 80,
+      })
+    }
+
+    // Inline literals preserve excess-property checking.
+    test('carries a nominated launcher address through to the effect', async () => {
+      const exportServiceInterface = jest.fn(async () => null)
+      const effects = {
+        bind: jest.fn(async () => null),
+        exportServiceInterface,
+      } as unknown as Effects
+      const origin = await uiOrigin(effects)
+
+      await origin.export([
+        sdk.createInterface(effects, {
+          name: 'Web UI',
+          id: 'ui',
+          description: 'The web interface',
+          type: 'ui',
+          masked: false,
+          schemeOverride: null,
+          username: null,
+          path: '',
+          query: {},
+          preferredLauncherAddress: 'https://pad.example.com',
+        }),
+      ])
+
+      expect(exportServiceInterface).toHaveBeenCalledWith(
+        expect.objectContaining({
+          preferredLauncherAddress: 'https://pad.example.com',
+        }),
+      )
+    })
+
+    test('nominates nothing when the option is omitted', async () => {
+      const exportServiceInterface = jest.fn(async () => null)
+      const effects = {
+        bind: jest.fn(async () => null),
+        exportServiceInterface,
+      } as unknown as Effects
+      const origin = await uiOrigin(effects)
+
+      await origin.export([
+        sdk.createInterface(effects, {
+          name: 'Web UI',
+          id: 'ui',
+          description: 'The web interface',
+          type: 'ui',
+          masked: false,
+          schemeOverride: null,
+          username: null,
+          path: '',
+          query: {},
+        }),
+      ])
+
+      const [params] = exportServiceInterface.mock.calls[0] as unknown as [
+        Record<string, unknown>,
+      ]
+      expect(params['preferredLauncherAddress']).toBeUndefined()
+    })
+  })
+
+  test('host.get returns interfaces whose addressInfo is pre-filled', () => {
+    async function _typecheck(effects: Effects) {
+      const host = await sdk.host.getOwn(effects, 'ui').const()
+      const ui = Object.values(host?.bindings ?? {})
+        .flatMap(b => Object.values(b.interfaces))
+        .find(i => i.id === 'ui')
+
+      const urls: string[] = ui?.addressInfo.format('urlstring') ?? []
+      const domains =
+        ui?.addressInfo.filter({ kind: 'domain' }).format('url') ?? []
+      void urls
+      void domains
+    }
+    void _typecheck
+  })
+
+  describe('MultiHost.retire / retirePort', () => {
+    test('retire forwards the host id', async () => {
+      const retireHost = jest.fn(async () => true)
+      const host = sdk.MultiHost.of({ retireHost } as unknown as Effects, 'ui')
+      await expect(host.retire()).resolves.toBe(true)
+      expect(retireHost).toHaveBeenCalledWith({ id: 'ui' })
+    })
+
+    // The positional port becomes a named field — the shape most likely to rot.
+    test('retirePort forwards the host id and the port', async () => {
+      const retireBinding = jest.fn(async () => false)
+      const host = sdk.MultiHost.of(
+        { retireBinding } as unknown as Effects,
+        'api',
+      )
+      await expect(host.retirePort(9090)).resolves.toBe(false)
+      expect(retireBinding).toHaveBeenCalledWith({
+        id: 'api',
+        internalPort: 9090,
+      })
+    })
+  })
+
+  describe('MultiHost.bindPortRange', () => {
+    const fakeEffects = (
+      bindRange: jest.Mock = jest.fn(async () => null),
+    ): Effects => ({ bindRange }) as unknown as Effects
+
+    test('forwards the call to effects.bindRange with normalised params', async () => {
+      const bindRange = jest.fn(async () => null)
+      const host = sdk.MultiHost.of(fakeEffects(bindRange), 'turn')
+      await host.bindPortRange({
+        internalStartPort: 49152,
+        externalStartPort: 49152,
+        numberOfPorts: 100,
+      })
+      expect(bindRange).toHaveBeenCalledWith({
+        id: 'turn',
+        internalStartPort: 49152,
+        externalStartPort: 49152,
+        numberOfPorts: 100,
+      })
+    })
+
+    test('accepts an offset range (internal !== external)', async () => {
+      const bindRange = jest.fn(async () => null)
+      const host = sdk.MultiHost.of(fakeEffects(bindRange), 'turn')
+      await host.bindPortRange({
+        internalStartPort: 49152,
+        externalStartPort: 50000,
+        numberOfPorts: 10,
+      })
+      expect(bindRange).toHaveBeenCalledWith({
+        id: 'turn',
+        internalStartPort: 49152,
+        externalStartPort: 50000,
+        numberOfPorts: 10,
+      })
+    })
+
+    test('rejects a single-port range (use bindPort instead)', async () => {
+      const host = sdk.MultiHost.of(fakeEffects(), 'turn')
+      await expect(
+        host.bindPortRange({
+          internalStartPort: 49152,
+          externalStartPort: 49152,
+          numberOfPorts: 1,
+        }),
+      ).rejects.toThrow(/>= 2/)
+    })
+
+    test('rejects numberOfPorts past the SDK cap', async () => {
+      const host = sdk.MultiHost.of(fakeEffects(), 'turn')
+      await expect(
+        host.bindPortRange({
+          internalStartPort: 49152,
+          externalStartPort: 49152,
+          numberOfPorts: MAX_BIND_PORT_RANGE_SIZE + 1,
+        }),
+      ).rejects.toThrow(/exceeds maximum/)
+    })
+
+    test('rejects ranges that walk past port 65535', async () => {
+      const host = sdk.MultiHost.of(fakeEffects(), 'turn')
+      await expect(
+        host.bindPortRange({
+          internalStartPort: 65500,
+          externalStartPort: 65500,
+          numberOfPorts: 100,
+        }),
+      ).rejects.toThrow(/out of bounds/)
+    })
+
+    test('rejects privileged/system start ports (<= 1024)', async () => {
+      const host = sdk.MultiHost.of(fakeEffects(), 'turn')
+      await expect(
+        host.bindPortRange({
+          internalStartPort: 1024,
+          externalStartPort: 1024,
+          numberOfPorts: 10,
+        }),
+      ).rejects.toThrow(/greater than 1024/)
+    })
+
+    test('export() registers the restricted range interface', async () => {
+      const bindRange = jest.fn(async () => null)
+      const exportRangeServiceInterface = jest.fn(async () => null)
+      const effects = {
+        bindRange,
+        exportRangeServiceInterface,
+      } as unknown as Effects
+      const range = await sdk.MultiHost.of(effects, 'zmq').bindPortRange({
+        internalStartPort: 28332,
+        externalStartPort: 28332,
+        numberOfPorts: 2,
+      })
+      await range.export(
+        sdk.createRangeInterface(effects, {
+          id: 'zmq',
+          name: 'ZMQ',
+          description: 'Bitcoin ZMQ endpoints',
+          scheme: 'tcp',
+        }),
+      )
+      expect(exportRangeServiceInterface).toHaveBeenCalledWith({
+        hostId: 'zmq',
+        internalStartPort: 28332,
+        id: 'zmq',
+        name: 'ZMQ',
+        description: 'Bitcoin ZMQ endpoints',
+        scheme: 'tcp',
+      })
+    })
+
+    test('export() defaults an omitted scheme to null', async () => {
+      const effects = {
+        bindRange: jest.fn(async () => null),
+        exportRangeServiceInterface: jest.fn(async () => null),
+      } as unknown as Effects
+      const range = await sdk.MultiHost.of(effects, 'turn').bindPortRange({
+        internalStartPort: 49152,
+        externalStartPort: 49152,
+        numberOfPorts: 100,
+      })
+      await range.export(
+        sdk.createRangeInterface(effects, {
+          id: 'turn-relay',
+          name: 'TURN Relay',
+          description: 'WebRTC media relay ports',
+        }),
+      )
+      expect(effects.exportRangeServiceInterface).toHaveBeenCalledWith(
+        expect.objectContaining({ scheme: null }),
+      )
+    })
+  })
+})

@@ -1,0 +1,2405 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6};
+use std::ops::RangeInclusive;
+use std::str::FromStr;
+
+use clap::Parser;
+use clap::builder::ValueParserFactory;
+use imbl_value::json;
+use itertools::Itertools;
+use patch_db::Dump;
+use patch_db::json_ptr::JsonPointer;
+use rpc_toolkit::{
+    Context, Empty, HandlerArgs, HandlerExt, ParentHandler, from_fn_async, from_fn_async_local,
+};
+use serde::{Deserialize, Serialize};
+
+use crate::context::{CliContext, RpcContext};
+use crate::db::prelude::Map;
+use crate::hostname::ServerHostname;
+use crate::net::forward::{AvailablePorts, START9_BRIDGE_IFACE};
+use crate::net::host::HostApiKind;
+use crate::net::service_interface::{
+    HostnameInfo, HostnameMetadata, RangeServiceInterface, ServiceInterface,
+};
+use crate::net::vhost::AlpnInfo;
+use crate::prelude::*;
+use crate::util::FromStrParser;
+use crate::util::serde::{HandlerExtSerde, display_serializable};
+use crate::util::tui::choose_custom_display;
+use crate::{GatewayId, HostId, ServiceInterfaceId};
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, VisitFields)]
+#[serde(rename_all = "camelCase")]
+pub struct BindId {
+    pub id: HostId,
+    pub internal_port: u16,
+}
+
+rpc_toolkit::reflect_ts!(BindId);
+rpc_toolkit::ts_export!(BindId, namespaces = [""]);
+impl ValueParserFactory for BindId {
+    type Parser = FromStrParser<Self>;
+    fn value_parser() -> Self::Parser {
+        FromStrParser::new()
+    }
+}
+impl FromStr for BindId {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (id, port) = s
+            .split_once(":")
+            .ok_or_else(|| Error::new(eyre!("expected <id>:<port>"), ErrorKind::ParseUrl))?;
+        Ok(Self {
+            id: id.parse()?,
+            internal_port: port.parse()?,
+        })
+    }
+}
+
+#[derive(Debug, Default, Clone, Deserialize, Serialize, VisitFields, HasModel)]
+#[serde(rename_all = "camelCase")]
+#[model = "Model<Self>"]
+pub struct DerivedAddressInfo {
+    /// User override: enable these addresses (only for public IP & port)
+    pub enabled: BTreeSet<SocketAddr>,
+    /// User override: disable these addresses (only for domains and private IP & port)
+    pub disabled: BTreeSet<(InternedString, u16)>,
+    /// User override: IPv6 global-unicast addresses opted into WAN exposure.
+    /// Projected into `HostnameInfo.public` by `update_addresses`, so `public`
+    /// stays the single source of truth for WAN reachability (P2P address
+    /// selection, upstream pinholes). A GUA not in this set is LAN-only.
+    #[serde(default)]
+    pub gua_wan: BTreeSet<SocketAddrV6>,
+    /// User override: enable these private IPs regardless of their mDNS address.
+    #[serde(default)]
+    pub lan_enabled: BTreeSet<(InternedString, u16)>,
+    /// COMPUTED: NetServiceData::update — all possible addresses for this binding
+    pub available: BTreeSet<HostnameInfo>,
+}
+
+rpc_toolkit::reflect_ts!(DerivedAddressInfo);
+rpc_toolkit::ts_export!(DerivedAddressInfo, namespaces = [""]);
+
+fn override_key(address: &HostnameInfo) -> (InternedString, u16) {
+    // disablable addresses will always have a port
+    (address.hostname.clone(), address.port.unwrap_or_default())
+}
+
+/// Does `mdns` resolve to `ip`?
+fn mdns_covers(mdns: &HostnameInfo, ip: &HostnameInfo) -> bool {
+    let gateway = match &ip.metadata {
+        HostnameMetadata::Ipv4 { gateway } | HostnameMetadata::Ipv6 { gateway, .. } => gateway,
+        _ => return false,
+    };
+    mdns.port == ip.port
+        && matches!(
+            &mdns.metadata,
+            HostnameMetadata::Mdns { gateways } if gateways.contains(gateway)
+        )
+}
+
+impl DerivedAddressInfo {
+    fn public_ip_on(&self, address: &HostnameInfo) -> bool {
+        address.to_socket_addr().map_or(
+            true, // should never happen, but would rather see them if it does
+            |sa| self.enabled.contains(&sa),
+        )
+    }
+
+    /// An override decides; without one the mDNS address resolving to it does.
+    fn lan_ip_on(&self, address: &HostnameInfo) -> bool {
+        let key = override_key(address);
+        if self.lan_enabled.contains(&key) {
+            return true;
+        }
+        if self.disabled.contains(&key) {
+            return false;
+        }
+        self.available
+            .iter()
+            .filter(|mdns| mdns_covers(mdns, address))
+            .all(|mdns| !self.disabled.contains(&override_key(mdns)))
+    }
+
+    /// On a non-SSL port an enabled LAN IP serves the name. An enabled public
+    /// GUA serves it too, and the switch stays off beside one.
+    fn mdns_on(&self, mdns: &HostnameInfo) -> bool {
+        !self.disabled.contains(&override_key(mdns))
+            || (!mdns.ssl
+                && self
+                    .available
+                    .iter()
+                    .any(|ip| !ip.public && mdns_covers(mdns, ip) && self.lan_ip_on(ip)))
+    }
+
+    fn set_lan_ip(&mut self, key: (InternedString, u16), enabled: bool) {
+        if enabled {
+            self.disabled.remove(&key);
+            self.lan_enabled.insert(key);
+        } else {
+            self.lan_enabled.remove(&key);
+            self.disabled.insert(key);
+        }
+    }
+
+    /// Returns addresses that are currently enabled after applying overrides.
+    /// Default: public IPs (including WAN-exposed GUAs) are opt-in via `enabled`,
+    /// a private IP follows its mDNS address, everything else is on unless in
+    /// `disabled`.
+    pub fn enabled(&self) -> BTreeSet<&HostnameInfo> {
+        self.available
+            .iter()
+            .filter(|h| {
+                if h.is_internal() {
+                    // lo / lxcbr0 are always reachable and never operator-disablable.
+                    true
+                } else if h.metadata.is_ip() {
+                    if h.public {
+                        self.public_ip_on(h)
+                    } else {
+                        self.lan_ip_on(h)
+                    }
+                } else if matches!(h.metadata, HostnameMetadata::Mdns { .. }) {
+                    self.mdns_on(h)
+                } else {
+                    !self.disabled.contains(&override_key(h))
+                }
+            })
+            .collect()
+    }
+
+    /// Move the port of every `enabled`/`disabled` override from `old` to `new`.
+    /// A range keys all its overrides on `external_start_port`, so a service-
+    /// driven resize that moves the span must carry the overrides with it — else
+    /// a disabled WAN address silently re-enables under the recomputed defaults.
+    pub fn rekey_port(&mut self, old: u16, new: u16) {
+        if old == new {
+            return;
+        }
+        self.enabled = std::mem::take(&mut self.enabled)
+            .into_iter()
+            .map(|mut sa| {
+                if sa.port() == old {
+                    sa.set_port(new);
+                }
+                sa
+            })
+            .collect();
+        for overrides in [&mut self.disabled, &mut self.lan_enabled] {
+            *overrides = std::mem::take(overrides)
+                .into_iter()
+                .map(|(h, p)| (h, if p == old { new } else { p }))
+                .collect();
+        }
+        self.gua_wan = std::mem::take(&mut self.gua_wan)
+            .into_iter()
+            .map(|mut sa| {
+                if sa.port() == old {
+                    sa.set_port(new);
+                }
+                sa
+            })
+            .collect();
+    }
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, HasModel, VisitFields)]
+#[model = "Model<Self>"]
+pub struct Bindings(pub BTreeMap<u16, BindInfo>);
+
+rpc_toolkit::reflect_ts!(Bindings);
+rpc_toolkit::ts_export!(Bindings, namespaces = [""]);
+
+impl Map for Bindings {
+    type Key = u16;
+    type Value = BindInfo;
+    fn key_str(key: &Self::Key) -> Result<impl AsRef<str>, Error> {
+        Self::key_string(key)
+    }
+    fn key_string(key: &Self::Key) -> Result<InternedString, Error> {
+        Ok(InternedString::from_display(key))
+    }
+}
+
+impl std::ops::Deref for Bindings {
+    type Target = BTreeMap<u16, BindInfo>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Bindings {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+/// Contiguous port-range binding (e.g. WebRTC/STUN/TURN RTP ranges).
+///
+/// Keyed by `internal_start_port` in [`BindingRanges`]. The range covers
+/// `internal_start_port..(internal_start_port + number_of_ports)` and is
+/// forwarded through a single iptables rule per protocol per gateway,
+/// preserving the destination port number.
+#[derive(Debug, Deserialize, Serialize, HasModel, VisitFields)]
+#[serde(rename_all = "camelCase")]
+#[model = "Model<Self>"]
+pub struct RangeBindInfo {
+    pub enabled: bool,
+    pub external_start_port: u16,
+    pub number_of_ports: u16,
+    /// Reachable addresses for this range (LAN IPv4 / WAN IPv4 / mDNS /
+    /// domains) with per-address enabled/disabled overrides — the same model as
+    /// a single-port binding, but IPv4-only and non-SSL. COMPUTED by
+    /// `update_addresses`; every entry uses `external_start_port` as its
+    /// representative port. Public IPs are disabled by default (WAN is opt-in);
+    /// LAN/mDNS/domains are enabled by default.
+    #[serde(default)]
+    pub addresses: DerivedAddressInfo,
+    /// The single restricted `api` interface exported from this range, if any
+    /// (`RangeOrigin.export`). Preserved across idempotent re-binds.
+    #[serde(default)]
+    pub interface: Option<RangeServiceInterface>,
+}
+
+rpc_toolkit::reflect_ts!(RangeBindInfo);
+rpc_toolkit::ts_export!(RangeBindInfo, namespaces = [""]);
+
+#[derive(Debug, Default, Deserialize, Serialize, HasModel, VisitFields)]
+#[model = "Model<Self>"]
+pub struct BindingRanges(pub BTreeMap<u16, RangeBindInfo>);
+
+rpc_toolkit::reflect_ts!(BindingRanges);
+rpc_toolkit::ts_export!(BindingRanges, namespaces = [""]);
+
+impl Map for BindingRanges {
+    type Key = u16;
+    type Value = RangeBindInfo;
+    fn key_str(key: &Self::Key) -> Result<impl AsRef<str>, Error> {
+        Self::key_string(key)
+    }
+    fn key_string(key: &Self::Key) -> Result<InternedString, Error> {
+        Ok(InternedString::from_display(key))
+    }
+}
+
+impl std::ops::Deref for BindingRanges {
+    type Target = BTreeMap<u16, RangeBindInfo>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for BindingRanges {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+/// The inclusive internal port span a claim of `count` ports from `start` covers.
+/// `count - 1` is taken first — `start + count` overflows u16 for a span ending
+/// at 65535.
+pub fn internal_span(start: u16, count: u16) -> Result<RangeInclusive<u16>, Error> {
+    count
+        .checked_sub(1)
+        .and_then(|last| start.checked_add(last))
+        .map(|end| start..=end)
+        .ok_or_else(|| {
+            Error::new(
+                eyre!("a span of {count} ports from {start} does not fit in the port space"),
+                ErrorKind::InvalidRequest,
+            )
+        })
+}
+
+pub fn overlap_error(claim: &RangeInclusive<u16>, existing: &RangeInclusive<u16>) -> Error {
+    fn describe(span: &RangeInclusive<u16>) -> String {
+        if span.start() == span.end() {
+            format!("port {}", span.start())
+        } else {
+            format!("port range {}-{}", span.start(), span.end())
+        }
+    }
+    Error::new(
+        eyre!(
+            "internal {} overlaps {}, which this host already binds",
+            describe(claim),
+            describe(existing)
+        ),
+        ErrorKind::InvalidRequest,
+    )
+}
+
+impl Bindings {
+    /// The span of the first enabled single-port binding inside `claim`.
+    pub fn enabled_overlap(&self, claim: &RangeInclusive<u16>) -> Option<RangeInclusive<u16>> {
+        self.range(claim.clone())
+            .find(|(_, info)| info.enabled)
+            .map(|(port, _)| *port..=*port)
+    }
+}
+
+impl BindingRanges {
+    /// The span of the first enabled range overlapping `claim`. `rebinding` is
+    /// the key of the entry an idempotent re-bind re-affirms, which must not
+    /// conflict with itself.
+    pub fn enabled_overlap(
+        &self,
+        claim: &RangeInclusive<u16>,
+        rebinding: Option<u16>,
+    ) -> Result<Option<RangeInclusive<u16>>, Error> {
+        for (start, info) in self.iter() {
+            if !info.enabled || Some(*start) == rebinding {
+                continue;
+            }
+            let existing = internal_span(*start, info.number_of_ports)?;
+            if existing.start() <= claim.end() && claim.start() <= existing.end() {
+                return Ok(Some(existing));
+            }
+        }
+        Ok(None)
+    }
+}
+
+impl RangeBindInfo {
+    pub fn disable(&mut self) {
+        self.enabled = false;
+    }
+
+    /// Hand the whole span back to the pool. `number_of_ports` is at least 2,
+    /// so subtract before adding — `start + count` overflows a u16 at 65535.
+    pub fn release(&self, available_ports: &mut AvailablePorts) {
+        available_ports
+            .free(self.external_start_port..=self.external_start_port + (self.number_of_ports - 1));
+    }
+
+    /// Addresses actually served by this range. Analogous to
+    /// [`BindInfo::enabled_addresses`]: a range with no exported interface is
+    /// internal-only (lo / lxcbr0), its per-address overrides dormant.
+    pub fn enabled_addresses(&self) -> BTreeSet<&HostnameInfo> {
+        let enabled = self.addresses.enabled();
+        if self.interface.is_none() {
+            enabled.into_iter().filter(|a| a.is_internal()).collect()
+        } else {
+            enabled
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, HasModel, VisitFields)]
+#[serde(rename_all = "camelCase")]
+#[model = "Model<Self>"]
+pub struct BindInfo {
+    pub enabled: bool,
+    pub options: BindOptions,
+    pub net: NetInfo,
+    pub addresses: DerivedAddressInfo,
+    /// Service interfaces exported from this binding (`Origin.export`). A single
+    /// binding (host + internal port) may back several interfaces (e.g. a `ui`
+    /// and an `api` on the same port), so this is keyed by interface id.
+    #[serde(default)]
+    pub interfaces: BTreeMap<ServiceInterfaceId, ServiceInterface>,
+}
+
+rpc_toolkit::reflect_ts!(BindInfo);
+rpc_toolkit::ts_export!(BindInfo, namespaces = [""]);
+
+#[derive(Clone, Debug, Deserialize, Serialize, VisitFields, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "camelCase")]
+pub struct NetInfo {
+    pub assigned_port: Option<u16>,
+    pub assigned_ssl_port: Option<u16>,
+}
+
+rpc_toolkit::reflect_ts!(NetInfo);
+rpc_toolkit::ts_export!(NetInfo, namespaces = [""]);
+impl BindInfo {
+    /// Addresses actually served by this binding. A binding with no exported
+    /// service interface listens internally only (lo / lxcbr0) — the operator's
+    /// per-address `enabled`/`disabled` overrides stay stored but dormant until
+    /// an interface is exported, at which point they take effect again.
+    pub fn enabled_addresses(&self) -> BTreeSet<&HostnameInfo> {
+        let enabled = self.addresses.enabled();
+        if self.interfaces.is_empty() {
+            enabled.into_iter().filter(|a| a.is_internal()).collect()
+        } else {
+            enabled
+        }
+    }
+
+    pub fn new(
+        available_ports: &mut AvailablePorts,
+        options: BindOptions,
+        privileged: bool,
+    ) -> Result<Self, Error> {
+        let mut assigned_port = None;
+        let mut assigned_ssl_port = None;
+        if let Some(preferred) = options.preferred_ssl_port() {
+            assigned_ssl_port = available_ports
+                .try_alloc(preferred, true, privileged)
+                .or_else(|| Some(available_ports.alloc(true).ok()?));
+        }
+        if options.wants_plain_port() {
+            assigned_port = available_ports
+                .try_alloc(options.preferred_external_port, false, privileged)
+                .or_else(|| Some(available_ports.alloc(false).ok()?));
+        }
+
+        Ok(Self {
+            enabled: true,
+            options,
+            net: NetInfo {
+                assigned_port,
+                assigned_ssl_port,
+            },
+            addresses: DerivedAddressInfo::default(),
+            interfaces: BTreeMap::new(),
+        })
+    }
+    pub fn update(
+        self,
+        available_ports: &mut AvailablePorts,
+        options: BindOptions,
+        privileged: bool,
+    ) -> Result<Self, Error> {
+        let Self {
+            net: held,
+            addresses,
+            interfaces,
+            ..
+        } = self;
+        // Free both up front so each leg can reclaim the number it already holds —
+        // it is in the user's address book and keys their per-address overrides.
+        available_ports.free(held.assigned_port.into_iter().chain(held.assigned_ssl_port));
+        let preferred_ssl_port = options.preferred_ssl_port();
+        let wants_plain_port = options.wants_plain_port();
+        let mut reclaim = |held: Option<u16>, preferred: u16, ssl: bool| {
+            for port in held.into_iter().chain([preferred]) {
+                if let Some(port) = available_ports.try_alloc(port, ssl, privileged) {
+                    return Ok(port);
+                }
+            }
+            available_ports.alloc(ssl)
+        };
+
+        let assigned_ssl_port = preferred_ssl_port
+            .map(|preferred| reclaim(held.assigned_ssl_port, preferred, true))
+            .transpose()?;
+        let assigned_port = wants_plain_port
+            .then(|| reclaim(held.assigned_port, options.preferred_external_port, false))
+            .transpose()?;
+
+        Ok(Self {
+            enabled: true,
+            options,
+            net: NetInfo {
+                assigned_port,
+                assigned_ssl_port,
+            },
+            addresses,
+            interfaces,
+        })
+    }
+    pub fn disable(&mut self) {
+        self.enabled = false;
+    }
+
+    /// Inverse of [`BindInfo::new`]. Unlike [`BindInfo::update`], which reclaims
+    /// the same numbers to keep the user's address book stable, this returns
+    /// them to the pool for anyone.
+    pub fn release(&self, available_ports: &mut AvailablePorts) {
+        available_ports.free(
+            self.net
+                .assigned_port
+                .into_iter()
+                .chain(self.net.assigned_ssl_port),
+        );
+    }
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, VisitFields)]
+#[serde(rename_all = "camelCase")]
+pub struct Security {
+    pub ssl: bool,
+}
+
+rpc_toolkit::reflect_ts!(Security);
+rpc_toolkit::ts_export!(Security, namespaces = [""]);
+
+#[derive(Clone, Debug, Deserialize, Serialize, VisitFields)]
+#[serde(rename_all = "camelCase")]
+pub struct BindOptions {
+    pub preferred_external_port: u16,
+    pub add_ssl: Option<AddSslOptions>,
+    pub secure: Option<Security>,
+}
+
+rpc_toolkit::reflect_ts!(BindOptions);
+rpc_toolkit::ts_export!(BindOptions, namespaces = [""]);
+
+impl BindOptions {
+    /// The container terminates TLS itself; the OS fronts its port with an
+    /// SNI-passthrough listener that pipes the raw TLS stream through.
+    pub fn serves_own_tls(&self) -> bool {
+        self.secure.map_or(false, |s| s.ssl) && self.add_ssl.is_none()
+    }
+
+    /// The `add_ssl` options for a binding StartOS rewraps: one whose container
+    /// serves its own TLS behind a listener of ours that terminates the client's.
+    pub fn rewrap(&self) -> Option<&AddSslOptions> {
+        self.add_ssl
+            .as_ref()
+            .filter(|_| self.secure.map_or(false, |s| s.ssl))
+    }
+
+    /// Preferred external port for the TLS-carrying listener: the OS's own when
+    /// it terminates (`add_ssl`), otherwise the binding's, since a self-TLS
+    /// binding has no second port to take one from.
+    pub fn preferred_ssl_port(&self) -> Option<u16> {
+        self.add_ssl
+            .as_ref()
+            .map(|s| s.preferred_external_port)
+            .or_else(|| {
+                self.serves_own_tls()
+                    .then_some(self.preferred_external_port)
+            })
+    }
+
+    /// A plaintext external port exists unless the container itself speaks TLS
+    /// — two listening ports both carrying TLS makes no sense.
+    pub fn wants_plain_port(&self) -> bool {
+        !self.secure.map_or(false, |s| s.ssl)
+    }
+}
+
+/// How the OS reverse proxy validates the container's TLS certificate when it
+/// rewraps SSL (`add_ssl` set AND `secure.ssl == true`, so the OS terminates
+/// the client's TLS and initiates a fresh TLS connection to the container).
+/// Absent (`None`) means validate against the StartOS root CA — the default.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, VisitVariants)]
+#[serde(rename_all = "camelCase")]
+pub enum UpstreamCertValidation {
+    /// Do not validate the container's certificate at all. Use when the
+    /// container serves a self-signed cert on the trusted internal bridge.
+    Disable,
+    /// Validate against this PEM-encoded certificate (or chain) instead of the
+    /// StartOS root CA.
+    Certificate(String),
+}
+
+rpc_toolkit::reflect_ts!(UpstreamCertValidation);
+rpc_toolkit::ts_export!(UpstreamCertValidation, namespaces = [""]);
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, VisitFields)]
+#[serde(rename_all = "camelCase")]
+pub struct AddSslOptions {
+    pub preferred_external_port: u16,
+    /// When `true`, the OS reverse proxy adds `X-Forwarded-Proto: https`
+    /// and `X-Forwarded-For: <client-ip>` to incoming HTTP requests before
+    /// forwarding them upstream. Setting this implies HTTP-aware proxying.
+    #[serde(default)]
+    pub add_x_forwarded_headers: bool,
+    /// The application protocols StartOS answers a client with, from those it
+    /// asked for. Unset answers with whatever it asked for.
+    #[serde(default, deserialize_with = "legacy_alpn::deserialize")]
+    #[visit(input_wire = "Option<legacy_alpn::CompatibleAlpnInfo>")]
+    #[visit(type_attributes(visit::input_wire))]
+    pub alpn: Option<AlpnInfo>,
+    /// Certificate validation for the OS→container TLS leg when rewrapping.
+    /// `None` (the default) validates against the StartOS root CA.
+    #[serde(default)]
+    pub upstream_cert_validation: Option<UpstreamCertValidation>,
+    /// Optional reverse-proxy auth gate. When set, the OS reverse proxy
+    /// will validate the `Authorization` header on incoming HTTP requests
+    /// against this configuration before forwarding them upstream.
+    /// Unauthenticated requests get `401 Unauthorized` with an appropriate
+    /// `WWW-Authenticate` challenge. For `Basic`, the authenticated
+    /// username is forwarded to the upstream service as `X-Forwarded-User`.
+    /// Setting this implies HTTP-aware proxying.
+    #[serde(default)]
+    pub auth: Option<ProxyAuth>,
+}
+
+rpc_toolkit::reflect_ts!(AddSslOptions);
+rpc_toolkit::ts_export!(AddSslOptions, namespaces = [""]);
+
+mod legacy_alpn {
+    use serde::{Deserialize, Deserializer};
+
+    use crate::net::vhost::AlpnInfo;
+    use crate::util::serde::MaybeUtf8String;
+
+    #[derive(Deserialize, visit_rs::VisitVariants)]
+    #[serde(rename_all = "camelCase")]
+    pub(super) enum LegacyAlpnInfo {
+        Reflect,
+        Specified(Vec<MaybeUtf8String>),
+    }
+
+    rpc_toolkit::reflect_ts!(LegacyAlpnInfo);
+
+    #[derive(Deserialize, visit_rs::VisitVariants)]
+    #[serde(untagged)]
+    pub(super) enum CompatibleAlpnInfo {
+        Current(Vec<MaybeUtf8String>),
+        Legacy(LegacyAlpnInfo),
+    }
+
+    rpc_toolkit::reflect_ts!(CompatibleAlpnInfo);
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Option<AlpnInfo>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(
+            match Option::<CompatibleAlpnInfo>::deserialize(deserializer)? {
+                None | Some(CompatibleAlpnInfo::Legacy(LegacyAlpnInfo::Reflect)) => None,
+                Some(CompatibleAlpnInfo::Current(protocols))
+                | Some(CompatibleAlpnInfo::Legacy(LegacyAlpnInfo::Specified(protocols))) => {
+                    Some(AlpnInfo(protocols))
+                }
+            },
+        )
+    }
+}
+
+/// Auth gate enforced by the OS reverse proxy on incoming requests.
+///
+/// - `Bearer { tokens }`: any of `tokens` is accepted as `Authorization: Bearer <token>`.
+/// - `Basic  { credentials }`: any `(username, password)` pair in `credentials` is
+///   accepted as `Authorization: Basic <base64(username:password)>`. The matched
+///   `username` is forwarded upstream as `X-Forwarded-User`.
+///
+/// `realm` is the authentication realm advertised in the
+/// `WWW-Authenticate` challenge sent on 401 responses (RFC 7235
+/// §2.2). Defaults to `"StartOS"` when unset. Packages that share
+/// credentials across multiple bindings should pick a stable realm
+/// so that browsers reuse cached credentials across them.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, VisitVariants)]
+#[serde(rename_all = "camelCase", tag = "type")]
+pub enum ProxyAuth {
+    Bearer {
+        tokens: Vec<String>,
+        #[serde(default)]
+        realm: Option<String>,
+    },
+    Basic {
+        credentials: Vec<BasicCredential>,
+        #[serde(default)]
+        realm: Option<String>,
+    },
+}
+
+rpc_toolkit::reflect_ts!(ProxyAuth);
+rpc_toolkit::ts_export!(ProxyAuth, namespaces = [""]);
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, VisitFields)]
+#[serde(rename_all = "camelCase")]
+pub struct BasicCredential {
+    pub username: String,
+    pub password: String,
+}
+
+rpc_toolkit::reflect_ts!(BasicCredential);
+rpc_toolkit::ts_export!(BasicCredential, namespaces = [""]);
+
+pub fn binding<C: Context, Kind: HostApiKind>()
+-> ParentHandler<C, Kind::Params, Kind::InheritedParams> {
+    ParentHandler::<C, Kind::Params, Kind::InheritedParams>::new()
+        .subcommand(
+            "list",
+            from_fn_async(list_bindings::<Kind>)
+                .with_inherited(Kind::inheritance)
+                .with_display_serializable()
+                .with_custom_display_fn(|HandlerArgs { params, .. }, res| {
+                    use prettytable::*;
+
+                    if let Some(format) = params.format {
+                        return display_serializable(format, res);
+                    }
+
+                    let mut table = Table::new();
+                    table.add_row(row![bc =>
+                        "INTERNAL PORT",
+                        "ENABLED",
+                        "EXTERNAL PORT",
+                        "EXTERNAL SSL PORT",
+                        "BRIDGE",
+                        "BRIDGE SSL",
+                    ]);
+                    for (internal, info) in res.iter() {
+                        let bridge = |ssl: bool| {
+                            bridge_address(&info.addresses, ssl)
+                                .map_or_else(|| "N/A".to_owned(), |a| a.to_string())
+                        };
+                        table.add_row(row![
+                            internal,
+                            info.enabled,
+                            if let Some(port) = info.net.assigned_port {
+                                port.to_string()
+                            } else {
+                                "N/A".to_owned()
+                            },
+                            if let Some(port) = info.net.assigned_ssl_port {
+                                port.to_string()
+                            } else {
+                                "N/A".to_owned()
+                            },
+                            bridge(false),
+                            bridge(true),
+                        ]);
+                    }
+
+                    print_table(&table)?;
+
+                    Ok(())
+                })
+                .with_about("about.list-bindings-for-host")
+                .with_call_remote::<CliContext>(),
+        )
+        .subcommand(
+            "set-address-enabled",
+            from_fn_async(set_address_enabled::<Kind>)
+                .with_metadata("sync_db", Value::Bool(true))
+                .with_inherited(Kind::inheritance)
+                .no_cli(),
+        )
+        .subcommand(
+            "set-address-enabled",
+            from_fn_async_local(cli_set_address_enabled::<Kind>)
+                .no_ts()
+                .with_inherited(Kind::inheritance)
+                .no_display()
+                .with_about("about.set-address-enabled-for-binding"),
+        )
+        .subcommand(
+            "set-range-address-enabled",
+            from_fn_async(set_range_address_enabled::<Kind>)
+                .with_metadata("sync_db", Value::Bool(true))
+                .with_inherited(Kind::inheritance)
+                .no_cli(),
+        )
+        .subcommand(
+            "set-range-address-enabled",
+            from_fn_async_local(cli_set_range_address_enabled::<Kind>)
+                .no_ts()
+                .with_inherited(Kind::inheritance)
+                .no_display()
+                .with_about("about.set-range-address-enabled-for-binding"),
+        )
+        .subcommand(
+            "set-gua-wan",
+            from_fn_async(set_gua_wan::<Kind>)
+                .with_metadata("sync_db", Value::Bool(true))
+                .with_inherited(Kind::inheritance)
+                .no_cli(),
+        )
+        .subcommand(
+            "set-gua-wan",
+            from_fn_async_local(cli_set_gua_wan::<Kind>)
+                .no_ts()
+                .with_inherited(Kind::inheritance)
+                .no_display()
+                .with_about("about.set-gua-wan-for-binding"),
+        )
+}
+
+/// The row `sdk.host.getBridgeAddress` resolves: IPv4 on the `lxcbr0` gateway.
+fn bridge_address(addresses: &DerivedAddressInfo, ssl: bool) -> Option<SocketAddr> {
+    addresses
+        .available
+        .iter()
+        .find(|a| {
+            a.ssl == ssl
+                && matches!(&a.metadata, HostnameMetadata::Ipv4 { gateway } if gateway.as_str() == START9_BRIDGE_IFACE)
+        })
+        .and_then(HostnameInfo::to_socket_addr)
+}
+
+pub async fn list_bindings<Kind: HostApiKind>(
+    ctx: RpcContext,
+    _: Empty,
+    inheritance: Kind::Inheritance,
+) -> Result<Bindings, Error> {
+    Kind::host_for(&inheritance, &mut ctx.db.peek().await)?
+        .as_bindings()
+        .de()
+}
+
+#[derive(Deserialize, Serialize, VisitFields)]
+#[serde(rename_all = "camelCase")]
+pub struct BindingSetAddressEnabledParams {
+    internal_port: u16,
+    address: HostnameInfo,
+    enabled: Option<bool>,
+}
+
+rpc_toolkit::reflect_ts!(BindingSetAddressEnabledParams);
+rpc_toolkit::ts_export!(BindingSetAddressEnabledParams, namespaces = [""]);
+
+#[derive(Deserialize, Serialize, Parser)]
+#[group(skip)]
+#[serde(rename_all = "camelCase")]
+pub struct CliBindingSetAddressEnabledParams {
+    #[arg(help = "help.arg.internal-port")]
+    internal_port: u16,
+    #[arg(long, help = "help.arg.address")]
+    address: String,
+    #[arg(long, help = "help.arg.binding-enabled")]
+    enabled: Option<bool>,
+}
+
+// On a non-SSL port (no SNI) a domain shares the bare IP's packets, so a domain
+// links the IPs at its gateway+port. There are two parallel "levels":
+//   WAN level: public domain(s) + bare WAN IPv4 + the GUA-as-public
+//   LAN level: private domain(s) + bare LAN IPv4 + the GUA-as-local
+// The IPv6 GUA is a single address shared by both — a public GUA is reachable on
+// LAN too, so **public wins**: if the WAN level is on the GUA is public, else if
+// the LAN level is on it is local, else it is off. WAN addresses are opt-in
+// (public IPs), LAN addresses are opt-out (on by default).
+
+/// Is there a non-SSL public domain at this `gateway` + `port`? Without one the
+/// WAN IPv4 and GUA toggle independently.
+pub(crate) fn has_nonssl_public_domain(
+    addresses: &DerivedAddressInfo,
+    gateway: &GatewayId,
+    port: u16,
+) -> bool {
+    addresses.available.iter().any(|a| {
+        !a.ssl
+            && a.port == Some(port)
+            && matches!(&a.metadata, HostnameMetadata::PublicDomain { gateway: gw } if gw == gateway)
+    })
+}
+
+/// Is there a non-SSL private domain at this `gateway` + `port`? The LAN mirror
+/// of [`has_nonssl_public_domain`].
+pub(crate) fn has_nonssl_private_domain(
+    addresses: &DerivedAddressInfo,
+    gateway: &GatewayId,
+    port: u16,
+) -> bool {
+    addresses.available.iter().any(|a| {
+        !a.ssl
+            && a.port == Some(port)
+            && matches!(&a.metadata, HostnameMetadata::PrivateDomain { gateways } if gateways.contains(gateway))
+    })
+}
+
+/// Is the LAN level (private domain or bare LAN IPv4) currently on at
+/// `gateway`+`port`? Excludes the GUA.
+fn nonssl_lan_on(addresses: &DerivedAddressInfo, gateway: &GatewayId, port: u16) -> bool {
+    addresses.available.iter().any(|a| {
+        if a.ssl || a.port != Some(port) {
+            return false;
+        }
+        match &a.metadata {
+            HostnameMetadata::PrivateDomain { gateways } if gateways.contains(gateway) => {
+                !addresses.disabled.contains(&override_key(a))
+            }
+            HostnameMetadata::Ipv4 { gateway: gw } if !a.public && gw == gateway => {
+                addresses.lan_ip_on(a)
+            }
+            _ => false,
+        }
+    })
+}
+
+/// Re-derive every GUA's reachability at `gateway`+`port` from its stored WAN
+/// opt-in (`gua_wan`, projected to `HostnameInfo.public`) and the LAN level. The
+/// WAN opt-in is an operator preference — this only READS it, never clobbers it,
+/// so a LAN-level change can't un-publish a GUA. A public GUA (in `gua_wan`) is
+/// reachable on WAN and LAN (public wins); otherwise it is local (on while the
+/// LAN level is up, else off). Only [`set_nonssl_wan_group`]/`set_gua_wan` write
+/// `gua_wan`.
+fn resolve_nonssl_gua(addresses: &mut DerivedAddressInfo, gateway: &GatewayId, port: u16) {
+    let lan_on = nonssl_lan_on(addresses, gateway, port);
+    let guas: Vec<(SocketAddrV6, InternedString)> = addresses
+        .available
+        .iter()
+        .filter_map(|a| {
+            if a.ssl || a.port != Some(port) {
+                return None;
+            }
+            match &a.metadata {
+                HostnameMetadata::Ipv6 { gateway: gw, .. } if gw == gateway => {
+                    a.gua().map(|g| (g, a.hostname.clone()))
+                }
+                _ => None,
+            }
+        })
+        .collect();
+    for (g, host) in guas {
+        let key = (host, port);
+        let sa = SocketAddr::V6(g);
+        if addresses.gua_wan.contains(&g) {
+            // Public (operator WAN opt-in): reachable on WAN and LAN.
+            addresses.enabled.insert(sa);
+            addresses.disabled.remove(&key);
+            addresses.lan_enabled.remove(&key);
+        } else {
+            // Local: LAN-only, following the LAN level.
+            addresses.enabled.remove(&sa);
+            addresses.set_lan_ip(key, lan_on);
+        }
+    }
+}
+
+/// Set the non-SSL WAN level at `gateway`+`port` — the public domain(s) and the
+/// bare WAN IPv4 — to `enabled`, then resolve the shared GUA. On a non-SSL port
+/// there is no SNI, so these share the same packets and move as one. Callers gate
+/// on a public domain being present ([`has_nonssl_public_domain`]).
+pub(crate) fn set_nonssl_wan_group(
+    addresses: &mut DerivedAddressInfo,
+    gateway: &GatewayId,
+    port: u16,
+    enabled: bool,
+) {
+    let mut domain_keys = Vec::new();
+    let mut ipv4 = Vec::new();
+    let mut guas = Vec::new();
+    for a in &addresses.available {
+        if a.ssl || a.port != Some(port) {
+            continue;
+        }
+        match &a.metadata {
+            HostnameMetadata::PublicDomain { gateway: gw } if gw == gateway => {
+                domain_keys.push((a.hostname.clone(), port));
+            }
+            HostnameMetadata::Ipv4 { gateway: gw } if a.public && gw == gateway => {
+                if let Some(sa) = a.to_socket_addr() {
+                    ipv4.push(sa);
+                }
+            }
+            HostnameMetadata::Ipv6 { gateway: gw, .. } if gw == gateway => {
+                if let Some(g) = a.gua() {
+                    guas.push(g);
+                }
+            }
+            _ => {}
+        }
+    }
+    for k in domain_keys {
+        if enabled {
+            addresses.disabled.remove(&k);
+        } else {
+            addresses.disabled.insert(k);
+        }
+    }
+    for sa in ipv4 {
+        if enabled {
+            addresses.enabled.insert(sa);
+        } else {
+            addresses.enabled.remove(&sa);
+        }
+    }
+    // The public domain flips the GUA's WAN opt-in (the stored `gua_wan` /
+    // `public` flag) with it; `resolve_nonssl_gua` then derives its reachability.
+    for g in guas {
+        if enabled {
+            addresses.gua_wan.insert(g);
+        } else {
+            addresses.gua_wan.remove(&g);
+        }
+    }
+    resolve_nonssl_gua(addresses, gateway, port);
+}
+
+/// Set the non-SSL LAN level at `gateway`+`port` — the private domain(s) and the
+/// bare LAN IPv4 — to `enabled`, then resolve the shared GUA. The LAN mirror of
+/// [`set_nonssl_wan_group`]; callers gate on a private domain being present
+/// ([`has_nonssl_private_domain`]).
+pub(crate) fn set_nonssl_lan_group(
+    addresses: &mut DerivedAddressInfo,
+    gateway: &GatewayId,
+    port: u16,
+    enabled: bool,
+) {
+    let mut domains = Vec::new();
+    let mut ips = Vec::new();
+    for a in &addresses.available {
+        if a.ssl || a.port != Some(port) {
+            continue;
+        }
+        match &a.metadata {
+            HostnameMetadata::PrivateDomain { gateways } if gateways.contains(gateway) => {
+                domains.push((a.hostname.clone(), port));
+            }
+            HostnameMetadata::Ipv4 { gateway: gw } if !a.public && gw == gateway => {
+                ips.push((a.hostname.clone(), port));
+            }
+            _ => {}
+        }
+    }
+    for k in domains {
+        if enabled {
+            addresses.disabled.remove(&k);
+        } else {
+            addresses.disabled.insert(k);
+        }
+    }
+    for k in ips {
+        addresses.set_lan_ip(k, enabled);
+    }
+    resolve_nonssl_gua(addresses, gateway, port);
+}
+
+/// Toggle one address on/off for a binding's `DerivedAddressInfo`. Public IPs
+/// live in the `enabled` set (keyed by `SocketAddr`); domains live in the
+/// `disabled` set and private IPs in `disabled` or `lan_enabled` (keyed by
+/// `(hostname, port)`). On a non-SSL port a dual-stack public domain links the
+/// WAN IPv4 and IPv6 GUA, so toggling any one of {IPv4, domain, GUA} moves the
+/// whole group ([`set_nonssl_wan_group`]).
+/// Shared by single-port bindings and port ranges (whose addresses all use
+/// `external_start_port` as their port, so the same keying applies).
+fn set_address_enabled_on(
+    addresses: &mut DerivedAddressInfo,
+    address: &HostnameInfo,
+    enabled: bool,
+) -> Result<(), Error> {
+    if address.public && address.metadata.is_ip() {
+        // Public IPs: toggle via SocketAddr in `enabled` set
+        let sa = address.to_socket_addr().ok_or_else(|| {
+            Error::new(
+                eyre!("cannot convert address to socket addr"),
+                ErrorKind::InvalidRequest,
+            )
+        })?;
+        if enabled {
+            addresses.enabled.insert(sa);
+        } else {
+            addresses.enabled.remove(&sa);
+        }
+        // Non-SSL Ipv4: a dual-stack public domain links this to the co-located
+        // GUA, so when one is present move the whole {IPv4, domain, GUA} group
+        // together (no domain => v4 and gua stay independent).
+        if !address.ssl {
+            if let HostnameMetadata::Ipv4 { gateway } = &address.metadata {
+                let port = sa.port();
+                if has_nonssl_public_domain(addresses, gateway, port) {
+                    set_nonssl_wan_group(addresses, gateway, port, enabled);
+                }
+            }
+        }
+    } else {
+        let port = address.port.unwrap_or(if address.ssl { 443 } else { 80 });
+        let key = (address.hostname.clone(), port);
+        if address.metadata.is_ip() {
+            addresses.set_lan_ip(key, enabled);
+        } else if enabled {
+            addresses.disabled.remove(&key);
+        } else {
+            addresses.disabled.insert(key);
+        }
+        // Non-SSL: a domain ties the v4 and v6 sides together (no SNI). A public
+        // domain moves the WAN level; a private domain (or the bare LAN IPv4, when
+        // a private domain links them) moves the LAN level.
+        if !address.ssl {
+            match &address.metadata {
+                HostnameMetadata::PublicDomain { gateway } => {
+                    set_nonssl_wan_group(addresses, gateway, port, enabled);
+                }
+                HostnameMetadata::PrivateDomain { gateways } => {
+                    for gateway in gateways {
+                        set_nonssl_lan_group(addresses, gateway, port, enabled);
+                    }
+                }
+                // Bare LAN IPv4 (this branch is never reached for a public IP).
+                HostnameMetadata::Ipv4 { gateway } => {
+                    if has_nonssl_private_domain(addresses, gateway, port) {
+                        set_nonssl_lan_group(addresses, gateway, port, enabled);
+                    }
+                }
+                // Off takes every LAN IP it resolves to off with it.
+                HostnameMetadata::Mdns { gateways } if !enabled => {
+                    for gateway in gateways {
+                        if has_nonssl_private_domain(addresses, gateway, port) {
+                            set_nonssl_lan_group(addresses, gateway, port, false);
+                        }
+                    }
+                    let held: Vec<_> = addresses
+                        .available
+                        .iter()
+                        .filter(|ip| !ip.public && mdns_covers(address, ip))
+                        .map(override_key)
+                        .collect();
+                    for key in held {
+                        addresses.lan_enabled.remove(&key);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Toggle one address of a single-port binding (keyed by its internal port).
+/// Port ranges use [`set_range_address_enabled`] — they live in a separate DB
+/// subtree, so the API distinguishes the two rather than probing both.
+pub async fn set_address_enabled<Kind: HostApiKind>(
+    ctx: RpcContext,
+    BindingSetAddressEnabledParams {
+        internal_port,
+        address,
+        enabled,
+    }: BindingSetAddressEnabledParams,
+    inheritance: Kind::Inheritance,
+) -> Result<(), Error> {
+    let enabled = enabled.unwrap_or(true);
+    if !enabled && address.is_internal() {
+        return Err(Error::new(
+            eyre!("loopback / bridge (internal) addresses cannot be disabled"),
+            ErrorKind::InvalidRequest,
+        ));
+    }
+    ctx.db
+        .mutate(|db| {
+            Kind::host_for(&inheritance, db)?
+                .as_bindings_mut()
+                .mutate(|b| {
+                    let bind = b.get_mut(&internal_port).or_not_found(internal_port)?;
+                    set_address_enabled_on(&mut bind.addresses, &address, enabled)
+                })?;
+            let hostname = ServerHostname::load(db.as_public().as_server_info())?;
+            let gateways = db
+                .as_public()
+                .as_server_info()
+                .as_network()
+                .as_gateways()
+                .de()?;
+            let ports = db.as_private().as_available_ports().de()?;
+            Kind::host_for(&inheritance, db)?.update_addresses(&hostname, &gateways, &ports)
+        })
+        .await
+        .result?;
+    Ok(())
+}
+
+/// Toggle one address of a port-range binding (keyed by its internal start
+/// port). The range counterpart of [`set_address_enabled`]; both share the
+/// address-toggle logic in [`set_address_enabled_on`].
+pub async fn set_range_address_enabled<Kind: HostApiKind>(
+    ctx: RpcContext,
+    BindingSetAddressEnabledParams {
+        internal_port,
+        address,
+        enabled,
+    }: BindingSetAddressEnabledParams,
+    inheritance: Kind::Inheritance,
+) -> Result<(), Error> {
+    let enabled = enabled.unwrap_or(true);
+    if !enabled && address.is_internal() {
+        return Err(Error::new(
+            eyre!("loopback / bridge (internal) addresses cannot be disabled"),
+            ErrorKind::InvalidRequest,
+        ));
+    }
+    ctx.db
+        .mutate(|db| {
+            Kind::host_for(&inheritance, db)?
+                .as_binding_ranges_mut()
+                .mutate(|ranges| {
+                    let range = ranges.get_mut(&internal_port).or_not_found(internal_port)?;
+                    set_address_enabled_on(&mut range.addresses, &address, enabled)
+                })?;
+            let hostname = ServerHostname::load(db.as_public().as_server_info())?;
+            let gateways = db
+                .as_public()
+                .as_server_info()
+                .as_network()
+                .as_gateways()
+                .de()?;
+            let ports = db.as_private().as_available_ports().de()?;
+            Kind::host_for(&inheritance, db)?.update_addresses(&hostname, &gateways, &ports)
+        })
+        .await
+        .result?;
+    Ok(())
+}
+
+#[derive(Deserialize, Serialize, VisitFields)]
+#[serde(rename_all = "camelCase")]
+pub struct BindingSetGuaWanParams {
+    internal_port: u16,
+    address: HostnameInfo,
+    wan: bool,
+}
+
+rpc_toolkit::reflect_ts!(BindingSetGuaWanParams);
+rpc_toolkit::ts_export!(BindingSetGuaWanParams, namespaces = [""]);
+
+#[derive(Deserialize, Serialize, Parser)]
+#[group(skip)]
+#[serde(rename_all = "camelCase")]
+pub struct CliBindingSetGuaWanParams {
+    #[arg(help = "help.arg.internal-port")]
+    internal_port: u16,
+    #[arg(long, help = "help.arg.address")]
+    address: String,
+    #[arg(long, help = "help.arg.gua-wan")]
+    wan: bool,
+}
+
+/// Opt a single IPv6 GUA on a binding into (or out of) WAN exposure. The flag
+/// is projected into `HostnameInfo.public` by `update_addresses`, so the row's
+/// enable/disable override set switches (`disabled` while local, `enabled`
+/// while public) — the current on/off state is carried across the flip. Errors
+/// if `address` is not an IPv6 global-unicast address.
+pub async fn set_gua_wan<Kind: HostApiKind>(
+    ctx: RpcContext,
+    BindingSetGuaWanParams {
+        internal_port,
+        address,
+        wan,
+    }: BindingSetGuaWanParams,
+    inheritance: Kind::Inheritance,
+) -> Result<(), Error> {
+    let gua = address.gua().ok_or_else(|| {
+        Error::new(
+            eyre!("address is not an IPv6 global-unicast address"),
+            ErrorKind::InvalidRequest,
+        )
+    })?;
+    ctx.db
+        .mutate(|db| {
+            Kind::host_for(&inheritance, db)?
+                .as_bindings_mut()
+                .mutate(|b| {
+                    let bind = b.get_mut(&internal_port).or_not_found(internal_port)?;
+                    let addrs = &mut bind.addresses;
+                    let sa = SocketAddr::V6(gua);
+                    // A GUA's WAN opt-in is the stored `gua_wan` / `public` flag.
+                    // With a co-located public domain, flipping the GUA drives the
+                    // whole WAN level (the public domain and bare WAN IPv4 follow —
+                    // correct precisely because a public domain is present).
+                    // Otherwise it is a standalone opt-in; `resolve_nonssl_gua`
+                    // derives the GUA's reachability from `gua_wan` + the LAN level.
+                    let gua_gw = match &address.metadata {
+                        HostnameMetadata::Ipv6 { gateway, .. } if !address.ssl => {
+                            Some(gateway.clone())
+                        }
+                        _ => None,
+                    };
+                    match gua_gw {
+                        Some(gateway) if has_nonssl_public_domain(addrs, &gateway, gua.port()) => {
+                            set_nonssl_wan_group(addrs, &gateway, gua.port(), wan);
+                        }
+                        Some(gateway) => {
+                            if wan {
+                                addrs.gua_wan.insert(gua);
+                            } else {
+                                addrs.gua_wan.remove(&gua);
+                            }
+                            resolve_nonssl_gua(addrs, &gateway, gua.port());
+                        }
+                        None => {
+                            // SSL / non-linkable GUA: a plain WAN opt-in toggle.
+                            if wan {
+                                addrs.gua_wan.insert(gua);
+                                addrs.enabled.insert(sa);
+                            } else {
+                                addrs.gua_wan.remove(&gua);
+                                addrs.enabled.remove(&sa);
+                            }
+                        }
+                    }
+                    Ok(())
+                })?;
+            let hostname = ServerHostname::load(db.as_public().as_server_info())?;
+            let gateways = db
+                .as_public()
+                .as_server_info()
+                .as_network()
+                .as_gateways()
+                .de()?;
+            let ports = db.as_private().as_available_ports().de()?;
+            Kind::host_for(&inheritance, db)?.update_addresses(&hostname, &gateways, &ports)
+        })
+        .await
+        .result?;
+    Ok(())
+}
+
+async fn cli_set_address_enabled<Kind: HostApiKind>(
+    HandlerArgs {
+        context,
+        parent_method,
+        method,
+        params,
+        inherited_params,
+        raw_params,
+    }: HandlerArgs<CliContext, CliBindingSetAddressEnabledParams, Kind::Inheritance>,
+) -> Result<(), Error> {
+    call_with_address::<Kind>(
+        &context,
+        parent_method.into_iter().chain(method).join("."),
+        raw_params,
+        &inherited_params,
+        params.internal_port,
+        "bindings",
+        &params.address,
+    )
+    .await
+}
+
+async fn cli_set_range_address_enabled<Kind: HostApiKind>(
+    HandlerArgs {
+        context,
+        parent_method,
+        method,
+        params,
+        inherited_params,
+        raw_params,
+    }: HandlerArgs<CliContext, CliBindingSetAddressEnabledParams, Kind::Inheritance>,
+) -> Result<(), Error> {
+    call_with_address::<Kind>(
+        &context,
+        parent_method.into_iter().chain(method).join("."),
+        raw_params,
+        &inherited_params,
+        params.internal_port,
+        "bindingRanges",
+        &params.address,
+    )
+    .await
+}
+
+async fn cli_set_gua_wan<Kind: HostApiKind>(
+    HandlerArgs {
+        context,
+        parent_method,
+        method,
+        params,
+        inherited_params,
+        raw_params,
+    }: HandlerArgs<CliContext, CliBindingSetGuaWanParams, Kind::Inheritance>,
+) -> Result<(), Error> {
+    call_with_address::<Kind>(
+        &context,
+        parent_method.into_iter().chain(method).join("."),
+        raw_params,
+        &inherited_params,
+        params.internal_port,
+        "bindings",
+        &params.address,
+    )
+    .await
+}
+
+async fn call_with_address<Kind: HostApiKind>(
+    ctx: &CliContext,
+    method: String,
+    mut params: Value,
+    inheritance: &Kind::Inheritance,
+    internal_port: u16,
+    binding_collection: &'static str,
+    address: &str,
+) -> Result<(), Error> {
+    let resolved = if address.trim_start().starts_with('{') {
+        serde_json::from_str(address).with_kind(ErrorKind::Deserialization)?
+    } else {
+        let mut pointer: JsonPointer = Kind::host_pointer(inheritance)?;
+        pointer.push_end(binding_collection);
+        pointer.push_end(&internal_port.to_string());
+        pointer.push_end("addresses");
+        pointer.push_end("available");
+        let dump: Dump = from_value(
+            ctx.call_remote::<RpcContext>(
+                "db.dump",
+                json!({ "pointer": AsRef::<str>::as_ref(&pointer) }),
+            )
+            .await?,
+        )?;
+        let available: BTreeSet<HostnameInfo> =
+            from_value::<Option<_>>(dump.value)?.or_not_found(internal_port)?;
+        let (hostname, port) = parse_address(address);
+        let candidates = available
+            .iter()
+            .filter(|a| a.hostname == hostname && port.is_none_or(|p| served_port(a) == p))
+            .collect::<Vec<_>>();
+        match &candidates[..] {
+            [] => {
+                return Err(Error::new(
+                    eyre!(
+                        "{}\n{}",
+                        t!(
+                            "net.host.binding.address-not-found",
+                            address = address,
+                            port = internal_port
+                        ),
+                        available
+                            .iter()
+                            .map(|a| format!("  {}", describe(a)))
+                            .join("\n"),
+                    ),
+                    ErrorKind::NotFound,
+                ));
+            }
+            [one] => HostnameInfo::clone(one),
+            _ => HostnameInfo::clone(
+                choose_custom_display(
+                    &t!(
+                        "net.host.binding.choose-address",
+                        address = address,
+                        port = internal_port
+                    ),
+                    &candidates,
+                    |a| describe(a),
+                )
+                .await?,
+            ),
+        }
+    };
+    params["address"] = to_value(&resolved)?;
+    ctx.call_remote::<RpcContext>(&method, params).await?;
+    Ok(())
+}
+
+fn parse_address(address: &str) -> (InternedString, Option<u16>) {
+    if let Ok(ip) = address.parse::<IpAddr>() {
+        return (InternedString::from_display(&ip), None);
+    }
+    if let Ok(addr) = address.parse::<SocketAddr>() {
+        return (InternedString::from_display(&addr.ip()), Some(addr.port()));
+    }
+    if let Some(Ok(ip)) = address
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .map(str::parse::<Ipv6Addr>)
+    {
+        return (InternedString::from_display(&ip), None);
+    }
+    match address
+        .rsplit_once(':')
+        .map(|(host, port)| (host, port.parse()))
+    {
+        Some((host, Ok(port))) => (InternedString::intern(host), Some(port)),
+        _ => (InternedString::intern(address), None),
+    }
+}
+
+/// The port a `None` stands for, as [`set_address_enabled_on`] keys it.
+fn served_port(address: &HostnameInfo) -> u16 {
+    address.port.unwrap_or(if address.ssl { 443 } else { 80 })
+}
+
+fn describe(address: &HostnameInfo) -> String {
+    let host = if address.hostname.parse::<Ipv6Addr>().is_ok() {
+        format!("[{}]", address.hostname)
+    } else {
+        address.hostname.to_string()
+    };
+    let kind = t!(match &address.metadata {
+        HostnameMetadata::Ipv4 { .. } => "net.host.binding.address-kind-ipv4",
+        HostnameMetadata::Ipv6 { .. } => "net.host.binding.address-kind-ipv6",
+        HostnameMetadata::Mdns { .. } => "net.host.binding.address-kind-mdns",
+        HostnameMetadata::PrivateDomain { .. } => "net.host.binding.address-kind-private-domain",
+        HostnameMetadata::PublicDomain { .. } => "net.host.binding.address-kind-public-domain",
+        HostnameMetadata::Plugin { .. } => "net.host.binding.address-kind-plugin",
+    });
+    let gateways = address.metadata.gateways().join(", ");
+    format!(
+        "{host}:{}  {kind}{}, {}{}",
+        served_port(address),
+        if gateways.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " {}",
+                t!("net.host.binding.address-via", gateways = gateways)
+            )
+        },
+        t!(if address.public {
+            "net.host.binding.address-public"
+        } else {
+            "net.host.binding.address-private"
+        }),
+        if address.ssl {
+            format!(", {}", t!("net.host.binding.address-ssl"))
+        } else {
+            String::new()
+        },
+    )
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::GatewayId;
+    use crate::net::service_interface::{HostnameInfo, HostnameMetadata};
+    use crate::util::serde::MaybeUtf8String;
+
+    fn ipv6_addr(host: &str, port: u16) -> HostnameInfo {
+        HostnameInfo {
+            ssl: true,
+            public: false,
+            hostname: InternedString::intern(host),
+            port: Some(port),
+            metadata: HostnameMetadata::Ipv6 {
+                gateway: GatewayId::from(InternedString::intern("eth0")),
+                scope_id: 0,
+            },
+        }
+    }
+
+    fn opts(preferred: u16, add_ssl: Option<u16>, ssl: Option<bool>) -> BindOptions {
+        BindOptions {
+            preferred_external_port: preferred,
+            add_ssl: add_ssl.map(|preferred_external_port| AddSslOptions {
+                preferred_external_port,
+                add_x_forwarded_headers: false,
+                alpn: None,
+                upstream_cert_validation: None,
+                auth: None,
+            }),
+            secure: ssl.map(|ssl| Security { ssl }),
+        }
+    }
+
+    fn add_ssl_with_alpn(alpn: serde_json::Value) -> AddSslOptions {
+        serde_json::from_value(serde_json::json!({
+            "preferredExternalPort": 443,
+            "alpn": alpn,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn bridge_address_is_the_lxcbr0_row_not_a_lookalike() {
+        let row = |ssl, hostname: &str, port, metadata| HostnameInfo {
+            ssl,
+            public: false,
+            hostname: InternedString::intern(hostname),
+            port: Some(port),
+            metadata,
+        };
+        let bridge = || HostnameMetadata::Ipv4 {
+            gateway: START9_BRIDGE_IFACE.parse().unwrap(),
+        };
+        let addresses = DerivedAddressInfo {
+            available: [
+                row(
+                    false,
+                    "10.0.3.1",
+                    1,
+                    HostnameMetadata::Plugin {
+                        package_id: "decoy".parse().unwrap(),
+                        remove_action: None,
+                        overflow_actions: vec![],
+                        info: Value::Null,
+                    },
+                ),
+                row(
+                    false,
+                    "192.168.1.5",
+                    8080,
+                    HostnameMetadata::Ipv4 {
+                        gateway: "eth0".parse().unwrap(),
+                    },
+                ),
+                row(false, "10.0.3.1", 8080, bridge()),
+                row(true, "10.0.3.1", 8443, bridge()),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let addr = |ssl| bridge_address(&addresses, ssl).map(|a| a.to_string());
+        assert_eq!(addr(false).as_deref(), Some("10.0.3.1:8080"));
+        assert_eq!(addr(true).as_deref(), Some("10.0.3.1:8443"));
+    }
+
+    #[test]
+    fn add_ssl_accepts_current_and_legacy_alpn_formats() {
+        let protocols = AlpnInfo(vec![
+            MaybeUtf8String(b"h2".to_vec()),
+            MaybeUtf8String(b"http/1.1".to_vec()),
+        ]);
+
+        for json in [
+            serde_json::json!(["h2", "http/1.1"]),
+            serde_json::json!({ "specified": ["h2", "http/1.1"] }),
+        ] {
+            let options = add_ssl_with_alpn(json);
+            assert_eq!(options.alpn, Some(protocols.clone()));
+            assert_eq!(
+                serde_json::to_value(options).unwrap()["alpn"],
+                serde_json::json!(["h2", "http/1.1"]),
+            );
+        }
+
+        for json in [serde_json::Value::Null, serde_json::json!("reflect")] {
+            let options = add_ssl_with_alpn(json);
+            assert_eq!(options.alpn, None);
+            assert_eq!(
+                serde_json::to_value(options).unwrap()["alpn"],
+                serde_json::Value::Null,
+            );
+        }
+    }
+
+    #[test]
+    fn tls_carrying_ports_are_ssl_ports() {
+        let mut ports = AvailablePorts::new();
+        let privileged = false;
+
+        // plaintext: one forwarded port
+        let plain = BindInfo::new(&mut ports, opts(8080, None, Some(false)), privileged).unwrap();
+        assert_eq!(plain.net.assigned_port, Some(8080));
+        assert_eq!(plain.net.assigned_ssl_port, None);
+        assert!(!ports.is_ssl(8080));
+
+        // we terminate TLS in front of a plaintext container: both ports
+        let add_ssl = BindInfo::new(&mut ports, opts(8081, Some(8444), None), privileged).unwrap();
+        assert_eq!(add_ssl.net.assigned_port, Some(8081));
+        assert_eq!(add_ssl.net.assigned_ssl_port, Some(8444));
+        assert!(ports.is_ssl(8444));
+
+        // we rewrap the container's TLS: the ssl port only
+        let rewrap =
+            BindInfo::new(&mut ports, opts(8082, Some(8445), Some(true)), privileged).unwrap();
+        assert_eq!(rewrap.net.assigned_port, None);
+        assert_eq!(rewrap.net.assigned_ssl_port, Some(8445));
+
+        // the container serves its own TLS: the ssl port only, fronted by
+        // our SNI-passthrough listener
+        let own_tls = BindInfo::new(&mut ports, opts(8083, None, Some(true)), privileged).unwrap();
+        assert_eq!(own_tls.net.assigned_port, None);
+        assert_eq!(own_tls.net.assigned_ssl_port, Some(8083));
+        assert!(ports.is_ssl(8083));
+    }
+
+    #[test]
+    fn changing_how_a_port_is_served_keeps_its_number() {
+        let mut ports = AvailablePorts::new();
+        let privileged = false;
+        let plain = BindInfo::new(&mut ports, opts(8080, None, Some(false)), privileged).unwrap();
+        assert_eq!(plain.net.assigned_port, Some(8080));
+
+        let own_tls = plain
+            .update(&mut ports, opts(8080, None, Some(true)), privileged)
+            .unwrap();
+        assert_eq!(own_tls.net.assigned_port, None);
+        assert_eq!(own_tls.net.assigned_ssl_port, Some(8080));
+        assert!(ports.is_ssl(8080));
+
+        // handing termination to us keeps the port
+        let add_ssl = own_tls
+            .update(&mut ports, opts(8080, Some(8080), Some(true)), privileged)
+            .unwrap();
+        assert_eq!(add_ssl.net.assigned_ssl_port, Some(8080));
+        assert!(ports.is_ssl(8080));
+
+        // and back down to plaintext
+        let plain = add_ssl
+            .update(&mut ports, opts(8080, None, Some(false)), privileged)
+            .unwrap();
+        assert_eq!(plain.net.assigned_port, Some(8080));
+        assert_eq!(plain.net.assigned_ssl_port, None);
+        assert!(!ports.is_ssl(8080));
+    }
+
+    /// Retiring has to hand both external ports back. Disabling — all
+    /// `clearBindings` does — keeps them claimed for the life of the server.
+    #[test]
+    fn release_frees_both_ports() {
+        let mut ports = AvailablePorts::new();
+        let privileged = false;
+
+        let bind = BindInfo::new(&mut ports, opts(8081, Some(8444), None), privileged).unwrap();
+        assert_eq!(bind.net.assigned_port, Some(8081));
+        assert_eq!(bind.net.assigned_ssl_port, Some(8444));
+        // not vacuous: both are held before the release
+        assert_eq!(ports.try_alloc(8081, false, privileged), None);
+        assert_eq!(ports.try_alloc(8444, true, privileged), None);
+
+        bind.release(&mut ports);
+
+        assert_eq!(ports.try_alloc(8081, false, privileged), Some(8081));
+        assert_eq!(ports.try_alloc(8444, true, privileged), Some(8444));
+    }
+
+    #[test]
+    fn release_leaves_other_bindings_alone() {
+        let mut ports = AvailablePorts::new();
+        let privileged = false;
+        let neighbor =
+            BindInfo::new(&mut ports, opts(9000, None, Some(false)), privileged).unwrap();
+        let bind = BindInfo::new(&mut ports, opts(8080, None, Some(false)), privileged).unwrap();
+        assert_eq!(bind.net.assigned_ssl_port, None);
+
+        bind.release(&mut ports);
+
+        assert_eq!(ports.try_alloc(8080, false, privileged), Some(8080));
+        assert_eq!(ports.try_alloc(9000, false, privileged), None);
+        assert_eq!(neighbor.net.assigned_port, Some(9000));
+    }
+
+    /// The whole span, inclusive — and a range ending at 65535 must not
+    /// overflow u16 on the way back to the pool.
+    #[test]
+    fn release_frees_the_whole_range_span() {
+        let mut ports = AvailablePorts::new();
+        let privileged = false;
+        ports.try_alloc_range(65534, 2, privileged).unwrap();
+        let range = RangeBindInfo {
+            enabled: true,
+            external_start_port: 65534,
+            number_of_ports: 2,
+            addresses: Default::default(),
+            interface: None,
+        };
+        assert_eq!(ports.try_alloc(65535, false, privileged), None);
+
+        range.release(&mut ports);
+
+        // succeeds only if both 65534 and 65535 came back
+        ports.try_alloc_range(65534, 2, privileged).unwrap();
+    }
+
+    #[test]
+    fn a_rebind_does_not_migrate_onto_a_freed_preferred_port() {
+        let mut ports = AvailablePorts::new();
+        let privileged = false;
+        // someone else holds 8080, so this binding lands elsewhere
+        assert_eq!(ports.try_alloc(8080, false, privileged), Some(8080));
+        let squatted =
+            BindInfo::new(&mut ports, opts(8080, None, Some(false)), privileged).unwrap();
+        let assigned = squatted.net.assigned_port.unwrap();
+        assert_ne!(assigned, 8080);
+
+        ports.free([8080]);
+        let again = squatted
+            .update(&mut ports, opts(8080, None, Some(false)), privileged)
+            .unwrap();
+        assert_eq!(again.net.assigned_port, Some(assigned));
+    }
+
+    /// The admin UI rebinds on every boot, so `update` is what hands 443 back.
+    #[test]
+    fn the_os_ui_keeps_its_well_known_ports_across_rebinds() {
+        let mut ports = AvailablePorts::new();
+        let privileged = true;
+        // exactly what `NetController::os_bindings` asks for
+        let admin = opts(80, Some(443), None);
+
+        let ui = BindInfo::new(&mut ports, admin.clone(), privileged).unwrap();
+        assert_eq!(ui.net.assigned_port, Some(80));
+        assert_eq!(ui.net.assigned_ssl_port, Some(443));
+        assert!(ports.is_ssl(443));
+
+        let ui = ui.update(&mut ports, admin, privileged).unwrap();
+        assert_eq!(ui.net.assigned_port, Some(80));
+        assert_eq!(ui.net.assigned_ssl_port, Some(443));
+        assert!(ports.is_ssl(443));
+    }
+
+    /// `Public::init` plants the binding already holding 443 but no plaintext
+    /// port, so `os_bindings` only ever reaches it through `update` — the shape
+    /// the test above skips by starting from `new`, which is how the UI came to
+    /// ship on an ephemeral port through 0.4.0.
+    #[test]
+    fn the_os_ui_claims_80_from_the_seeded_binding() {
+        let mut ports = AvailablePorts::new();
+        let admin = opts(80, Some(443), None);
+        let seeded = BindInfo {
+            enabled: false,
+            options: admin.clone(),
+            net: NetInfo {
+                assigned_port: None,
+                assigned_ssl_port: Some(443),
+            },
+            addresses: DerivedAddressInfo::default(),
+            interfaces: BTreeMap::new(),
+        };
+
+        let ui = seeded.update(&mut ports, admin.clone(), true).unwrap();
+        assert_eq!(ui.net.assigned_port, Some(80));
+        assert_eq!(ui.net.assigned_ssl_port, Some(443));
+
+        let ui = ui.update(&mut ports, admin, true).unwrap();
+        assert_eq!(ui.net.assigned_port, Some(80));
+        assert_eq!(ui.net.assigned_ssl_port, Some(443));
+    }
+
+    /// A binding that grows a second leg must not hand the port it already has to
+    /// the new one — each leg keeps its own.
+    #[test]
+    fn gaining_a_leg_does_not_carry_the_other_leg_s_port() {
+        let mut ports = AvailablePorts::new();
+        let privileged = false;
+        let plain = BindInfo::new(&mut ports, opts(8080, None, Some(false)), privileged).unwrap();
+        assert_eq!(plain.net.assigned_port, Some(8080));
+
+        let both = plain
+            .update(&mut ports, opts(8080, Some(8443), None), privileged)
+            .unwrap();
+        assert_eq!(both.net.assigned_port, Some(8080));
+        assert_eq!(both.net.assigned_ssl_port, Some(8443));
+    }
+
+    /// The seeded admin binding is the same shape from the other side, and its
+    /// plaintext leg must want 80 outright — not 443 with 80 as the fallback the
+    /// ssl leg's head start happens to force.
+    #[test]
+    fn the_os_ui_plaintext_leg_wants_80_even_when_443_is_free() {
+        let admin = opts(80, Some(443), None);
+        let seeded = || BindInfo {
+            enabled: false,
+            options: admin.clone(),
+            net: NetInfo {
+                assigned_port: None,
+                assigned_ssl_port: Some(443),
+            },
+            addresses: DerivedAddressInfo::default(),
+            interfaces: BTreeMap::new(),
+        };
+
+        let mut ports = AvailablePorts::new();
+        let ui = seeded().update(&mut ports, admin.clone(), true).unwrap();
+        assert_eq!(ui.net.assigned_port, Some(80));
+        assert_eq!(ui.net.assigned_ssl_port, Some(443));
+
+        // 443 already taken, so the ssl leg cannot clear it out of the plain leg's way.
+        let mut squatted = AvailablePorts::new();
+        assert_eq!(squatted.try_alloc(443, true, true), Some(443));
+        let ui = seeded().update(&mut squatted, admin, true).unwrap();
+        assert_eq!(ui.net.assigned_port, Some(80));
+    }
+
+    /// Why the drift needs `v0_4_0_2` rather than healing itself: `update`
+    /// keeps the port it already holds even for a privileged claimant whose
+    /// preferred port is free.
+    #[test]
+    fn a_drifted_os_ui_port_does_not_heal_on_rebind() {
+        let mut ports = AvailablePorts::new();
+        ports.set_ssl(443, true);
+        ports.set_ssl(55543, false);
+        let admin = opts(80, Some(443), None);
+        let drifted = BindInfo {
+            enabled: false,
+            options: admin.clone(),
+            net: NetInfo {
+                assigned_port: Some(55543),
+                assigned_ssl_port: Some(443),
+            },
+            addresses: DerivedAddressInfo::default(),
+            interfaces: BTreeMap::new(),
+        };
+
+        let ui = drifted.update(&mut ports, admin, true).unwrap();
+        assert_eq!(ui.net.assigned_port, Some(55543));
+    }
+
+    #[test]
+    fn gua_detection() {
+        assert!(ipv6_addr("2001:db8::1", 443).gua().is_some()); // global unicast
+        assert!(ipv6_addr("fd00::1", 443).gua().is_none()); // ULA
+        assert!(ipv6_addr("fe80::1", 443).gua().is_none()); // link-local
+        assert!(ipv6_addr("::1", 443).gua().is_none()); // loopback
+        // An IPv4 address is never a GUA, even at a global-looking string.
+        let v4 = HostnameInfo {
+            hostname: InternedString::intern("1.2.3.4"),
+            metadata: HostnameMetadata::Ipv4 {
+                gateway: GatewayId::from(InternedString::intern("eth0")),
+            },
+            ..ipv6_addr("2001:db8::1", 443)
+        };
+        assert!(v4.gua().is_none());
+    }
+
+    #[test]
+    fn nonssl_wan_group_moves_domain_v4_gua_together() {
+        let gw = GatewayId::from(InternedString::intern("wg1"));
+        let mk = |ssl, public, host: &str, meta| HostnameInfo {
+            ssl,
+            public,
+            hostname: InternedString::intern(host),
+            port: Some(42000),
+            metadata: meta,
+        };
+        let mut info = DerivedAddressInfo::default();
+        info.available.insert(mk(
+            false,
+            true,
+            "turn.start9.dev",
+            HostnameMetadata::PublicDomain {
+                gateway: gw.clone(),
+            },
+        ));
+        info.available.insert(mk(
+            false,
+            true,
+            "64.23.194.12",
+            HostnameMetadata::Ipv4 {
+                gateway: gw.clone(),
+            },
+        ));
+        info.available.insert(mk(
+            false,
+            false,
+            "2001:db8::1",
+            HostnameMetadata::Ipv6 {
+                gateway: gw.clone(),
+                scope_id: 0,
+            },
+        ));
+
+        assert!(has_nonssl_public_domain(&info, &gw, 42000));
+        assert!(!has_nonssl_public_domain(&info, &gw, 9999));
+
+        let v4_sa: SocketAddr = "64.23.194.12:42000".parse().unwrap();
+        let gua_v6: SocketAddrV6 = "[2001:db8::1]:42000".parse().unwrap();
+        let dom_key = (InternedString::intern("turn.start9.dev"), 42000u16);
+
+        // Enable: domain un-disabled, v4 enabled, GUA published (gua_wan+enabled).
+        set_nonssl_wan_group(&mut info, &gw, 42000, true);
+        assert!(!info.disabled.contains(&dom_key));
+        assert!(info.enabled.contains(&v4_sa));
+        assert!(info.gua_wan.contains(&gua_v6));
+        assert!(info.enabled.contains(&SocketAddr::V6(gua_v6)));
+
+        // Disable: all three off together.
+        set_nonssl_wan_group(&mut info, &gw, 42000, false);
+        assert!(info.disabled.contains(&dom_key));
+        assert!(!info.enabled.contains(&v4_sa));
+        assert!(!info.gua_wan.contains(&gua_v6));
+        assert!(!info.enabled.contains(&SocketAddr::V6(gua_v6)));
+    }
+
+    #[test]
+    fn shared_gua_public_wins_over_local() {
+        let gw = GatewayId::from(InternedString::intern("wg1"));
+        let mk = |ssl, public, host: &str, meta| HostnameInfo {
+            ssl,
+            public,
+            hostname: InternedString::intern(host),
+            port: Some(42000),
+            metadata: meta,
+        };
+        let mut info = DerivedAddressInfo::default();
+        info.available.insert(mk(
+            false,
+            true,
+            "pub.example.com",
+            HostnameMetadata::PublicDomain {
+                gateway: gw.clone(),
+            },
+        ));
+        info.available.insert(mk(
+            false,
+            true,
+            "64.23.194.12",
+            HostnameMetadata::Ipv4 {
+                gateway: gw.clone(),
+            },
+        ));
+        info.available.insert(mk(
+            false,
+            false,
+            "priv.local",
+            HostnameMetadata::PrivateDomain {
+                gateways: BTreeSet::from([gw.clone()]),
+            },
+        ));
+        info.available.insert(mk(
+            false,
+            false,
+            "10.0.0.5",
+            HostnameMetadata::Ipv4 {
+                gateway: gw.clone(),
+            },
+        ));
+        info.available.insert(mk(
+            false,
+            false,
+            "2001:db8::1",
+            HostnameMetadata::Ipv6 {
+                gateway: gw.clone(),
+                scope_id: 0,
+            },
+        ));
+
+        let gua_v6: SocketAddrV6 = "[2001:db8::1]:42000".parse().unwrap();
+        let gua_key = (InternedString::intern("2001:db8::1"), 42000u16);
+
+        // WAN level on -> GUA public (public is inclusive of LAN, so it wins).
+        set_nonssl_wan_group(&mut info, &gw, 42000, true);
+        assert!(
+            info.gua_wan.contains(&gua_v6),
+            "public domain on => GUA public"
+        );
+
+        // WAN level off, LAN level still on -> GUA drops to local, not off.
+        set_nonssl_wan_group(&mut info, &gw, 42000, false);
+        assert!(!info.gua_wan.contains(&gua_v6), "GUA no longer public");
+        assert!(
+            !info.disabled.contains(&gua_key),
+            "GUA is local (on), not off, because the LAN level is still up"
+        );
+    }
+
+    #[test]
+    fn nonssl_lan_group_moves_private_v4_gua_together() {
+        let gw = GatewayId::from(InternedString::intern("wg1"));
+        let mk = |host: &str, meta| HostnameInfo {
+            ssl: false,
+            public: false,
+            hostname: InternedString::intern(host),
+            port: Some(42000),
+            metadata: meta,
+        };
+        let mut info = DerivedAddressInfo::default();
+        info.available.insert(mk(
+            "priv.local",
+            HostnameMetadata::PrivateDomain {
+                gateways: BTreeSet::from([gw.clone()]),
+            },
+        ));
+        info.available.insert(mk(
+            "10.0.0.5",
+            HostnameMetadata::Ipv4 {
+                gateway: gw.clone(),
+            },
+        ));
+        info.available.insert(mk(
+            "2001:db8::1",
+            HostnameMetadata::Ipv6 {
+                gateway: gw.clone(),
+                scope_id: 0,
+            },
+        ));
+
+        let priv_key = (InternedString::intern("priv.local"), 42000u16);
+        let lan_key = (InternedString::intern("10.0.0.5"), 42000u16);
+        let gua_key = (InternedString::intern("2001:db8::1"), 42000u16);
+
+        // Disable the LAN level (nothing on the WAN side to keep the GUA) -> off.
+        set_nonssl_lan_group(&mut info, &gw, 42000, false);
+        assert!(info.disabled.contains(&priv_key));
+        assert!(info.disabled.contains(&lan_key));
+        assert!(info.disabled.contains(&gua_key), "GUA off");
+
+        // Re-enable -> private domain + LAN IPv4 on, GUA local (on, not public).
+        set_nonssl_lan_group(&mut info, &gw, 42000, true);
+        assert!(!info.disabled.contains(&priv_key));
+        assert!(!info.disabled.contains(&lan_key));
+        assert!(!info.disabled.contains(&gua_key));
+        assert!(
+            !info
+                .gua_wan
+                .contains(&"[2001:db8::1]:42000".parse().unwrap()),
+            "GUA is local, not public"
+        );
+    }
+
+    #[test]
+    fn lan_change_preserves_a_stored_wan_gua() {
+        let gw = GatewayId::from(InternedString::intern("wg1"));
+        let mk = |host: &str, meta| HostnameInfo {
+            ssl: false,
+            public: false,
+            hostname: InternedString::intern(host),
+            port: Some(42000),
+            metadata: meta,
+        };
+        let mut info = DerivedAddressInfo::default();
+        info.available.insert(mk(
+            "priv.local",
+            HostnameMetadata::PrivateDomain {
+                gateways: BTreeSet::from([gw.clone()]),
+            },
+        ));
+        info.available.insert(mk(
+            "10.0.0.5",
+            HostnameMetadata::Ipv4 {
+                gateway: gw.clone(),
+            },
+        ));
+        info.available.insert(mk(
+            "2001:db8::1",
+            HostnameMetadata::Ipv6 {
+                gateway: gw.clone(),
+                scope_id: 0,
+            },
+        ));
+        let gua_v6: SocketAddrV6 = "[2001:db8::1]:42000".parse().unwrap();
+        // Operator opted this GUA into WAN directly (stored preference) — there is
+        // no public domain to link it.
+        info.gua_wan.insert(gua_v6);
+        info.enabled.insert(SocketAddr::V6(gua_v6));
+
+        // A LAN-level change must NOT un-publish the GUA's stored WAN opt-in.
+        set_nonssl_lan_group(&mut info, &gw, 42000, false);
+        assert!(
+            info.gua_wan.contains(&gua_v6),
+            "a LAN change must not clobber the GUA's stored WAN opt-in"
+        );
+        set_nonssl_lan_group(&mut info, &gw, 42000, true);
+        assert!(
+            info.gua_wan.contains(&gua_v6),
+            "still WAN after LAN re-enabled"
+        );
+    }
+
+    #[test]
+    fn gua_enabled_follows_public_flag() {
+        let local = ipv6_addr("2001:db8::1", 443);
+        let key = local.gua().unwrap();
+        let mut info = DerivedAddressInfo::default();
+        info.available.insert(local.clone());
+
+        // A local (non-WAN) GUA follows the private rule: on unless disabled.
+        assert!(info.enabled().contains(&local));
+        info.disabled.insert((local.hostname.clone(), key.port()));
+        assert!(!info.enabled().contains(&local));
+        info.disabled.clear();
+
+        // A WAN GUA carries public=true (projected from gua_wan by
+        // update_addresses) and follows the public rule: opt-in via `enabled`.
+        let public = HostnameInfo {
+            public: true,
+            ..local.clone()
+        };
+        info.available.clear();
+        info.available.insert(public.clone());
+        assert!(!info.enabled().contains(&public));
+        info.enabled.insert(SocketAddr::V6(key));
+        assert!(info.enabled().contains(&public));
+    }
+
+    fn lan_fixture(ssl: bool) -> (DerivedAddressInfo, HostnameInfo, [HostnameInfo; 2]) {
+        let eth = GatewayId::from(InternedString::intern("eth0"));
+        let wifi = GatewayId::from(InternedString::intern("wlan0"));
+        let mk = |host: &str, metadata| HostnameInfo {
+            ssl,
+            public: false,
+            hostname: InternedString::intern(host),
+            port: Some(8443),
+            metadata,
+        };
+        let mdns = mk(
+            "server.local",
+            HostnameMetadata::Mdns {
+                gateways: BTreeSet::from([eth.clone(), wifi.clone()]),
+            },
+        );
+        let ips = [
+            mk("192.0.2.10", HostnameMetadata::Ipv4 { gateway: eth }),
+            mk("198.51.100.10", HostnameMetadata::Ipv4 { gateway: wifi }),
+        ];
+        let mut info = DerivedAddressInfo::default();
+        info.available.insert(mdns.clone());
+        info.available.extend(ips.iter().cloned());
+        (info, mdns, ips)
+    }
+
+    #[test]
+    fn a_lan_ip_is_disabled_on_its_own() {
+        let (mut info, mdns, [eth, wifi]) = lan_fixture(true);
+
+        set_address_enabled_on(&mut info, &eth, false).unwrap();
+
+        assert!(info.enabled().contains(&mdns));
+        assert!(!info.enabled().contains(&eth));
+        assert!(info.enabled().contains(&wifi));
+    }
+
+    #[test]
+    fn a_lan_ip_without_an_override_follows_its_mdns_address() {
+        let (mut info, mdns, [eth, wifi]) = lan_fixture(true);
+
+        set_address_enabled_on(&mut info, &mdns, false).unwrap();
+        assert!(info.enabled().is_empty());
+
+        set_address_enabled_on(&mut info, &eth, true).unwrap();
+        set_address_enabled_on(&mut info, &mdns, false).unwrap();
+        assert!(!info.enabled().contains(&mdns));
+        assert!(info.enabled().contains(&eth));
+        assert!(!info.enabled().contains(&wifi));
+
+        let reassigned = HostnameInfo {
+            hostname: InternedString::intern("198.51.100.11"),
+            ..wifi.clone()
+        };
+        info.available.remove(&eth);
+        info.available.remove(&wifi);
+        info.available.insert(reassigned.clone());
+        assert!(!info.enabled().contains(&reassigned));
+
+        info.available.insert(eth.clone());
+        assert!(info.enabled().contains(&eth));
+
+        set_address_enabled_on(&mut info, &mdns, true).unwrap();
+        assert!(info.enabled().contains(&mdns));
+        assert!(info.enabled().contains(&reassigned));
+    }
+
+    #[test]
+    fn an_enabled_lan_ip_serves_its_mdns_address_on_a_nonssl_port() {
+        let (mut info, mdns, [eth, wifi]) = lan_fixture(false);
+
+        set_address_enabled_on(&mut info, &mdns, false).unwrap();
+        assert!(info.enabled().is_empty());
+
+        set_address_enabled_on(&mut info, &eth, true).unwrap();
+        assert!(info.enabled().contains(&mdns));
+        assert!(info.enabled().contains(&eth));
+        assert!(!info.enabled().contains(&wifi));
+
+        set_address_enabled_on(&mut info, &mdns, false).unwrap();
+        assert!(info.enabled().is_empty());
+
+        set_address_enabled_on(&mut info, &mdns, true).unwrap();
+        assert!(info.enabled().contains(&mdns));
+        assert!(info.enabled().contains(&eth));
+        assert!(info.enabled().contains(&wifi));
+    }
+
+    #[test]
+    fn disabling_mdns_on_a_nonssl_port_takes_a_linked_lan_group_with_it() {
+        let (mut info, mdns, [eth, wifi]) = lan_fixture(false);
+        let domain = HostnameInfo {
+            hostname: InternedString::intern("priv.lan"),
+            metadata: HostnameMetadata::PrivateDomain {
+                gateways: BTreeSet::from([GatewayId::from(InternedString::intern("eth0"))]),
+            },
+            ..eth.clone()
+        };
+        info.available.insert(domain.clone());
+
+        set_address_enabled_on(&mut info, &mdns, false).unwrap();
+        assert!(info.enabled().is_empty());
+
+        set_address_enabled_on(&mut info, &mdns, true).unwrap();
+        assert!(info.enabled().contains(&mdns));
+        assert!(info.enabled().contains(&wifi));
+        assert!(!info.enabled().contains(&eth));
+        assert!(!info.enabled().contains(&domain));
+    }
+
+    #[test]
+    fn an_enabled_public_gua_leaves_mdns_disabled() {
+        let (mut info, mdns, _) = lan_fixture(false);
+        let gua = HostnameInfo {
+            public: true,
+            hostname: InternedString::intern("2001:db8::10"),
+            metadata: HostnameMetadata::Ipv6 {
+                gateway: GatewayId::from(InternedString::intern("eth0")),
+                scope_id: 0,
+            },
+            ..mdns.clone()
+        };
+        info.available.insert(gua.clone());
+        info.enabled.insert(gua.to_socket_addr().unwrap());
+
+        set_address_enabled_on(&mut info, &mdns, false).unwrap();
+
+        assert!(!info.enabled().contains(&mdns));
+        assert!(info.enabled().contains(&gua));
+    }
+
+    #[test]
+    fn rekey_port_carries_range_overrides() {
+        use std::net::SocketAddr;
+        let mut info = DerivedAddressInfo::default();
+        let wan: SocketAddr = "1.2.3.4:49152".parse().unwrap();
+        let unrelated: SocketAddr = "1.2.3.4:8443".parse().unwrap();
+        info.enabled.insert(wan);
+        info.enabled.insert(unrelated);
+        info.disabled
+            .insert((InternedString::intern("example.com"), 49152));
+        info.lan_enabled
+            .insert((InternedString::intern("192.0.2.10"), 49152));
+
+        // A range moving from external_start_port 49152 to 5000.
+        info.rekey_port(49152, 5000);
+
+        assert_eq!(
+            info.lan_enabled,
+            BTreeSet::from([(InternedString::intern("192.0.2.10"), 5000)])
+        );
+
+        assert!(info.enabled.contains(&"1.2.3.4:5000".parse().unwrap()));
+        assert!(!info.enabled.contains(&wan));
+        assert!(info.enabled.contains(&unrelated)); // unrelated port untouched
+        assert!(
+            info.disabled
+                .contains(&(InternedString::intern("example.com"), 5000))
+        );
+        assert!(
+            !info
+                .disabled
+                .contains(&(InternedString::intern("example.com"), 49152))
+        );
+    }
+
+    fn range_info(external_start_port: u16, number_of_ports: u16, enabled: bool) -> RangeBindInfo {
+        RangeBindInfo {
+            enabled,
+            external_start_port,
+            number_of_ports,
+            addresses: Default::default(),
+            interface: None,
+        }
+    }
+
+    #[test]
+    fn internal_span_covers_every_port_and_rejects_one_past_the_end() {
+        assert_eq!(internal_span(42000, 500).unwrap(), 42000..=42499);
+        assert_eq!(internal_span(65534, 2).unwrap(), 65534..=65535);
+        assert_eq!(internal_span(8080, 1).unwrap(), 8080..=8080);
+        assert!(internal_span(65535, 2).is_err());
+        assert!(internal_span(0, 0).is_err());
+    }
+
+    #[test]
+    fn only_enabled_bindings_occupy_their_port() {
+        let mut ports = AvailablePorts::new();
+        let live = BindInfo::new(&mut ports, opts(28332, None, Some(false)), false).unwrap();
+        let mut dormant = BindInfo::new(&mut ports, opts(28333, None, Some(false)), false).unwrap();
+        dormant.disable();
+        let bindings = Bindings([(28332, live), (28333, dormant)].into_iter().collect());
+
+        assert_eq!(
+            bindings.enabled_overlap(&(28330..=28334)),
+            Some(28332..=28332)
+        );
+        assert_eq!(bindings.enabled_overlap(&(28333..=28340)), None);
+        assert_eq!(bindings.enabled_overlap(&(28333..=28333)), None);
+    }
+
+    #[test]
+    fn a_range_does_not_conflict_with_the_entry_it_reaffirms() {
+        let ranges = BindingRanges(
+            [
+                (42000, range_info(42000, 500, true)),
+                (50000, range_info(50000, 10, false)),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        // Re-affirming 42000 skips itself but a second range still collides.
+        assert_eq!(
+            ranges
+                .enabled_overlap(&(42000..=42499), Some(42000))
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            ranges.enabled_overlap(&(42499..=42600), None).unwrap(),
+            Some(42000..=42499)
+        );
+        assert_eq!(
+            ranges.enabled_overlap(&(42500..=42600), None).unwrap(),
+            None
+        );
+        // A dormant range never conflicts.
+        assert_eq!(
+            ranges.enabled_overlap(&(50005..=50020), None).unwrap(),
+            None
+        );
+    }
+}

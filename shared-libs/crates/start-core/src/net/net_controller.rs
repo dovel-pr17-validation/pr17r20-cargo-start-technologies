@@ -1,0 +1,2287 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::sync::{Arc, Weak};
+
+use color_eyre::eyre::eyre;
+use imbl::OrdMap;
+use imbl_value::InternedString;
+use ipnet::IpNet;
+use nix::net::if_::if_nametoindex;
+use patch_db::json_ptr::JsonPointer;
+use tokio::process::Command;
+use tokio::sync::Mutex;
+use tokio_rustls::rustls::ClientConfig as TlsClientConfig;
+use tokio_rustls::rustls::crypto::CryptoProvider;
+use tracing::instrument;
+
+use crate::db::model::Database;
+use crate::db::model::public::NetworkInterfaceInfo;
+use crate::hostname::ServerHostname;
+use crate::net::dns::DnsController;
+use crate::net::dns_update::{DnsUpdateController, spawn_server_mdns_injection};
+use crate::net::forward::{
+    ForwardRequirements, InterfacePortForwardController, START9_BRIDGE_IFACE, nft_rule, nft_rule_v6,
+};
+use crate::net::gateway::{NetworkInterfaceController, WildcardListener};
+use crate::net::host::binding::{AddSslOptions, BindId, BindOptions, UpstreamCertValidation};
+use crate::net::host::{Host, Hosts, host_for, host_for_existing};
+use crate::net::port_map::{PortMapController, candidate_gateways};
+use crate::net::service_interface::{
+    AddressInfo, HostnameInfo, HostnameMetadata, ServiceInterface, ServiceInterfaceType,
+};
+use crate::net::socks::SocksController;
+use crate::net::vhost::{AlpnInfo, DynVHostTarget, ProxyTarget, VHostController, VHostKey};
+use crate::net::web_server::WebServerAcceptorSetter;
+use crate::net::{SERVICE_OUTBOUND_REJECT_RULE_PRIORITY, SERVICE_OUTBOUND_RULE_PRIORITY};
+use crate::prelude::*;
+use crate::service::effects::callbacks::ServiceCallbacks;
+use crate::util::Invoke;
+use crate::util::future::NonDetachingJoinHandle;
+use crate::util::serde::MaybeUtf8String;
+use crate::util::sync::{SyncMutex, Watch};
+use crate::{GatewayId, HOST_IP, HostId, Id, OptionExt, PackageId, ServiceInterfaceId};
+
+pub struct NetController {
+    pub(crate) db: TypedPatchDb<Database>,
+    pub(super) vhost: VHostController,
+    crypto_provider: Arc<CryptoProvider>,
+    pub(super) tls_client_config: Arc<TlsClientConfig>,
+    tls_client_config_no_verify: Arc<TlsClientConfig>,
+    /// Cache of upstream client configs keyed by PEM, so a given
+    /// `UpstreamCertValidation::Certificate` yields a stable `Arc` across
+    /// rebuilds (keeps `ProxyTarget` equality from churning the vhost). Weak so
+    /// entries drop once no live `ProxyTarget` holds the config; dead entries
+    /// are pruned on insert.
+    upstream_cert_configs: SyncMutex<BTreeMap<String, Weak<TlsClientConfig>>>,
+    pub(crate) net_iface: Arc<NetworkInterfaceController>,
+    pub(super) dns: Arc<DnsController>,
+    pub(super) dns_update: DnsUpdateController,
+    /// Publishes the server's `<hostname>.local` name over WireGuard gateways.
+    _mdns_injection: NonDetachingJoinHandle<()>,
+    pub(super) forward: InterfacePortForwardController,
+    pub(crate) port_map: PortMapController,
+    pub(super) _socks: SocksController,
+    pub(crate) callbacks: Arc<ServiceCallbacks>,
+}
+
+impl NetController {
+    pub async fn init(
+        db: TypedPatchDb<Database>,
+        dns: Arc<DnsController>,
+        webserver: &WebServerAcceptorSetter<WildcardListener>,
+        socks_listen: SocketAddr,
+        max_proxy_conns_per_target: usize,
+    ) -> Result<Self, Error> {
+        let net_iface = Arc::new(NetworkInterfaceController::new(db.clone()));
+        dns.activate(net_iface.clone());
+        webserver.send_modify(|listener| listener.set_ip_info(net_iface.watcher.subscribe()));
+        let socks = SocksController::new(socks_listen)?;
+        let crypto_provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
+        let tls_client_config = Arc::new(crate::net::tls::client_config(
+            crypto_provider.clone(),
+            [&*db
+                .peek()
+                .await
+                .as_private()
+                .as_key_store()
+                .as_local_certs()
+                .as_root_cert()
+                .de()?
+                .0],
+        )?);
+        let tls_client_config_no_verify = Arc::new(crate::net::tls::client_config_no_verify(
+            crypto_provider.clone(),
+        )?);
+        nft_rule(
+            "forward",
+            "lxcbr0-egress",
+            false,
+            false,
+            &format!("iifname \"{START9_BRIDGE_IFACE}\" ct state new accept"),
+        )
+        .await?;
+        nft_rule_v6(
+            "forward",
+            "lxcbr0-egress",
+            false,
+            false,
+            &format!("iifname \"{START9_BRIDGE_IFACE}\" ct state new accept"),
+        )
+        .await?;
+        let peek = db.peek().await;
+        let passthroughs = peek
+            .as_public()
+            .as_server_info()
+            .as_network()
+            .as_passthroughs()
+            .de()?;
+        let hostname = peek.as_public().as_server_info().as_hostname().de()?;
+        drop(peek);
+        let branding = crate::net::ssl::CertBranding::start_os(&hostname);
+        // One PortMapController shared by the forward and vhost controllers so a
+        // single query answers "is this port automatically forwarded?".
+        let port_map = PortMapController::new(net_iface.watcher.subscribe());
+        let dns_update = DnsUpdateController::new(
+            net_iface.watcher.subscribe(),
+            Arc::new(
+                |gw: GatewayId| -> std::pin::Pin<
+                    Box<dyn std::future::Future<Output = Result<Option<[u8; 32]>, ()>> + Send>,
+                > {
+                    Box::pin(async move {
+                        crate::net::gateway::wireguard_psk(gw.as_str())
+                            .await
+                            .map_err(|_| ())
+                    })
+                },
+            ),
+        );
+        let mdns_injection = spawn_server_mdns_injection(
+            db.clone(),
+            net_iface.watcher.subscribe(),
+            dns_update.clone(),
+        );
+        Ok(Self {
+            db: db.clone(),
+            vhost: VHostController::new(
+                db.clone(),
+                net_iface.clone(),
+                crypto_provider.clone(),
+                branding,
+                passthroughs,
+                max_proxy_conns_per_target,
+                port_map.clone(),
+            ),
+            crypto_provider,
+            tls_client_config,
+            tls_client_config_no_verify,
+            upstream_cert_configs: SyncMutex::new(BTreeMap::new()),
+            dns,
+            dns_update,
+            _mdns_injection: mdns_injection,
+            forward: InterfacePortForwardController::new(
+                net_iface.watcher.subscribe(),
+                port_map.clone(),
+            ),
+            port_map,
+            net_iface,
+            _socks: socks,
+            callbacks: Arc::new(ServiceCallbacks::default()),
+        })
+    }
+
+    /// Client config for the OS→container TLS leg when rewrapping SSL. Falls
+    /// back to validating against the root CA if a supplied certificate fails
+    /// to parse (fail closed — the handshake then fails, surfacing the misconfig).
+    fn upstream_client_config(
+        &self,
+        mode: &Option<UpstreamCertValidation>,
+    ) -> Arc<TlsClientConfig> {
+        match mode {
+            None => self.tls_client_config.clone(),
+            Some(UpstreamCertValidation::Disable) => self.tls_client_config_no_verify.clone(),
+            Some(UpstreamCertValidation::Certificate(pem)) => {
+                if let Some(cfg) = self
+                    .upstream_cert_configs
+                    .peek(|cache| cache.get(pem).and_then(Weak::upgrade))
+                {
+                    return cfg;
+                }
+                match crate::net::tls::client_config_with_cert(self.crypto_provider.clone(), pem) {
+                    Ok(cfg) => {
+                        let cfg = Arc::new(cfg);
+                        self.upstream_cert_configs.mutate(|cache| {
+                            cache.retain(|_, weak| weak.strong_count() > 0);
+                            cache.insert(pem.clone(), Arc::downgrade(&cfg));
+                        });
+                        cfg
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "Invalid upstream certificate for SSL rewrap, falling back to root CA validation: {e}"
+                        );
+                        tracing::debug!("{e:?}");
+                        self.tls_client_config.clone()
+                    }
+                }
+            }
+        }
+    }
+
+    #[instrument(skip_all)]
+    pub async fn create_service(
+        self: &Arc<Self>,
+        package: PackageId,
+        ip: Ipv4Addr,
+        ipv6: Option<Ipv6Addr>,
+    ) -> Result<NetService, Error> {
+        let dns = self.dns.add_service(Some(package.clone()), ip, ipv6)?;
+
+        let res = NetService::new(NetServiceData {
+            id: Some(package),
+            ip,
+            ipv6,
+            _dns: dns,
+            controller: Arc::downgrade(self),
+            binds: BTreeMap::new(),
+        })?;
+        res.clear_bindings(Default::default()).await?;
+        Ok(res)
+    }
+
+    pub async fn os_bindings(self: &Arc<Self>) -> Result<NetService, Error> {
+        let dns = self.dns.add_service(None, HOST_IP.into(), None)?;
+
+        let service = NetService::new(NetServiceData {
+            id: None,
+            ip: [127, 0, 0, 1].into(),
+            ipv6: None,
+            _dns: dns,
+            controller: Arc::downgrade(self),
+            binds: BTreeMap::new(),
+        })?;
+        service.clear_bindings(Default::default()).await?;
+        service
+            .bind(
+                HostId::admin(),
+                80,
+                BindOptions {
+                    preferred_external_port: 80,
+                    add_ssl: Some(AddSslOptions {
+                        preferred_external_port: 443,
+                        add_x_forwarded_headers: false,
+                        alpn: Some(AlpnInfo(vec![
+                            MaybeUtf8String("h2".into()),
+                            MaybeUtf8String("http/1.1".into()),
+                        ])),
+                        auth: None,
+                        upstream_cert_validation: Default::default(),
+                    }),
+                    secure: None,
+                },
+            )
+            .await?;
+
+        // Sync the OS's own UI as a service interface (idempotent — the OS's
+        // equivalent of a service's setupInterfaces) so the server binding
+        // always has an exported interface. Bindings/ranges without one are
+        // treated as internal-only below.
+        self.db
+            .mutate(|db| {
+                let iface_id = ServiceInterfaceId::from(
+                    Id::try_from("admin-ui".to_owned()).expect("valid id"),
+                );
+                let iface = ServiceInterface {
+                    id: iface_id.clone(),
+                    name: "StartOS UI".to_owned(),
+                    description:
+                        "The web user interface for your StartOS server, accessible from any browser."
+                            .to_owned(),
+                    masked: false,
+                    address_info: AddressInfo {
+                        username: None,
+                        host_id: HostId::admin(),
+                        internal_port: 80,
+                        scheme: Some(InternedString::intern("http")),
+                        ssl_scheme: Some(InternedString::intern("https")),
+                        suffix: String::new(),
+                    },
+                    interface_type: ServiceInterfaceType::Ui,
+                    preferred_launcher_address: None,
+                };
+                db.as_public_mut()
+                    .as_server_info_mut()
+                    .as_network_mut()
+                    .as_host_mut()
+                    .as_bindings_mut()
+                    .as_idx_mut(&80)
+                    .or_not_found(80)?
+                    .as_interfaces_mut()
+                    .ser(&[(iface_id, iface)].into_iter().collect::<BTreeMap<_, _>>())
+            })
+            .await
+            .result?;
+
+        Ok(service)
+    }
+}
+
+/// Public bare-IPv4 gateways for a binding's SSL `*` vhost: only SSL-port
+/// addresses count — a bare IP enabled on the *plain* port must not mark the
+/// SSL vhost public (that would request a pinhole for a port the operator
+/// never exposed). Its v6 twin is scoped the same way (`a.ssl`).
+fn ssl_vhost_public_v4<'a>(
+    enabled_addresses: impl IntoIterator<Item = &'a HostnameInfo>,
+) -> BTreeSet<GatewayId> {
+    enabled_addresses
+        .into_iter()
+        .filter(|a| a.public && a.ssl && matches!(a.metadata, HostnameMetadata::Ipv4 { .. }))
+        .flat_map(|a| a.metadata.gateways().cloned())
+        .collect()
+}
+
+/// The loopback and bridge addresses of a binding's SSL port. Every name the
+/// binding serves accepts them.
+fn ssl_vhost_internal_ips<'a>(
+    enabled_addresses: impl IntoIterator<Item = &'a HostnameInfo>,
+) -> BTreeSet<IpAddr> {
+    enabled_addresses
+        .into_iter()
+        .filter(|a| a.ssl && a.is_internal())
+        .filter_map(|a| a.hostname.parse().ok())
+        .collect()
+}
+
+/// The `(port, is the public leg)` a name is served on. A plugin's name arrives
+/// on the binding's own SSL port, whatever port the name advertises.
+fn named_vhost_leg(addr_info: &HostnameInfo, assigned_ssl_port: u16) -> Option<(u16, bool)> {
+    match &addr_info.metadata {
+        HostnameMetadata::PublicDomain { .. }
+        | HostnameMetadata::PrivateDomain { .. }
+        | HostnameMetadata::Mdns { .. } => Some((addr_info.port?, addr_info.public)),
+        HostnameMetadata::Plugin { .. } => Some((assigned_ssl_port, false)),
+        _ => None,
+    }
+}
+
+/// Adds an entry for each name the binding serves over TLS, or merges the
+/// name's gateways into an entry another row already made.
+fn add_named_vhosts(
+    vhosts: &mut BTreeMap<VHostKey, ProxyTarget>,
+    enabled_addresses: &BTreeSet<&HostnameInfo>,
+    assigned_ssl_port: u16,
+    net_ifaces: &OrdMap<GatewayId, NetworkInterfaceInfo>,
+    new_target: impl Fn(&HostnameInfo, bool) -> ProxyTarget,
+) {
+    let internal = ssl_vhost_internal_ips(enabled_addresses.iter().copied());
+    for addr_info in enabled_addresses {
+        if !addr_info.ssl {
+            continue;
+        }
+        let Some((port, public)) = named_vhost_leg(addr_info, assigned_ssl_port) else {
+            continue;
+        };
+        let key = (Some(addr_info.hostname.clone()), port, public);
+        let ProxyTarget {
+            public_v4,
+            public_v6,
+            private: accepts,
+            ..
+        } = vhosts.entry(key).or_insert_with(|| ProxyTarget {
+            private: internal.clone(),
+            ..new_target(addr_info, public)
+        });
+        if public {
+            // A public domain is dual-stack (A + AAAA): public on its
+            // gateways' bare IPv4 and on each of their GUAs.
+            let gws: BTreeSet<GatewayId> = addr_info.metadata.gateways().cloned().collect();
+            public_v4.extend(gws.iter().cloned());
+            public_v6.extend(crate::net::utils::gua_ips(net_ifaces, &gws));
+        } else {
+            for gw in addr_info.metadata.gateways() {
+                if let Some(ip_info) = net_ifaces.get(gw).and_then(|i| i.ip_info.as_ref()) {
+                    accepts.extend(ip_info.subnets.iter().map(|s| s.addr()));
+                }
+            }
+        }
+    }
+}
+
+/// LAN addresses a binding's SSL `*` vhost answers on: its enabled SSL-port IPs.
+fn ssl_vhost_private_ips<'a>(
+    enabled_addresses: impl IntoIterator<Item = &'a HostnameInfo>,
+) -> BTreeSet<IpAddr> {
+    enabled_addresses
+        .into_iter()
+        .filter(|a| !a.public && a.ssl && a.metadata.is_ip())
+        .filter_map(|a| a.hostname.parse().ok())
+        .collect()
+}
+
+/// LAN addresses a forwarded port answers on. An IP admits itself; a private
+/// domain, every address of its gateways.
+fn forwarded_lan_ips<'a>(
+    enabled_addresses: impl IntoIterator<Item = &'a HostnameInfo>,
+    net_ifaces: &OrdMap<GatewayId, NetworkInterfaceInfo>,
+) -> BTreeSet<IpAddr> {
+    let mut ips = BTreeSet::new();
+    for address in enabled_addresses.into_iter().filter(|a| !a.public) {
+        match &address.metadata {
+            HostnameMetadata::Ipv4 { .. } | HostnameMetadata::Ipv6 { .. } => {
+                ips.extend(address.hostname.parse::<IpAddr>().ok());
+            }
+            HostnameMetadata::PrivateDomain { gateways } => ips.extend(
+                gateways
+                    .iter()
+                    .filter_map(|gw| net_ifaces.get(gw).and_then(|i| i.ip_info.as_ref()))
+                    .flat_map(|ip| ip.subnets.iter().map(|s| s.addr())),
+            ),
+            _ => {}
+        }
+    }
+    ips
+}
+
+/// Hosts the datapath still holds that the database no longer has. Collected
+/// before the update loop so a port handed from a retired host to a surviving
+/// one in the same pass comes down before it is rebuilt.
+fn retired_hosts<'a>(held: impl Iterator<Item = &'a HostId>, current: &Hosts) -> Vec<HostId> {
+    held.filter(|id| !current.0.contains_key(*id))
+        .cloned()
+        .collect()
+}
+
+#[derive(Default, Debug)]
+struct HostBinds {
+    /// `(internal-target, count, requirements, rc)` keyed by external start
+    /// port. `count == 1` is the single-port case; `count > 1` represents a
+    /// contiguous range forward.
+    forwards: BTreeMap<u16, (SocketAddrV4, u16, ForwardRequirements, Arc<()>)>,
+    vhosts: BTreeMap<VHostKey, (ProxyTarget, Arc<()>)>,
+    private_dns: BTreeMap<InternedString, Arc<()>>,
+    /// Directly-forwarded v6: `(host GUA, external port) -> (container v6,
+    /// internal port, LAN source filter)`. A GUA on a port no listener of ours
+    /// answers is DNAT'd to the container (see `forward6`); tracked so a stale
+    /// forward is torn down when the GUA's exposure or target changes.
+    gua_forwards: BTreeMap<(Ipv6Addr, u16), (Ipv6Addr, u16, Option<IpNet>)>,
+}
+
+pub struct NetServiceData {
+    id: Option<PackageId>,
+    ip: Ipv4Addr,
+    /// The container's SLAAC ULA, DNAT target for a non-SSL GUA forward. `None`
+    /// until the container has a v6 (or for the OS's own bindings).
+    ipv6: Option<Ipv6Addr>,
+    _dns: Arc<()>,
+    controller: Weak<NetController>,
+    binds: BTreeMap<HostId, HostBinds>,
+}
+impl NetServiceData {
+    fn net_controller(&self) -> Result<Arc<NetController>, Error> {
+        Weak::upgrade(&self.controller).ok_or_else(|| {
+            Error::new(
+                eyre!("NetController is shutdown"),
+                crate::ErrorKind::Network,
+            )
+        })
+    }
+
+    async fn update(&mut self, ctrl: &NetController, id: HostId, host: Host) -> Result<(), Error> {
+        let mut forwards: BTreeMap<u16, (SocketAddrV4, u16, ForwardRequirements)> = BTreeMap::new();
+        let mut vhosts: BTreeMap<VHostKey, ProxyTarget> = BTreeMap::new();
+        let mut private_dns: BTreeMap<InternedString, BTreeSet<GatewayId>> = BTreeMap::new();
+        // Non-SSL v6 DNAT forwards to the container — net_controller's concern (no
+        // vhost owns them), but the forward controller opens their upstream pinhole
+        // together with the DNAT (see the reconcile below).
+        let mut gua_forwards: BTreeMap<(Ipv6Addr, u16), (Ipv6Addr, u16, Option<IpNet>)> =
+            BTreeMap::new();
+        let binds = self.binds.entry(id.clone()).or_default();
+
+        let net_ifaces = ctrl.net_iface.watcher.ip_info();
+        let host_addresses: Vec<_> = host.addresses().collect();
+
+        // ── Build controller entries from enabled addresses ──
+        for (port, bind) in host.bindings.iter() {
+            if !bind.enabled {
+                continue;
+            }
+            if bind.net.assigned_port.is_none() && bind.net.assigned_ssl_port.is_none() {
+                continue;
+            }
+            // A binding with no exported interface is internal-only: it forwards
+            // to lo / lxcbr0 but never to a gateway (see `enabled_addresses`).
+            let enabled_addresses = bind.enabled_addresses();
+            let addr: SocketAddr = (self.ip, *port).into();
+            // The container's bridge v6, for the source-preserving leg of a v6 client.
+            let addr_v6 = self.ipv6.map(|ip| SocketAddrV6::new(ip, *port, 0, 0));
+
+            // Key private DNS by its live gateways so the resolver only answers
+            // locally over those gateways — works even when also public (split DNS).
+            for addr_info in &enabled_addresses {
+                if let HostnameMetadata::PrivateDomain { gateways } = &addr_info.metadata {
+                    let live: BTreeSet<GatewayId> = gateways
+                        .iter()
+                        .filter(|gw| {
+                            net_ifaces
+                                .get(*gw)
+                                .map_or(false, |info| info.ip_info.is_some())
+                        })
+                        .cloned()
+                        .collect();
+                    if !live.is_empty() {
+                        private_dns
+                            .entry(addr_info.hostname.clone())
+                            .or_default()
+                            .extend(live);
+                    }
+                }
+            }
+
+            let connect_ssl: Option<Arc<TlsClientConfig>> = bind
+                .options
+                .rewrap()
+                .map(|ssl| ctrl.upstream_client_config(&ssl.upstream_cert_validation));
+            let alpn = bind
+                .options
+                .add_ssl
+                .as_ref()
+                .and_then(|ssl| ssl.alpn.clone());
+
+            // `*` vhost: every assigned_ssl_port is answered by a listener of
+            // ours — terminating (add_ssl), or an SNI-agnostic passthrough when
+            // the container serves its own TLS.
+            if let Some(assigned_ssl_port) = bind.net.assigned_ssl_port {
+                // A GUA set to LAN+WAN is WAN, so it lands in the public set.
+                let server_private_ips = ssl_vhost_private_ips(enabled_addresses.iter().copied());
+
+                // Public gateways, split by family: a bare public IPv4 (WAN IP)
+                // and a LAN+WAN GUA are independently toggleable, and the vhost
+                // must accept (and forward) each family only where that family
+                // is actually public — so a GUA-only-public gateway never
+                // accepts or forwards bare IPv4. The controller derives the IPv4
+                // `*` pinhole from `public_v4`; the GUA needs no NAT.
+                let server_public_v4 = ssl_vhost_public_v4(enabled_addresses.iter().copied());
+                // Per-IP (per-GUA), not per-gateway: one gateway can carry
+                // several GUAs that are independently Local vs Public, so only
+                // the specific enabled-public GUAs accept WAN. Scoped to the SSL
+                // exposure (`a.ssl`), since this `*` vhost answers TLS on the
+                // ssl port — a GUA public only on a non-SSL port is served by the
+                // v6 DNAT forward, not this vhost.
+                let server_public_v6: BTreeSet<Ipv6Addr> = enabled_addresses
+                    .iter()
+                    .filter(|a| a.public && a.ssl)
+                    .filter_map(|a| a.gua().map(|g| *g.ip()))
+                    .collect();
+
+                if !server_private_ips.is_empty()
+                    || !server_public_v4.is_empty()
+                    || !server_public_v6.is_empty()
+                {
+                    let passthrough = bind.options.add_ssl.is_none();
+                    vhosts.insert(
+                        (None, assigned_ssl_port, true),
+                        ProxyTarget {
+                            public_v4: server_public_v4,
+                            public_v6: server_public_v6,
+                            public_v6_gateways: BTreeSet::new(),
+                            private: server_private_ips,
+                            acme: None,
+                            addr,
+                            addr_v6,
+                            add_x_forwarded_headers: bind
+                                .options
+                                .add_ssl
+                                .as_ref()
+                                .map_or(false, |s| s.add_x_forwarded_headers),
+                            auth: bind.options.add_ssl.as_ref().and_then(|s| s.auth.clone()),
+                            connect_ssl: connect_ssl.clone(),
+                            alpn: alpn.clone(),
+                            passthrough,
+                            // The container handles its own TLS and the box is
+                            // its gateway, so preserve the client source IP.
+                            preserve_source_ip: passthrough,
+                        },
+                    );
+                }
+
+                // Named vhosts: group by (hostname, ssl_port), merge public/private
+                // sets. Terminating when we hold the TLS (add_ssl); an SNI
+                // passthrough to the container's own TLS otherwise. Either way the
+                // entry carries its own gateways, so a public domain accepts WAN
+                // even where the bare IP is disabled.
+                //
+                // The mDNS name and a plugin's names are registered here like any
+                // other: the vhost controller serves a name only if it has an
+                // entry, and this is where the set of names a host answers to is
+                // decided. Neither is public, so neither contributes an upstream
+                // port map. Every name accepts the bridge, where other services
+                // and a plugin's provider reach it.
+                let passthrough = bind.options.add_ssl.is_none();
+                add_named_vhosts(
+                    &mut vhosts,
+                    &enabled_addresses,
+                    assigned_ssl_port,
+                    &net_ifaces,
+                    |addr_info, public| ProxyTarget {
+                        public_v4: BTreeSet::new(),
+                        public_v6: BTreeSet::new(),
+                        public_v6_gateways: BTreeSet::new(),
+                        private: BTreeSet::new(),
+                        // The public leg's alone, so a name served both ways
+                        // keeps its LAN side. A passthrough never intermediates
+                        // ACME — the backend is the ACME client.
+                        acme: if passthrough || !public {
+                            None
+                        } else {
+                            host_addresses
+                                .iter()
+                                .find(|a| a.address == addr_info.hostname)
+                                .and_then(|a| a.public.as_ref())
+                                .and_then(|p| p.acme.clone())
+                        },
+                        addr,
+                        addr_v6,
+                        add_x_forwarded_headers: bind
+                            .options
+                            .add_ssl
+                            .as_ref()
+                            .map_or(false, |s| s.add_x_forwarded_headers),
+                        auth: bind.options.add_ssl.as_ref().and_then(|s| s.auth.clone()),
+                        connect_ssl: connect_ssl.clone(),
+                        alpn: alpn.clone(),
+                        passthrough,
+                        preserve_source_ip: passthrough,
+                    },
+                );
+            }
+
+            // Direct forward — the plaintext port, the only external port with
+            // no listener of ours in front (every TLS port is a vhost above).
+            if let Some(external) = bind.net.assigned_port {
+                // Only addresses at this port drive its forward (a vhost's port has its own).
+                let fwd_public: BTreeSet<GatewayId> = enabled_addresses
+                    .iter()
+                    .filter(|a| a.public && a.port == Some(external))
+                    .flat_map(|a| a.metadata.gateways())
+                    .cloned()
+                    .collect();
+                // Declare which address makes each gateway public, so a stray
+                // auto-port-map can be traced back to the exposure driving it.
+                for a in enabled_addresses
+                    .iter()
+                    .filter(|a| a.public && a.port == Some(external))
+                {
+                    tracing::debug!(
+                        "port {external}: WAN address {} (ip={}) on gateway(s) {:?}",
+                        a.hostname,
+                        a.metadata.is_ip(),
+                        a.metadata.gateways().collect::<Vec<_>>(),
+                    );
+                }
+                let fwd_private = forwarded_lan_ips(
+                    enabled_addresses
+                        .iter()
+                        .copied()
+                        .filter(|a| a.port == Some(external)),
+                    &net_ifaces,
+                );
+                // StartOS answers these addresses itself, and a loopback DNAT is martian-dropped on ingress.
+                if !self.ip.is_loopback() {
+                    forwards.insert(
+                        external,
+                        (
+                            SocketAddrV4::new(self.ip, *port),
+                            1,
+                            ForwardRequirements {
+                                public_gateways: fwd_public,
+                                private_ips: fwd_private,
+                                secure: bind.options.secure.is_some(),
+                            },
+                        ),
+                    );
+                }
+
+                // No listener of ours answers here, so DNAT the host's
+                // GUA:external to the container's v6:internal. A LAN-only GUA is
+                // source-restricted to its on-link subnet; a LAN+WAN GUA is
+                // unrestricted. Fail closed: skip a LAN-only GUA whose subnet we
+                // can't determine rather than expose it unrestricted.
+                if let Some(container_v6) = self.ipv6 {
+                    for a in enabled_addresses.iter() {
+                        // A vhost's port is its listener's; DNAT only this one.
+                        let Some(gua) = a.gua().filter(|g| g.port() == external) else {
+                            continue;
+                        };
+                        // Secure only when the underlying protocol is itself secure —
+                        // this is the plaintext port, so we never terminate TLS here.
+                        // The WAN is never secure, so an insecure exposure that
+                        // requested public serves the LAN instead.
+                        let secure_exposure = bind.options.secure.is_some();
+                        let src_filter = if a.public && secure_exposure {
+                            None
+                        } else {
+                            // LAN: insecure reaches it only over a secure gateway (IPv4 parity).
+                            if !secure_exposure
+                                && !a
+                                    .metadata
+                                    .gateways()
+                                    .filter_map(|gw| net_ifaces.get(gw))
+                                    .any(|info| info.secure())
+                            {
+                                continue;
+                            }
+                            match a
+                                .metadata
+                                .gateways()
+                                .filter_map(|gw| net_ifaces.get(gw))
+                                .filter_map(|info| info.ip_info.as_ref())
+                                .flat_map(|ip| ip.subnets.iter())
+                                .find(|s| s.contains(&IpAddr::V6(*gua.ip())))
+                                .copied()
+                            {
+                                Some(subnet) => Some(subnet),
+                                None => continue,
+                            }
+                        };
+                        // A public bare GUA on a non-TLS port is DNAT'd to the
+                        // container — no vhost owns a non-TLS port. The forward
+                        // controller opens its upstream pinhole together with the
+                        // DNAT (see the reconcile below).
+                        gua_forwards
+                            .insert((*gua.ip(), gua.port()), (container_v6, *port, src_filter));
+                    }
+                }
+            }
+        }
+
+        // Port-range bindings: forward each enabled range the same way as a
+        // single-port non-SSL binding — `private_ips` from enabled private
+        // (LAN) addresses, `public_gateways` from enabled public (WAN)
+        // addresses — but with `count = number_of_ports`. Outbound-only
+        // gateways never get range addresses synthesized, so they never appear
+        // here. Private domains register their resolver entries like single-port.
+        //
+        // `secure: true` is intentional: ranges carry no Security option (no
+        // SSL/vhost), so without it the forward.rs security gate
+        // (`!reqs.secure && !info.secure()`) would drop every range on a gateway
+        // the operator has not marked secure.
+        for (&internal_start, range) in host.binding_ranges.iter() {
+            if !range.enabled {
+                continue;
+            }
+            // A range with no exported interface is internal-only: it forwards
+            // to lo / lxcbr0 but never to a gateway (see `enabled_addresses`).
+            let enabled_addresses = range.enabled_addresses();
+
+            for addr_info in &enabled_addresses {
+                if let HostnameMetadata::PrivateDomain { gateways } = &addr_info.metadata {
+                    let live: BTreeSet<GatewayId> = gateways
+                        .iter()
+                        .filter(|gw| {
+                            net_ifaces
+                                .get(*gw)
+                                .map_or(false, |info| info.ip_info.is_some())
+                        })
+                        .cloned()
+                        .collect();
+                    if !live.is_empty() {
+                        private_dns
+                            .entry(addr_info.hostname.clone())
+                            .or_default()
+                            .extend(live);
+                    }
+                }
+            }
+
+            let public_gateways: BTreeSet<GatewayId> = enabled_addresses
+                .iter()
+                .filter(|a| a.public)
+                .flat_map(|a| a.metadata.gateways())
+                .cloned()
+                .collect();
+            let private_ips = forwarded_lan_ips(enabled_addresses.iter().copied(), &net_ifaces);
+            if public_gateways.is_empty() && private_ips.is_empty() {
+                continue;
+            }
+            forwards.insert(
+                range.external_start_port,
+                (
+                    SocketAddrV4::new(self.ip, internal_start),
+                    range.number_of_ports,
+                    ForwardRequirements {
+                        public_gateways,
+                        private_ips,
+                        secure: true,
+                    },
+                ),
+            );
+        }
+
+        // The vhost controller owns every upstream port map for its ports — the
+        // IPv6 GUA pinholes (bare `*` and public-domain vhosts) and their v6 80->443
+        // redirect included — deriving them from each ProxyTarget's `public_v6`. The
+        // non-vhost DNAT'd GUA pinholes are owned by the forward controller (with the
+        // DNAT). So net_controller itself requests no port maps. The IPv4 gateway
+        // serves its own port-80 HTTP->HTTPS redirect.
+
+        // Reconcile non-SSL v6 forwards: tear down any that changed or went away,
+        // then install new/changed ones. The forward controller owns each forward's
+        // DNAT *and* its upstream pinhole (WAN forwards only), just like the v4 path.
+        // Best-effort — a nft failure on one forward is logged, not fatal.
+        for (key, spec) in &binds.gua_forwards {
+            if gua_forwards.get(key) != Some(spec) {
+                let &(gua, ext) = key;
+                let &(tgt, int, ref src) = spec;
+                if let Err(e) = ctrl
+                    .forward
+                    .unforward6(
+                        SocketAddrV6::new(gua, ext, 0, 0),
+                        SocketAddrV6::new(tgt, int, 0, 0),
+                        64,
+                        src.clone(),
+                    )
+                    .await
+                {
+                    tracing::error!("failed to remove v6 forward [{gua}]:{ext}: {e}");
+                    tracing::debug!("{e:?}");
+                }
+            }
+        }
+        for (key, spec) in &gua_forwards {
+            if binds.gua_forwards.get(key) != Some(spec) {
+                let &(gua, ext) = key;
+                let &(tgt, int, ref src) = spec;
+                // PCP candidates for the pinhole (only used for a WAN forward).
+                let gateways: Vec<(IpAddr, Option<u32>)> = if src.is_none() {
+                    net_ifaces
+                        .iter()
+                        .map(|(_, i)| i)
+                        .find(|info| {
+                            info.ip_info.as_ref().map_or(false, |i| {
+                                i.subnets.iter().any(|s| s.addr() == IpAddr::V6(gua))
+                            })
+                        })
+                        .map(|info| {
+                            candidate_gateways(info)
+                                .into_iter()
+                                .filter(|(g, _)| g.is_ipv6())
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                if let Err(e) = ctrl
+                    .forward
+                    .forward6(
+                        SocketAddrV6::new(gua, ext, 0, 0),
+                        SocketAddrV6::new(tgt, int, 0, 0),
+                        64,
+                        src.clone(),
+                        gateways,
+                    )
+                    .await
+                {
+                    tracing::error!("failed to add v6 forward [{gua}]:{ext} -> [{tgt}]:{int}: {e}");
+                    tracing::debug!("{e:?}");
+                }
+            }
+        }
+        binds.gua_forwards = gua_forwards;
+
+        // ── Phase 3: Reconcile ──
+        let all = binds
+            .forwards
+            .keys()
+            .chain(forwards.keys())
+            .copied()
+            .collect::<BTreeSet<_>>();
+        for external in all {
+            let mut prev = binds.forwards.remove(&external);
+            if let Some((internal, count, reqs)) = forwards.remove(&external) {
+                prev = prev.filter(|(i, c, r, _)| i == &internal && *c == count && *r == reqs);
+                binds.forwards.insert(
+                    external,
+                    if let Some(prev) = prev {
+                        prev
+                    } else {
+                        (
+                            internal,
+                            count,
+                            reqs.clone(),
+                            ctrl.forward
+                                .add_range(
+                                    external,
+                                    count,
+                                    reqs,
+                                    internal,
+                                    net_ifaces
+                                        .iter()
+                                        .find_map(|(_, i)| {
+                                            i.ip_info.as_ref().and_then(|i| {
+                                                i.subnets.iter().find(|i| {
+                                                    i.contains(&IpAddr::from(*internal.ip()))
+                                                })
+                                            })
+                                        })
+                                        .map(|s| s.prefix_len())
+                                        .unwrap_or(32),
+                                )
+                                .await?,
+                        )
+                    },
+                );
+            }
+        }
+        ctrl.forward.gc().await?;
+
+        // The vhost controller owns every upstream IPv4 port map for its ports —
+        // PCP HOSTNAME for a public domain, a plain pinhole for a bare public IPv4
+        // (`*` vhost) — deriving them from the vhost targets themselves (their
+        // per-family `public_v4`). Called on the complete `vhosts` before the drain
+        // loop below consumes it, and on every update (even with none) so a host
+        // that dropped its exposure withdraws its prior mappings.
+        ctrl.vhost
+            .reconcile_port_maps((self.id.clone(), id.clone()), &vhosts);
+
+        let all = binds
+            .vhosts
+            .keys()
+            .chain(vhosts.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for key in all {
+            let mut prev = binds.vhosts.remove(&key);
+            if let Some(target) = vhosts.remove(&key) {
+                prev = prev.filter(|(t, _)| t == &target);
+                binds.vhosts.insert(
+                    key.clone(),
+                    if let Some(prev) = prev {
+                        prev
+                    } else {
+                        (
+                            target.clone(),
+                            ctrl.vhost.add(key.0, key.1, DynVHostTarget::new(target))?,
+                        )
+                    },
+                );
+            } else {
+                if let Some((_, rc)) = prev {
+                    drop(rc);
+                    ctrl.vhost.gc(key.0, key.1);
+                }
+            }
+        }
+
+        let mut rm = BTreeSet::new();
+        binds.private_dns.retain(|fqdn, _| {
+            if private_dns.contains_key(fqdn) {
+                true
+            } else {
+                rm.insert(fqdn.clone());
+                false
+            }
+        });
+        for (fqdn, gateways) in private_dns {
+            // Best-effort: also publish the record to the gateway's own DNS via
+            // RFC 2136 so LAN devices not using StartOS's resolver can resolve it.
+            ctrl.dns_update.add(fqdn.clone(), gateways.clone());
+            binds
+                .private_dns
+                .insert(fqdn.clone(), ctrl.dns.add_private_domain(fqdn, gateways)?);
+        }
+        ctrl.dns.gc_private_domains(&rm)?;
+        ctrl.dns_update.gc(rm);
+
+        Ok(())
+    }
+
+    /// Tear down everything the datapath holds for a host that is no longer in
+    /// the database. Reconciling against an empty host is what reaps it: the v6
+    /// forwards, the vhost port maps and the RFC 2136 records carry no
+    /// refcount, so dropping `HostBinds` on its own leaves them up.
+    async fn retire(&mut self, ctrl: &NetController, id: HostId) -> Result<(), Error> {
+        if !self.binds.contains_key(&id) {
+            return Ok(());
+        }
+        self.update(ctrl, id.clone(), Host::new()).await?;
+        self.binds.remove(&id);
+        Ok(())
+    }
+
+    fn outbound_sources(&self) -> Vec<IpAddr> {
+        std::iter::once(IpAddr::V4(self.ip))
+            .chain(self.ipv6.map(IpAddr::V6))
+            .collect()
+    }
+}
+
+fn ip_rule(source: IpAddr) -> Command {
+    let mut cmd = Command::new("ip");
+    if source.is_ipv6() {
+        cmd.arg("-6");
+    }
+    cmd.arg("rule");
+    cmd
+}
+
+/// Variants order by rule priority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum ServiceOutboundRule {
+    Gateway(u32),
+    Reject,
+}
+
+fn outbound_rule_command(action: &str, source: IpAddr, rule: ServiceOutboundRule) -> Command {
+    let mut command = ip_rule(source);
+    command.arg(action).arg("from").arg(source.to_string());
+    match rule {
+        ServiceOutboundRule::Gateway(table) => {
+            command
+                .arg("lookup")
+                .arg(table.to_string())
+                .arg("priority")
+                .arg(SERVICE_OUTBOUND_RULE_PRIORITY.to_string());
+        }
+        ServiceOutboundRule::Reject => {
+            command
+                .arg("unreachable")
+                .arg("priority")
+                .arg(SERVICE_OUTBOUND_REJECT_RULE_PRIORITY.to_string());
+        }
+    }
+    command
+}
+
+async fn outbound_rule(
+    action: &str,
+    source: IpAddr,
+    rule: ServiceOutboundRule,
+) -> Result<(), Error> {
+    outbound_rule_command(action, source, rule)
+        .invoke(ErrorKind::Network)
+        .await?;
+    Ok(())
+}
+
+async fn purge_outbound_rules(sources: &[IpAddr]) {
+    for source in sources {
+        for priority in [
+            SERVICE_OUTBOUND_RULE_PRIORITY,
+            SERVICE_OUTBOUND_REJECT_RULE_PRIORITY,
+        ] {
+            while ip_rule(*source)
+                .arg("del")
+                .arg("from")
+                .arg(source.to_string())
+                .arg("priority")
+                .arg(priority.to_string())
+                .invoke(ErrorKind::Network)
+                .await
+                .is_ok()
+            {}
+        }
+    }
+}
+
+async fn add_outbound_rules(sources: &[IpAddr], rule: ServiceOutboundRule) -> Result<(), Error> {
+    let mut added = Vec::new();
+    for source in sources {
+        if let Err(e) = outbound_rule("add", *source, rule).await {
+            for source in added {
+                let _ = outbound_rule("del", source, rule).await;
+            }
+            return Err(e);
+        }
+        added.push(*source);
+    }
+    Ok(())
+}
+
+async fn delete_outbound_rules(sources: &[IpAddr], rule: ServiceOutboundRule) {
+    for source in sources {
+        let _ = outbound_rule("del", *source, rule).await;
+    }
+}
+
+fn delete_conntrack_command(source: IpAddr) -> Command {
+    let mut command = Command::new("conntrack");
+    command.arg("-D");
+    if source.is_ipv6() {
+        command.arg("-f").arg("ipv6");
+    }
+    command.arg("-s").arg(source.to_string());
+    command
+}
+
+async fn flush_outbound_connections(sources: &[IpAddr]) {
+    for source in sources {
+        // `conntrack -D` exits one when no flows match.
+        let _ = delete_conntrack_command(*source)
+            .invoke(ErrorKind::Network)
+            .await;
+    }
+}
+
+async fn sync_outbound_rules(
+    db: &TypedPatchDb<Database>,
+    id: &PackageId,
+    sources: &[IpAddr],
+    current: &mut BTreeSet<ServiceOutboundRule>,
+) {
+    if let Err(e) = async {
+        let gateway: Option<GatewayId> = db
+            .peek()
+            .await
+            .as_public()
+            .as_package_data()
+            .as_idx(id)
+            .and_then(|p| p.as_outbound_gateway().de().ok())
+            .flatten();
+        let mut desired = BTreeSet::new();
+        if let Some(gateway) = &gateway {
+            desired.insert(ServiceOutboundRule::Reject);
+            if let Some(idx) = if_nametoindex(gateway.as_str()).log_err() {
+                desired.insert(ServiceOutboundRule::Gateway(
+                    crate::net::gateway::gateway_table_id(idx),
+                ));
+            }
+        }
+        // A lookup that fails to install still gets its rejection.
+        let previous = current.clone();
+        let mut res = Ok::<_, Error>(());
+        for rule in &desired - &*current {
+            match add_outbound_rules(sources, rule).await {
+                Ok(()) => {
+                    current.insert(rule);
+                }
+                Err(e) => res = Err(e),
+            }
+        }
+        // The rule being replaced keeps routing until it is deleted.
+        for rule in (&*current - &desired).into_iter().rev() {
+            delete_outbound_rules(sources, rule).await;
+            current.remove(&rule);
+        }
+        if *current != previous {
+            flush_outbound_connections(sources).await;
+        }
+        res
+    }
+    .await
+    {
+        tracing::error!("Failed to update outbound gateway for {id}: {e}");
+        tracing::debug!("{e:?}");
+    }
+}
+
+pub struct NetService {
+    shutdown: bool,
+    data: Arc<Mutex<NetServiceData>>,
+    sync_task: NonDetachingJoinHandle<()>,
+    synced: Watch<u64>,
+}
+impl NetService {
+    pub(crate) fn dummy() -> Self {
+        Self {
+            shutdown: true,
+            data: Arc::new(Mutex::new(NetServiceData {
+                id: None,
+                ip: Ipv4Addr::new(0, 0, 0, 0),
+                ipv6: None,
+                _dns: Default::default(),
+                controller: Default::default(),
+                binds: BTreeMap::new(),
+            })),
+            sync_task: tokio::spawn(futures::future::ready(())).into(),
+            synced: Watch::new(0u64),
+        }
+    }
+
+    fn new(data: NetServiceData) -> Result<Self, Error> {
+        let ctrl = data.net_controller()?;
+        let pkg_id = data.id.clone();
+        let db = ctrl.db.clone();
+        drop(ctrl);
+
+        let synced = Watch::new(0u64);
+        let synced_writer = synced.clone();
+
+        let outbound_sources = data.outbound_sources();
+        let data = Arc::new(Mutex::new(data));
+        let thread_data = data.clone();
+        let sync_task = tokio::spawn(async move {
+            if let Some(ref id) = pkg_id {
+                let ptr: JsonPointer = format!("/public/packageData/{}/hosts", id).parse().unwrap();
+                let mut watch = db.watch(ptr).await.typed::<Hosts>();
+
+                purge_outbound_rules(&outbound_sources).await;
+                let mut outbound_sub = db
+                    .subscribe(
+                        format!("/public/packageData/{}/outboundGateway", id)
+                            .parse::<JsonPointer<_, _>>()
+                            .unwrap(),
+                    )
+                    .await;
+                let ctrl_for_ip = thread_data.lock().await.net_controller().ok();
+                let mut ip_info_watch = ctrl_for_ip
+                    .as_ref()
+                    .map(|c| c.net_iface.watcher.subscribe());
+                if let Some(ref mut w) = ip_info_watch {
+                    w.mark_seen();
+                }
+                drop(ctrl_for_ip);
+                let mut current_outbound = BTreeSet::new();
+                sync_outbound_rules(&db, id, &outbound_sources, &mut current_outbound).await;
+
+                loop {
+                    let (hosts_changed, outbound_changed) = tokio::select! {
+                        res = watch.changed() => {
+                            if let Err(e) = res {
+                                tracing::error!("DB watch disconnected for {id}: {e}");
+                                break;
+                            }
+                            (true, false)
+                        }
+                        _ = outbound_sub.recv() => (false, true),
+                        _ = async {
+                            if let Some(ref mut w) = ip_info_watch {
+                                w.changed().await;
+                            } else {
+                                std::future::pending::<()>().await;
+                            }
+                        } => (false, true),
+                    };
+
+                    // Handle host updates
+                    if hosts_changed {
+                        if let Err(e) = async {
+                            // A host absent from a hosts map we failed to read is
+                            // not a retired host. Bail rather than tear every
+                            // one of them down.
+                            let hosts: Hosts = match watch.peek()?.de() {
+                                Ok(hosts) => hosts,
+                                Err(e) => {
+                                    tracing::error!("Failed to read hosts for {id}: {e}");
+                                    tracing::debug!("{e:?}");
+                                    return Ok(());
+                                }
+                            };
+                            let mut data = thread_data.lock().await;
+                            let ctrl = data.net_controller()?;
+                            // Retire first: a port handed from a removed host to
+                            // a surviving one in the same pass has to come down
+                            // before it is rebuilt.
+                            for host_id in retired_hosts(data.binds.keys(), &hosts) {
+                                data.retire(&*ctrl, host_id).await?;
+                            }
+                            for (host_id, host) in hosts.0 {
+                                data.update(&*ctrl, host_id, host).await?;
+                            }
+                            Ok::<_, Error>(())
+                        }
+                        .await
+                        {
+                            tracing::error!("Failed to update network info for {id}: {e}");
+                            tracing::debug!("{e:?}");
+                        }
+                    }
+
+                    if outbound_changed {
+                        sync_outbound_rules(&db, id, &outbound_sources, &mut current_outbound)
+                            .await;
+                    }
+
+                    synced_writer.send_modify(|v| *v += 1);
+                }
+
+                for rule in current_outbound.into_iter().rev() {
+                    delete_outbound_rules(&outbound_sources, rule).await;
+                }
+            } else {
+                let ptr: JsonPointer = "/public/serverInfo/network/host".parse().unwrap();
+                let mut watch = db.watch(ptr).await.typed::<Host>();
+                loop {
+                    if let Err(e) = watch.changed().await {
+                        tracing::error!("DB watch disconnected for Main UI: {e}");
+                        break;
+                    }
+                    if let Err(e) = async {
+                        let host = watch.peek()?.de()?;
+                        let mut data = thread_data.lock().await;
+                        let ctrl = data.net_controller()?;
+                        data.update(&*ctrl, HostId::admin(), host).await?;
+                        Ok::<_, Error>(())
+                    }
+                    .await
+                    {
+                        tracing::error!("Failed to update network info for Main UI: {e}");
+                        tracing::debug!("{e:?}");
+                    }
+                    synced_writer.send_modify(|v| *v += 1);
+                }
+            }
+        });
+
+        Ok(Self {
+            shutdown: false,
+            data,
+            sync_task: sync_task.into(),
+            synced,
+        })
+    }
+
+    pub async fn bind(
+        &self,
+        id: HostId,
+        internal_port: u16,
+        options: BindOptions,
+    ) -> Result<(), Error> {
+        let (ctrl, pkg_id) = {
+            let data = self.data.lock().await;
+            (
+                data.net_controller()?,
+                data.id.clone().unwrap_or_else(PackageId::start_os),
+            )
+        };
+        // StartOS runs as root, so the admin UI may claim 80 and 443.
+        let privileged = pkg_id.is_start_os();
+        ctrl.db
+            .mutate(|db| {
+                let gateways = db
+                    .as_public()
+                    .as_server_info()
+                    .as_network()
+                    .as_gateways()
+                    .de()?;
+                let hostname = ServerHostname::load(db.as_public().as_server_info())?;
+                let mut ports = db.as_private().as_available_ports().de()?;
+                let host = host_for(db, &pkg_id, &id)?;
+                let is_new = !host.as_bindings().contains_key(&internal_port)?;
+                host.add_binding(&mut ports, internal_port, options, privileged)?;
+                host.update_addresses(&hostname, &gateways, &ports)?;
+                // Isolate a newly-bound binding from any pre-existing public
+                // domain on this host, then re-derive so port forwards match.
+                if is_new {
+                    host.reconcile_public_domains_on_new_binding(internal_port)?;
+                    host.update_addresses(&hostname, &gateways, &ports)?;
+                }
+                db.as_private_mut().as_available_ports_mut().ser(&ports)?;
+                Ok(())
+            })
+            .await
+            .result
+    }
+
+    pub async fn bind_range(
+        &self,
+        id: HostId,
+        internal_start_port: u16,
+        external_start_port: u16,
+        number_of_ports: u16,
+    ) -> Result<(), Error> {
+        let (ctrl, pkg_id) = {
+            let data = self.data.lock().await;
+            (
+                data.net_controller()?,
+                data.id.clone().unwrap_or_else(PackageId::start_os),
+            )
+        };
+        // StartOS runs as root, so the admin UI may claim 80 and 443.
+        let privileged = pkg_id.is_start_os();
+        ctrl.db
+            .mutate(|db| {
+                let gateways = db
+                    .as_public()
+                    .as_server_info()
+                    .as_network()
+                    .as_gateways()
+                    .de()?;
+                let hostname = ServerHostname::load(db.as_public().as_server_info())?;
+                let mut ports = db.as_private().as_available_ports().de()?;
+                let host = host_for(db, &pkg_id, &id)?;
+                let is_new = !host
+                    .as_binding_ranges()
+                    .contains_key(&internal_start_port)?;
+                host.add_binding_range(
+                    &mut ports,
+                    internal_start_port,
+                    external_start_port,
+                    number_of_ports,
+                    privileged,
+                )?;
+                host.update_addresses(&hostname, &gateways, &ports)?;
+                // Isolate a newly-bound range from any pre-existing public domain
+                // on this host, then re-derive so port forwards match.
+                if is_new {
+                    host.reconcile_public_domains_on_new_range(internal_start_port)?;
+                    host.update_addresses(&hostname, &gateways, &ports)?;
+                }
+                db.as_private_mut().as_available_ports_mut().ser(&ports)?;
+                Ok(())
+            })
+            .await
+            .result
+    }
+
+    /// Returns `true` if the mutate actually changed something (a non-empty
+    /// patch). A no-op clears nothing, so the caller can skip waiting on the
+    /// sync-task for a change that will never arrive.
+    pub async fn clear_bindings(&self, except: BTreeSet<BindId>) -> Result<bool, Error> {
+        let (ctrl, pkg_id) = {
+            let data = self.data.lock().await;
+            (data.net_controller()?, data.id.clone())
+        };
+        let rev = ctrl
+            .db
+            .mutate(|db| {
+                let gateways = db
+                    .as_public()
+                    .as_server_info()
+                    .as_network()
+                    .as_gateways()
+                    .de()?;
+                let hostname = ServerHostname::load(db.as_public().as_server_info())?;
+                let ports = db.as_private().as_available_ports().de()?;
+                if let Some(ref pkg_id) = pkg_id {
+                    let Some(pde) = db.as_public_mut().as_package_data_mut().as_idx_mut(pkg_id)
+                    else {
+                        return Ok(());
+                    };
+                    for (host_id, host) in pde.as_hosts_mut().as_entries_mut()? {
+                        host.as_bindings_mut().mutate(|b| {
+                            for (internal_port, info) in b.iter_mut() {
+                                if !except.contains(&BindId {
+                                    id: host_id.clone(),
+                                    internal_port: *internal_port,
+                                }) {
+                                    info.disable();
+                                }
+                            }
+                            Ok(())
+                        })?;
+                        host.as_binding_ranges_mut().mutate(|r| {
+                            for (internal_port, info) in r.iter_mut() {
+                                if !except.contains(&BindId {
+                                    id: host_id.clone(),
+                                    internal_port: *internal_port,
+                                }) {
+                                    info.disable();
+                                }
+                            }
+                            Ok(())
+                        })?;
+                        host.update_addresses(&hostname, &gateways, &ports)?;
+                    }
+                } else {
+                    let host = db
+                        .as_public_mut()
+                        .as_server_info_mut()
+                        .as_network_mut()
+                        .as_host_mut();
+                    host.as_bindings_mut().mutate(|b| {
+                        for (internal_port, info) in b.iter_mut() {
+                            if !except.contains(&BindId {
+                                id: HostId::admin(),
+                                internal_port: *internal_port,
+                            }) {
+                                info.disable();
+                            }
+                        }
+                        Ok(())
+                    })?;
+                    host.as_binding_ranges_mut().mutate(|r| {
+                        for (internal_port, info) in r.iter_mut() {
+                            if !except.contains(&BindId {
+                                id: HostId::admin(),
+                                internal_port: *internal_port,
+                            }) {
+                                info.disable();
+                            }
+                        }
+                        Ok(())
+                    })?;
+                    host.update_addresses(&hostname, &gateways, &ports)?;
+                }
+                Ok(())
+            })
+            .await;
+        rev.result.map(|_| rev.revision.is_some())
+    }
+
+    /// Permanently remove a host and everything nested in it — its bindings and
+    /// ranges, their exported service interfaces, the operator's domains and
+    /// per-address choices — returning its external ports to the pool. `false`
+    /// if there was no such host.
+    ///
+    /// The datapath comes down through the sync task's retire pass; the patch
+    /// this writes is what wakes it.
+    pub async fn retire_host(&self, id: HostId) -> Result<bool, Error> {
+        let (ctrl, pkg_id) = {
+            let data = self.data.lock().await;
+            (data.net_controller()?, data.id.clone())
+        };
+        let Some(pkg_id) = pkg_id else {
+            return Err(Error::new(
+                eyre!("the server's own host cannot be retired"),
+                ErrorKind::InvalidRequest,
+            ));
+        };
+        ctrl.db
+            .mutate(|db| {
+                let Some(host) = db
+                    .as_public_mut()
+                    .as_package_data_mut()
+                    .as_idx_mut(&pkg_id)
+                    .or_not_found(&pkg_id)?
+                    .as_hosts_mut()
+                    .remove(&id)?
+                    .map(|h| h.de())
+                    .transpose()?
+                else {
+                    return Ok(false);
+                };
+                db.as_private_mut()
+                    .as_available_ports_mut()
+                    .mutate(|p| Ok(host.release(p)))?;
+                Ok(true)
+            })
+            .await
+            .result
+    }
+
+    /// Permanently remove one binding — or the port range at the same key,
+    /// which `bindings` and `binding_ranges` share — and its exported service
+    /// interfaces, returning its external ports to the pool. `false` if nothing
+    /// was bound at `internal_port`.
+    ///
+    /// The host survives, so the ordinary reconcile tears the datapath down.
+    pub async fn retire_binding(&self, id: HostId, internal_port: u16) -> Result<bool, Error> {
+        let (ctrl, pkg_id) = {
+            let data = self.data.lock().await;
+            (data.net_controller()?, data.id.clone())
+        };
+        let Some(pkg_id) = pkg_id else {
+            return Err(Error::new(
+                eyre!("the server's own bindings cannot be retired"),
+                ErrorKind::InvalidRequest,
+            ));
+        };
+        ctrl.db
+            .mutate(|db| {
+                let gateways = db
+                    .as_public()
+                    .as_server_info()
+                    .as_network()
+                    .as_gateways()
+                    .de()?;
+                let hostname = ServerHostname::load(db.as_public().as_server_info())?;
+                let mut ports = db.as_private().as_available_ports().de()?;
+
+                let Some(host) = host_for_existing(db, &pkg_id, &id)? else {
+                    return Ok(false);
+                };
+                let mut retired = false;
+                if let Some(bind) = host.as_bindings_mut().remove(&internal_port)? {
+                    bind.de()?.release(&mut ports);
+                    retired = true;
+                }
+                if let Some(range) = host.as_binding_ranges_mut().remove(&internal_port)? {
+                    range.de()?.release(&mut ports);
+                    retired = true;
+                }
+                if !retired {
+                    return Ok(false);
+                }
+                // `port_forwards` is computed from the bindings, so it still
+                // advertises the retired one until this re-derives it.
+                host.update_addresses(&hostname, &gateways, &ports)?;
+                db.as_private_mut().as_available_ports_mut().ser(&ports)?;
+                Ok(true)
+            })
+            .await
+            .result
+    }
+
+    pub async fn remove_all(mut self) -> Result<(), Error> {
+        if Weak::upgrade(&self.data.lock().await.controller).is_none() {
+            self.shutdown = true;
+            tracing::warn!("NetService dropped after NetController is shutdown");
+            return Err(Error::new(
+                eyre!("NetController is shutdown"),
+                crate::ErrorKind::Network,
+            ));
+        }
+        let current = self.synced.peek(|v| *v);
+        // Only wait for the sync-task to apply the teardown if clear_bindings
+        // actually changed something. A no-op mutate produces no patch, so the
+        // sync-task's `hosts` watch never fires and `synced` never advances —
+        // without this guard the wait below blocks forever (its `sync_task` arm
+        // only rescues us when the task is already dead, not alive-but-idle).
+        if self.clear_bindings(Default::default()).await? {
+            let mut w = self.synced.clone();
+            tokio::select! {
+                _ = w.wait_for(|v| *v > current) => {}
+                // sync-task already dead (e.g. aborted by a prior remove_all):
+                // `synced` will never advance again, so don't block on it.
+                _ = &mut self.sync_task => {}
+            }
+        }
+        self.sync_task.abort();
+        let outbound_sources = {
+            let mut data = self.data.lock().await;
+            if let Ok(ctrl) = data.net_controller() {
+                for id in data.binds.keys().cloned().collect::<Vec<_>>() {
+                    data.retire(&*ctrl, id).await.log_err();
+                }
+            }
+            data.outbound_sources()
+        };
+        purge_outbound_rules(&outbound_sources).await;
+        // Set last: an earlier failure leaves shutdown false so Drop's fallback re-runs.
+        self.shutdown = true;
+        Ok(())
+    }
+
+    pub async fn get_ip(&self) -> Ipv4Addr {
+        self.data.lock().await.ip
+    }
+}
+
+impl Drop for NetService {
+    fn drop(&mut self) {
+        if !self.shutdown {
+            self.shutdown = true;
+            let svc = std::mem::replace(self, Self::dummy());
+            tokio::spawn(async move { svc.remove_all().await.log_err() });
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use imbl_value::InternedString;
+
+    use super::*;
+    use crate::db::model::public::IpInfo;
+    use crate::net::host::binding::Security;
+
+    fn bind_options(
+        add_ssl: bool,
+        secure_ssl: Option<bool>,
+        alpn: Option<AlpnInfo>,
+    ) -> BindOptions {
+        BindOptions {
+            preferred_external_port: 443,
+            add_ssl: add_ssl.then(|| AddSslOptions {
+                preferred_external_port: 443,
+                add_x_forwarded_headers: false,
+                alpn,
+                upstream_cert_validation: None,
+                auth: None,
+            }),
+            secure: secure_ssl.map(|ssl| Security { ssl }),
+        }
+    }
+
+    #[test]
+    fn the_bare_ip_vhost_answers_on_its_enabled_ssl_ips_alone() {
+        let eth = GatewayId::from(InternedString::intern("eth0"));
+        let row = |host: &str, ssl, public, metadata| HostnameInfo {
+            ssl,
+            public,
+            hostname: InternedString::intern(host),
+            port: Some(if ssl { 8443 } else { 8080 }),
+            metadata,
+        };
+        let ipv4 = || HostnameMetadata::Ipv4 {
+            gateway: eth.clone(),
+        };
+        let mdns = row(
+            "server.local",
+            true,
+            false,
+            HostnameMetadata::Mdns {
+                gateways: BTreeSet::from([eth.clone()]),
+            },
+        );
+        let plain = row("192.0.2.10", false, false, ipv4());
+        let wan = row("198.51.100.2", true, true, ipv4());
+        let ssl = row("192.0.2.10", true, false, ipv4());
+
+        assert!(ssl_vhost_private_ips([&mdns, &plain, &wan]).is_empty());
+        assert_eq!(
+            ssl_vhost_private_ips([&mdns, &plain, &wan, &ssl]),
+            BTreeSet::from(["192.0.2.10".parse::<IpAddr>().unwrap()])
+        );
+    }
+
+    #[test]
+    fn a_plugin_name_is_served_on_the_bindings_ssl_port_over_internal_ips_alone() {
+        let eth = GatewayId::from(InternedString::intern("eth0"));
+        let row = |host: &str, ssl, public, port, metadata| HostnameInfo {
+            ssl,
+            public,
+            hostname: InternedString::intern(host),
+            port: Some(port),
+            metadata,
+        };
+        let ipv4 = || HostnameMetadata::Ipv4 {
+            gateway: eth.clone(),
+        };
+        let onion = row(
+            "example.onion",
+            true,
+            true,
+            443,
+            HostnameMetadata::Plugin {
+                package_id: "tor".parse().unwrap(),
+                remove_action: None,
+                overflow_actions: Vec::new(),
+                info: imbl_value::Value::Null,
+            },
+        );
+        let domain = row(
+            "example.com",
+            true,
+            true,
+            443,
+            HostnameMetadata::PublicDomain {
+                gateway: eth.clone(),
+            },
+        );
+        let bridge = row("10.0.3.1", true, false, 49443, ipv4());
+        let bridge_plain = row("10.0.3.1", false, false, 49080, ipv4());
+        let lan = row("192.0.2.10", true, false, 49443, ipv4());
+
+        assert_eq!(named_vhost_leg(&onion, 49443), Some((49443, false)));
+        assert_eq!(named_vhost_leg(&domain, 49443), Some((443, true)));
+        assert_eq!(named_vhost_leg(&lan, 49443), None);
+        assert_eq!(
+            ssl_vhost_internal_ips([&onion, &bridge, &bridge_plain, &lan]),
+            BTreeSet::from(["10.0.3.1".parse::<IpAddr>().unwrap()])
+        );
+    }
+
+    #[test]
+    fn every_named_vhost_accepts_the_bridge_even_when_names_share_an_entry() {
+        let eth = GatewayId::from(InternedString::intern("eth0"));
+        let row = |host: &str, public, port, metadata| HostnameInfo {
+            ssl: true,
+            public,
+            hostname: InternedString::intern(host),
+            port: Some(port),
+            metadata,
+        };
+        let plugin = || HostnameMetadata::Plugin {
+            package_id: "tor".parse().unwrap(),
+            remove_action: None,
+            overflow_actions: Vec::new(),
+            info: imbl_value::Value::Null,
+        };
+        let private_domain = || HostnameMetadata::PrivateDomain {
+            gateways: BTreeSet::from([eth.clone()]),
+        };
+        let bridge = row(
+            "10.0.3.1",
+            false,
+            49443,
+            HostnameMetadata::Ipv4 {
+                gateway: eth.clone(),
+            },
+        );
+        let named = |rows: &[&HostnameInfo]| {
+            let enabled: BTreeSet<&HostnameInfo> = rows.iter().copied().chain([&bridge]).collect();
+            let mut vhosts = BTreeMap::new();
+            add_named_vhosts(&mut vhosts, &enabled, 49443, &OrdMap::new(), |_, _| {
+                ProxyTarget {
+                    public_v4: BTreeSet::new(),
+                    public_v6: BTreeSet::new(),
+                    public_v6_gateways: BTreeSet::new(),
+                    private: BTreeSet::new(),
+                    acme: None,
+                    addr: "10.0.3.2:443".parse().unwrap(),
+                    addr_v6: None,
+                    add_x_forwarded_headers: false,
+                    auth: None,
+                    connect_ssl: None,
+                    alpn: None,
+                    passthrough: false,
+                    preserve_source_ip: false,
+                }
+            });
+            vhosts
+        };
+        let accepts = |vhosts: &BTreeMap<VHostKey, ProxyTarget>, name: &str, public| {
+            let ProxyTarget { private, .. } =
+                &vhosts[&(Some(InternedString::intern(name)), 49443, public)];
+            private.contains(&"10.0.3.1".parse::<IpAddr>().unwrap())
+        };
+
+        let onion = row("example.onion", true, 443, plugin());
+        let shared_onion = row("box.example", true, 443, plugin());
+        let shared_domain = row("box.example", false, 49443, private_domain());
+        let private = row("lan.example", false, 49443, private_domain());
+        let public = row(
+            "www.example",
+            true,
+            49443,
+            HostnameMetadata::PublicDomain {
+                gateway: eth.clone(),
+            },
+        );
+
+        assert!(accepts(&named(&[&onion]), "example.onion", false));
+        assert!(accepts(&named(&[&private]), "lan.example", false));
+        assert!(accepts(&named(&[&public]), "www.example", true));
+        assert!(accepts(
+            &named(&[&shared_domain, &shared_onion]),
+            "box.example",
+            false
+        ));
+    }
+
+    #[test]
+    fn mdns_tls_routes_accept_gateway_lan_ips_without_enabled_bare_ips() {
+        let eth = gw("eth0");
+        let ifaces = OrdMap::from_iter([(
+            eth,
+            NetworkInterfaceInfo {
+                ip_info: Some(Arc::new(IpInfo {
+                    subnets: ["192.0.2.10/24", "192.0.2.11/24"]
+                        .into_iter()
+                        .map(|s| s.parse::<IpNet>().unwrap())
+                        .collect(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+        )]);
+        let name = mdns(true, 8443, ["eth0"]);
+        let bridge = lan_ip("10.0.3.1", true, 8443, "lxcbr0");
+        let enabled = BTreeSet::from([&name, &bridge]);
+        let mut vhosts = BTreeMap::new();
+        add_named_vhosts(&mut vhosts, &enabled, 8443, &ifaces, |_, _| {
+            proxy_target(&[])
+        });
+        let target = &vhosts[&(Some(name.hostname.clone()), 8443, false)];
+        assert_eq!(
+            target.private,
+            BTreeSet::from([ip("10.0.3.1"), ip("192.0.2.10"), ip("192.0.2.11")]),
+        );
+        assert!(target.public_v4.is_empty());
+        assert!(target.public_v6.is_empty());
+        assert!(target.public_v6_gateways.is_empty());
+        assert_eq!(
+            ssl_vhost_private_ips(enabled.iter().copied()),
+            BTreeSet::from([ip("10.0.3.1")]),
+        );
+    }
+
+    #[test]
+    fn a_forwarded_port_admits_its_enabled_lan_ips_alone() {
+        let eth = GatewayId::from(InternedString::intern("eth0"));
+        let ifaces: OrdMap<GatewayId, NetworkInterfaceInfo> = [(
+            eth.clone(),
+            NetworkInterfaceInfo {
+                ip_info: Some(Arc::new(IpInfo {
+                    subnets: ["192.0.2.10/24", "192.0.2.11/24"]
+                        .into_iter()
+                        .map(|s| s.parse::<IpNet>().unwrap())
+                        .collect(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+        )]
+        .into_iter()
+        .collect();
+        let row = |host: &str, metadata| HostnameInfo {
+            ssl: false,
+            public: false,
+            hostname: InternedString::intern(host),
+            port: Some(8080),
+            metadata,
+        };
+        let gateways = BTreeSet::from([eth.clone()]);
+        let mdns = row(
+            "server.local",
+            HostnameMetadata::Mdns {
+                gateways: gateways.clone(),
+            },
+        );
+        let ip = row("192.0.2.10", HostnameMetadata::Ipv4 { gateway: eth });
+        let domain = row("priv.lan", HostnameMetadata::PrivateDomain { gateways });
+        let ips = |hosts: &[&str]| -> BTreeSet<IpAddr> {
+            hosts.iter().map(|h| h.parse().unwrap()).collect()
+        };
+
+        assert_eq!(forwarded_lan_ips([&mdns], &ifaces), ips(&[]));
+        assert_eq!(
+            forwarded_lan_ips([&mdns, &ip], &ifaces),
+            ips(&["192.0.2.10"])
+        );
+        assert_eq!(
+            forwarded_lan_ips([&domain], &ifaces),
+            ips(&["192.0.2.10", "192.0.2.11"])
+        );
+    }
+
+    /// `alpn` names protocols, not a transport, so it has no say in whether the
+    /// container is dialled over TLS.
+    #[test]
+    fn alpn_does_not_decide_whether_the_container_is_dialled_over_tls() {
+        let pinned = || Some(AlpnInfo(vec![MaybeUtf8String(b"h2".to_vec())]));
+        for alpn in [None, pinned()] {
+            assert!(
+                bind_options(true, Some(true), alpn.clone())
+                    .rewrap()
+                    .is_some(),
+                "a container serving its own TLS is dialled over TLS, whatever `alpn` says",
+            );
+            for secure in [None, Some(false)] {
+                assert!(
+                    bind_options(true, secure, alpn.clone()).rewrap().is_none(),
+                    "a container that does not serve TLS is dialled plainly",
+                );
+            }
+            assert!(
+                bind_options(false, Some(true), alpn.clone())
+                    .rewrap()
+                    .is_none(),
+                "a passthrough has no leg of ours to dial",
+            );
+        }
+    }
+
+    fn bare_v4(ssl: bool, port: u16, gateway: &GatewayId) -> HostnameInfo {
+        HostnameInfo {
+            ssl,
+            public: true,
+            hostname: InternedString::intern("203.0.113.10"),
+            port: Some(port),
+            metadata: HostnameMetadata::Ipv4 {
+                gateway: gateway.clone(),
+            },
+        }
+    }
+
+    // Regression for the coturn/`—`-fallback bug: enabling the bare WAN IP on a
+    // binding's *plain* port marked the SSL `*` vhost public, requesting a bare
+    // pinhole for the SSL port the operator never enabled. Only SSL-port
+    // addresses may make the SSL vhost public.
+    #[test]
+    fn plain_port_bare_ip_does_not_publicize_ssl_vhost() {
+        let wg = GatewayId::from(InternedString::intern("wg0"));
+        let addrs = [bare_v4(false, 57551, &wg)];
+        assert!(
+            ssl_vhost_public_v4(addrs.iter()).is_empty(),
+            "a plain-port bare IP must not mark the SSL vhost public"
+        );
+
+        let addrs = [bare_v4(false, 57551, &wg), bare_v4(true, 5349, &wg)];
+        assert_eq!(
+            ssl_vhost_public_v4(addrs.iter()),
+            BTreeSet::from([wg.clone()]),
+            "an SSL-port bare IP does mark it public"
+        );
+    }
+
+    fn gw(name: &str) -> GatewayId {
+        GatewayId::from(InternedString::intern(name))
+    }
+
+    fn lan_ip(ip: &str, ssl: bool, port: u16, gateway: &str) -> HostnameInfo {
+        let metadata = if ip.parse::<IpAddr>().unwrap().is_ipv4() {
+            HostnameMetadata::Ipv4 {
+                gateway: gw(gateway),
+            }
+        } else {
+            HostnameMetadata::Ipv6 {
+                gateway: gw(gateway),
+                scope_id: 0,
+            }
+        };
+        HostnameInfo {
+            ssl,
+            public: false,
+            hostname: InternedString::intern(ip),
+            port: Some(port),
+            metadata,
+        }
+    }
+
+    fn mdns(
+        ssl: bool,
+        port: u16,
+        gateways: impl IntoIterator<Item = &'static str>,
+    ) -> HostnameInfo {
+        HostnameInfo {
+            ssl,
+            public: false,
+            hostname: InternedString::intern("start-9.local"),
+            port: Some(port),
+            metadata: HostnameMetadata::Mdns {
+                gateways: gateways.into_iter().map(gw).collect(),
+            },
+        }
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn a_name_contributes_no_address_to_the_ssl_vhost() {
+        let addrs = [
+            lan_ip("fe80::1", true, 443, "eth0"),
+            mdns(true, 443, ["eth0"]),
+            lan_ip("10.0.3.1", true, 443, "lxcbr0"),
+        ];
+
+        assert_eq!(
+            ssl_vhost_private_ips(addrs.iter()),
+            BTreeSet::from([ip("fe80::1"), ip("10.0.3.1")]),
+            "only the addresses still enabled are served"
+        );
+    }
+
+    #[test]
+    fn forwarded_lan_ips_match_the_selected_port_and_exclude_public_rows() {
+        let selected = lan_ip("192.168.1.5", false, 5000, "eth0");
+        let other_port = lan_ip("192.168.1.6", false, 5001, "eth0");
+        let ipv6 = lan_ip("fd00::5", false, 5000, "eth0");
+        let public = bare_v4(false, 5000, &gw("eth0"));
+
+        assert_eq!(
+            forwarded_lan_ips(
+                [&selected, &other_port, &ipv6, &public]
+                    .into_iter()
+                    .filter(|a| a.port == Some(5000)),
+                &OrdMap::new(),
+            ),
+            BTreeSet::from([ip("192.168.1.5"), ip("fd00::5")]),
+        );
+    }
+
+    #[test]
+    fn a_bare_ip_serves_itself_and_not_its_gateways_other_addresses() {
+        let addrs = [
+            lan_ip("192.168.1.5", true, 443, "eth0"),
+            lan_ip("10.13.13.5", true, 443, "eth0"),
+        ];
+
+        assert_eq!(
+            ssl_vhost_private_ips(addrs.iter()),
+            BTreeSet::from([ip("192.168.1.5"), ip("10.13.13.5")]),
+            "each enabled address is served"
+        );
+
+        assert_eq!(
+            ssl_vhost_private_ips(addrs[1..].iter()),
+            BTreeSet::from([ip("10.13.13.5")]),
+            "switching one off leaves the other served"
+        );
+    }
+
+    #[test]
+    fn a_plain_port_bare_ip_is_not_served_by_the_ssl_vhost() {
+        let addrs = [lan_ip("192.168.1.5", false, 80, "eth0")];
+
+        assert!(
+            ssl_vhost_private_ips(addrs.iter()).is_empty(),
+            "a plain-port bare IP is not an address the SSL vhost answers on"
+        );
+    }
+
+    #[test]
+    fn a_public_address_is_not_a_private_one() {
+        let addrs = [bare_v4(true, 443, &gw("eth0"))];
+
+        assert!(
+            ssl_vhost_private_ips(addrs.iter()).is_empty(),
+            "the WAN IPv4 belongs to the public set"
+        );
+    }
+
+    #[test]
+    fn the_container_bridges_own_addresses_are_internal() {
+        assert!(lan_ip("10.0.3.1", true, 443, "lxcbr0").is_internal());
+        assert!(lan_ip("fd00:3::1", true, 443, "lxcbr0").is_internal());
+        assert!(lan_ip("127.0.0.1", true, 443, "lo").is_internal());
+        assert!(lan_ip("::1", true, 443, "lo").is_internal());
+
+        assert!(!lan_ip("192.168.1.5", true, 443, "eth0").is_internal());
+        assert!(
+            !lan_ip("fd00:3::5", true, 443, "eth0").is_internal(),
+            "a router handing out the bridge's own prefix does not make its \
+             addresses internal, which would put them beyond the operator's reach"
+        );
+        assert!(
+            !lan_ip("fe80::1", true, 443, "lxcbr0").is_internal(),
+            "a link-local address is the kernel's, not one the bridge is given"
+        );
+    }
+
+    fn host_id(s: &str) -> HostId {
+        HostId::from(Id::try_from(s.to_owned()).unwrap())
+    }
+
+    fn hosts(ids: impl IntoIterator<Item = &'static str>) -> Hosts {
+        Hosts(
+            ids.into_iter()
+                .map(|id| (host_id(id), Host::new()))
+                .collect(),
+        )
+    }
+
+    fn proxy_target(private: &[&str]) -> ProxyTarget {
+        ProxyTarget {
+            public_v4: BTreeSet::new(),
+            public_v6: BTreeSet::new(),
+            public_v6_gateways: BTreeSet::new(),
+            private: private.iter().map(|ip| ip.parse().unwrap()).collect(),
+            acme: None,
+            addr: "10.0.3.2:80".parse().unwrap(),
+            addr_v6: None,
+            add_x_forwarded_headers: false,
+            auth: None,
+            connect_ssl: None,
+            alpn: Some(AlpnInfo(vec![MaybeUtf8String(b"h2".to_vec())])),
+            passthrough: false,
+            preserve_source_ip: false,
+        }
+    }
+
+    #[test]
+    fn only_hosts_the_database_dropped_are_retired() {
+        let held = [host_id("ui"), host_id("api"), host_id("peer")];
+
+        assert_eq!(
+            retired_hosts(held.iter(), &hosts(["ui", "api", "peer"])),
+            Vec::<HostId>::new(),
+            "nothing is retired while every held host is still in the database"
+        );
+        assert_eq!(
+            retired_hosts(held.iter(), &hosts(["ui", "peer"])),
+            vec![host_id("api")],
+            "the host the database dropped is retired"
+        );
+        assert_eq!(
+            retired_hosts(held.iter(), &hosts(["ui", "api", "peer", "metrics"])),
+            Vec::<HostId>::new(),
+            "a host the database gained but the datapath has not built yet is not a retirement"
+        );
+        assert_eq!(
+            retired_hosts(held.iter(), &hosts([])),
+            held.to_vec(),
+            "an uninstalled package retires every host it held"
+        );
+        assert_eq!(
+            retired_hosts([].iter(), &hosts(["ui"])),
+            Vec::<HostId>::new(),
+            "the first pass after a restart holds nothing, so it retires nothing"
+        );
+    }
+
+    /// Retiring a host works by reconciling it against an empty [`Host`], which
+    /// is a teardown only for as long as every resource `HostBinds` holds is
+    /// driven by the desired set `update` computes from that host. Adding a
+    /// field here fails to compile until it is destructured, which is the
+    /// prompt to go wire it into `update`'s teardown — several of these carry
+    /// no refcount, so nothing else would reap them.
+    #[test]
+    fn host_binds_holds_only_what_update_reconciles() {
+        let HostBinds {
+            forwards,
+            vhosts,
+            private_dns,
+            gua_forwards,
+        } = HostBinds::default();
+        assert!(forwards.is_empty());
+        assert!(vhosts.is_empty());
+        assert!(private_dns.is_empty());
+        assert!(gua_forwards.is_empty());
+    }
+
+    fn args(cmd: &Command) -> Vec<&str> {
+        cmd.as_std()
+            .get_args()
+            .map(|a| a.to_str().unwrap())
+            .collect()
+    }
+
+    /// `ip rule` rejects an IPv6 source without `-6`.
+    #[test]
+    fn outbound_rule_family_follows_its_source() {
+        assert_eq!(args(&ip_rule("10.0.3.5".parse().unwrap())), ["rule"]);
+        assert_eq!(args(&ip_rule("fd00:3::5".parse().unwrap())), ["-6", "rule"]);
+    }
+
+    #[test]
+    fn service_outbound_rules_order_by_priority() {
+        assert!(ServiceOutboundRule::Gateway(u32::MAX) < ServiceOutboundRule::Reject);
+        assert!(SERVICE_OUTBOUND_RULE_PRIORITY < SERVICE_OUTBOUND_REJECT_RULE_PRIORITY);
+    }
+
+    #[test]
+    fn service_outbound_rules_are_source_scoped_in_each_family() {
+        assert_eq!(
+            args(&outbound_rule_command(
+                "add",
+                "10.0.3.5".parse().unwrap(),
+                ServiceOutboundRule::Gateway(1004),
+            )),
+            [
+                "rule", "add", "from", "10.0.3.5", "lookup", "1004", "priority", "70"
+            ]
+        );
+        assert_eq!(
+            args(&outbound_rule_command(
+                "add",
+                "fd00:3::5".parse().unwrap(),
+                ServiceOutboundRule::Reject,
+            )),
+            [
+                "-6",
+                "rule",
+                "add",
+                "from",
+                "fd00:3::5",
+                "unreachable",
+                "priority",
+                "71"
+            ]
+        );
+    }
+
+    #[test]
+    fn conntrack_filter_family_follows_its_source() {
+        assert_eq!(
+            args(&delete_conntrack_command("10.0.3.5".parse().unwrap())),
+            ["-D", "-s", "10.0.3.5"]
+        );
+        assert_eq!(
+            args(&delete_conntrack_command("fd00:3::5".parse().unwrap())),
+            ["-D", "-f", "ipv6", "-s", "fd00:3::5"]
+        );
+    }
+
+    #[test]
+    fn outbound_sources_cover_every_address_the_container_holds() {
+        let mut data = NetServiceData {
+            id: None,
+            ip: Ipv4Addr::new(10, 0, 3, 5),
+            ipv6: None,
+            _dns: Default::default(),
+            controller: Default::default(),
+            binds: BTreeMap::new(),
+        };
+        assert_eq!(
+            data.outbound_sources(),
+            ["10.0.3.5".parse::<IpAddr>().unwrap()]
+        );
+
+        data.ipv6 = Some("fd00:3::5".parse().unwrap());
+        assert_eq!(
+            data.outbound_sources(),
+            ["10.0.3.5", "fd00:3::5"].map(|a| a.parse::<IpAddr>().unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dropped_service_stops_its_sync_task() {
+        let (held, released) = tokio::sync::oneshot::channel::<()>();
+        let mut service = NetService::dummy();
+        service.sync_task = tokio::spawn(async move {
+            let _held = held;
+            std::future::pending::<()>().await
+        })
+        .into();
+        drop(service);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), released)
+                .await
+                .is_ok()
+        );
+    }
+}

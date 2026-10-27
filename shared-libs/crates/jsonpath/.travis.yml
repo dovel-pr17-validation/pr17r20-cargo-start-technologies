@@ -1,0 +1,37 @@
+language: rust
+sudo: required
+addons:
+  apt:
+    packages:
+      - libssl-dev
+
+cache: cargo
+
+branches:
+  only:
+    - master
+    - /^test-.*$/
+
+matrix:
+  include:
+    - rust: stable
+      os: linux
+      env: RUST_BACKTRACE=1
+      before_cache: |
+        if [[ "$TRAVIS_RUST_VERSION" == stable ]]; then
+          cargo install cargo-tarpaulin -f
+        fi
+      before_script:
+        - rustup component add clippy
+      script:
+        - ./clippy.sh
+      after_success: |
+        cargo tarpaulin --exclude-files parser/mod.rs --out Xml
+        bash <(curl -s https://codecov.io/bash)
+    - rust: stable
+      os: osx
+      env: RUST_BACKTRACE=1
+      script:
+        - cargo clean
+        - cargo build --verbose --all
+        - cargo test --verbose --all

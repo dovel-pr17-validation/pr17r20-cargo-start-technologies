@@ -1,0 +1,13 @@
+[package]
+authors = ["Changseok Han <freestrings@gmail.com>"]
+license = "MIT"
+name = "jsonpath_lua"
+version = "0.1.0"
+[dependencies]
+jsonpath_lib = { path = "../" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+
+[[bin]]
+name = "bench"
+path = "bench_lua_vs_rust/example.rs"

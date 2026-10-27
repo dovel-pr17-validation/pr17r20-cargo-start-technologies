@@ -1,0 +1,32 @@
+add table ip startos
+add chain ip startos prerouting { type nat hook prerouting priority dstnat; policy accept; }
+add chain ip startos output { type nat hook output priority -100; policy accept; }
+add chain ip startos postrouting { type nat hook postrouting priority srcnat; policy accept; }
+# Pins a forwarded port's outbound traffic to its external address:port. Runs
+# ahead of lxc-net's masquerade and StartTunnel's egress masquerade, which share
+# priority srcnat with `postrouting`.
+add chain ip startos forward_snat { type nat hook postrouting priority srcnat - 1; policy accept; }
+add chain ip startos forward { type filter hook forward priority filter; policy drop; }
+add chain ip startos mangle_prerouting { type filter hook prerouting priority mangle; policy accept; }
+# 'route' (not filter) so restore-mark reroutes locally-generated replies (iptables mangle-OUTPUT parity)
+add chain ip startos mangle_output { type route hook output priority mangle; policy accept; }
+add chain ip startos mangle_local_outbound
+add chain ip startos mangle_forward { type filter hook forward priority mangle; policy accept; }
+
+# Traffic a package container must never send straight at the network — it has to
+# go through the OS instead. Runs at priority -10, ahead of the main forward
+# filter; `drop` is terminal, everything else falls through to the ip startos
+# forward policy. inet family covers IPv4 and IPv6; flush+add keeps it idempotent
+# across reloads. iifname (not iif) matches by name, so the rules load even before
+# lxcbr0 exists.
+#   - Port-mapping (PCP/NAT-PMP udp/5351, UPnP SSDP udp/1900): only startd may open
+#     gateway ports, via the output hook; never forwarded from a container.
+#   - DNS (udp/tcp 53) off the bridge: services resolve through the OS proxy at
+#     10.0.3.1:53, a host-local input-hook destination that never hits this chain;
+#     a query aimed straight at a gateway or public resolver is dropped. lxcbr0 ==
+#     START9_BRIDGE_IFACE.
+add table inet startos_egress_guard
+add chain inet startos_egress_guard forward { type filter hook forward priority -10; policy accept; }
+flush chain inet startos_egress_guard forward
+add rule inet startos_egress_guard forward udp dport { 5351, 1900 } drop
+add rule inet startos_egress_guard forward iifname "lxcbr0" meta l4proto { tcp, udp } th dport 53 drop

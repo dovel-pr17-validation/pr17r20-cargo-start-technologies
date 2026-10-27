@@ -1,0 +1,132 @@
+# Local filesystem mounting			-*- shell-script -*-
+
+#
+# This script overrides local_mount_root() in /scripts/local
+# and mounts root as a read-only filesystem with a temporary (rw)
+# overlay filesystem.
+#
+
+. /scripts/local
+
+local_mount_root()
+{
+	echo 'using startos initramfs module'
+
+	local_top
+	local_device_setup "${ROOT}" "root file system"
+	ROOT="${DEV}"
+
+	# Get the root filesystem type if not set
+	if [ -z "${ROOTFSTYPE}" ]; then
+		FSTYPE=$(get_fstype "${ROOT}")
+	else
+		FSTYPE=${ROOTFSTYPE}
+	fi
+
+	local_premount
+
+	# CHANGES TO THE ORIGINAL FUNCTION BEGIN HERE
+	# N.B. this code still lacks error checking
+
+	modprobe ${FSTYPE}
+	checkfs ${ROOT} root "${FSTYPE}"
+
+	echo 'mounting startos'
+	mkdir /startos
+
+	ROOTFLAGS="$(echo "${ROOTFLAGS}" | sed 's/subvol=\(next\|current\)//' | sed 's/^-o *$//')"
+
+	if [ "${FSTYPE}" != "unknown" ]; then
+		mount -t ${FSTYPE} ${ROOTFLAGS} ${ROOT} /startos
+	else
+		mount ${ROOTFLAGS} ${ROOT} /startos
+	fi
+
+	if [ -d /startos/images ]; then
+		if [ -h /startos/config/current.rootfs ] && [ -e /startos/config/current.rootfs ]; then
+			image=$(readlink -f /startos/config/current.rootfs)
+		else
+			image="$(ls -t1 /startos/images/*.rootfs | head -n1)"
+			# Repair the pointer for boxes whose 0.4.0 migration never created it
+			if [ -f "$image" ]; then
+				mkdir -p /startos/config
+				ln -sf "../images/$(basename "$image")" /startos/config/current.rootfs
+			fi
+		fi
+		if ! [ -f "$image" ]; then
+			>&2 echo "image $image not available to boot"
+			exit 1
+		fi
+	else
+		if ! [ -f /startos/next/.startos-migration ]; then
+			>&2 echo no StartOS filesystem found
+			exit 1
+		fi
+
+		# First boot after a 0.3.5.1 -> 0.4.0 update. The 0.3.5.1 updater rsynced a
+		# migration payload into `next` (the 0.4.0 base image under next/images plus
+		# this box's real machine-id/ssh/fstab, which it copied out of the running
+		# system) and pointed the bootloader at this initramfs. The old 0.3.x roots
+		# (current/next/prev) are disposable — only the data partition is preserved.
+		echo 'migrating 0.3.x layout to 0.4.0'
+
+		mkdir -p /startos/config/overlay/etc
+		cp -a /startos/next/etc/fstab /startos/config/overlay/etc/fstab
+		cp -a /startos/next/etc/machine-id /startos/config/overlay/etc/machine-id
+		rm -rf /startos/config/overlay/etc/ssh
+		cp -a /startos/next/etc/ssh /startos/config/overlay/etc/ssh
+
+		# Publish images/ by an atomic rename so a crash can never leave an empty
+		# images dir (which the branch above would treat as "no bootable image").
+		rm -rf /startos/images.new
+		mkdir -p /startos/images.new
+		mv /startos/next/images/*.rootfs /startos/images.new/
+		mv /startos/images.new /startos/images
+
+		image="$(ls -t1 /startos/images/*.rootfs | head -n1)"
+		if ! [ -f "$image" ]; then
+			>&2 echo 'migration payload missing 0.4.0 base image'
+			exit 1
+		fi
+		# busybox ln has no -r; write the relative target explicitly
+		ln -sf "../images/$(basename "$image")" /startos/config/current.rootfs
+
+		rm -rf /startos/next /startos/current /startos/prev /startos/config/upgrade
+	fi
+
+	mkdir /lower /upper
+
+	if [ -d "$image" ]; then
+		mount -r --bind $image /lower
+	elif [ -f "$image" ]; then
+		modprobe loop
+		modprobe squashfs
+		mount -r $image /lower
+	else
+		>&2 echo "not a regular file or directory: $image"
+		exit 1
+	fi
+
+	modprobe overlay || insmod "/lower/lib/modules/$(uname -r)/kernel/fs/overlayfs/overlay.ko"
+
+	# Mount a tmpfs for the overlay in /upper
+	mount -t tmpfs tmpfs /upper
+	mkdir /upper/data /upper/work
+
+	mkdir -p /startos/config/overlay
+
+	# Mount the final overlay-root in $rootmnt
+	mount -t overlay \
+		-olowerdir=/startos/config/overlay:/lower,upperdir=/upper/data,workdir=/upper/work \
+		overlay ${rootmnt}
+
+	mkdir -m 750 -p ${rootmnt}/media/startos
+	mkdir -p ${rootmnt}/media/startos/config
+	mount --bind /startos/config ${rootmnt}/media/startos/config
+	mkdir -p ${rootmnt}/media/startos/images
+	mount --bind /startos/images ${rootmnt}/media/startos/images
+	mkdir -p ${rootmnt}/media/startos/root
+	mount -r --bind /startos ${rootmnt}/media/startos/root
+	mkdir -p ${rootmnt}/media/startos/current
+	mount -r --bind /lower ${rootmnt}/media/startos/current
+}

@@ -1,0 +1,34 @@
+import { Component, input } from '@angular/core'
+import { TuiIcon } from '@taiga-ui/core'
+
+@Component({
+  selector: 'app-placeholder',
+  template: `
+    @if (icon(); as icon) {
+      <tui-icon [icon]="icon" />
+    }
+    <ng-content />
+  `,
+  styles: `
+    :host {
+      display: flex;
+      flex: 1;
+      flex-direction: column;
+      gap: 0.5rem;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      padding: 1rem;
+      font: var(--tui-typography-body-l);
+      color: var(--tui-text-tertiary);
+
+      tui-icon {
+        font-size: 2.5rem;
+      }
+    }
+  `,
+  imports: [TuiIcon],
+})
+export class PlaceholderComponent {
+  readonly icon = input<string>()
+}

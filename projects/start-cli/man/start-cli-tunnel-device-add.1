@@ -1,0 +1,35 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH start-cli-tunnel-device-add 1  "add "
+.SH NAME
+start\-cli\-tunnel\-device\-add \- Add a device to a subnet
+.SH SYNOPSIS
+\fBstart\-cli tunnel device add\fR [\fB\-\-kind\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fISUBNET\fR> <\fINAME\fR> [\fIIP\fR]
+.SH DESCRIPTION
+Add a device to a subnet
+.SH OPTIONS
+.TP
+\fB\-\-kind\fR \fI<KIND>\fR [default: client]
+Client (no autoconfig) or Server (gateway\-autoconfig on by default)
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+client
+.IP \(bu 2
+server
+.RE
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fISUBNET\fR>
+
+.TP
+<\fINAME\fR>
+
+.TP
+[\fIIP\fR]
+

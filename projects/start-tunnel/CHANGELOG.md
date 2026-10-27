@@ -1,0 +1,373 @@
+# Changelog
+
+All notable changes to StartTunnel are documented here.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [1.4.1]
+
+### Removed
+
+- `start-tunnel auth get-pubkey` is removed; the tunnel server never answered it.
+
+### Fixed
+
+- Action menus near the right edge of the screen size to fit their items.
+
+- Revoking a sign-in immediately closes its idle streams.
+
+- On the StartTunnel host itself, `start-tunnel auth login` and `auth logout` explain that no login is needed there.
+
+## [1.4.0]
+
+### Added
+
+- The Debian package enables Bash tab completion automatically in new shells. `start-tunnel completions <shell>` generates completion scripts for Bash, Zsh, fish, elvish, and PowerShell.
+
+### Fixed
+
+- Fix server selection for manual AAAA DNS records to use the server's IPv6 address and list servers with IPv6 configured.
+- Show server names alongside IPv6 addresses in DNS records.
+
+- Keep the admin UI reachable when SNI forwards share its listen port. Reject conflicting plain forwards while the UI is enabled, and check for enabled plain forwards when enabling the UI or changing its active listen address. Disabled configurations can share the same port.
+- Restore the full port range when re-enabling a port forward.
+
+- The port-mapping server now answers NAT-PMP requests with "unsupported version" instead of ignoring them, so NAT-PMP clients fall back right away rather than retrying for about two minutes.
+
+### Security
+
+- **Update dependencies with security fixes**, including TLS certificate verification and handshake handling, HTTP/2 flow control, and XML parsing.
+
+- Isolate login rate limits by server address and public or private access, and log the client IP and address on the first blocked attempt per throttle window.
+- Reject remote requests using unconfigured loopback signing addresses.
+
+## [1.3.1]
+
+### Security
+
+- **Update the web interface and shared dependencies with security fixes**, including Angular and DOMPurify, and replace the unmaintained YAML parser.
+
+### Fixed
+
+- **Devices can reach their own services through published SNI hostnames**,
+  including a shared port's fallback.
+
+- **Small VPSes have room for connection-heavy services such as Tor relays.**
+  StartTunnel sizes connection tracking at 256 entries per MiB of host RAM,
+  preserving higher host settings. Hosts that restrict these kernel settings
+  keep their available capacity.
+
+- **The Debian package installs the networking utilities needed on minimal
+  images.** `iproute2` and `procps` are explicit dependencies.
+
+- **Forwarded IPv4 UDP ports retain their outbound mapping.** UDP traffic a
+  device starts from a forwarded port leaves through the forward's public
+  interface with its public address and port.
+
+- **SNI hostname routes work on IPv4-only tunnel hosts.** The reply path for
+  IPv4 routes is set up when IPv6 is disabled on the host.
+
+- **A port forward takes effect for peers that were already sending to it.**
+  A peer that sent to a port while it had no forward kept reaching StartTunnel
+  itself instead of the forward's target.
+
+- **You can sign in to the StartTunnel UI at any loopback address**, such as
+  `http://127.0.0.1:8080` through an SSH port forward.
+
+- **Published-port controls remain authoritative during device refreshes.** A
+  device renewing or deleting an automatic mapping leaves manual mappings
+  intact, and a disabled mapping stays disabled while its lease is renewed.
+  This applies to IPv4 forwards, SNI routes and fallbacks, and IPv6 pinholes.
+
+- **A device can repoint an automatic mapping it already holds.** A request for
+  the same external port or SNI hostname with a different internal port
+  updates the mapping, as does a different range size on an IPv4 forward.
+  Previously IPv4 forwards, SNI routes and SNI fallbacks refused it until the
+  old lease expired.
+
+- **Port forwards left behind by an earlier run of the daemon are cleared at
+  startup.** After a crash, or a restart during which the tunnel's WAN address
+  changed, a stale forward could keep sending a port to an old address until
+  the next reboot.
+
+- **Open pages can load the current web interface after future updates.** Pages
+  opened on this release revalidate the interface when they reload.
+
+- **An SNI hostname entered with capital letters receives its traffic.** A
+  route added by hand as `Cloud.Example.com` was listed as enabled while every
+  connection to it was closed. Hostnames match in any case, and a route saved
+  that way starts working once the update is installed.
+
+## [1.3.0]
+
+### Added
+
+- **Devices can request SNI hostname routes over UPnP, not only PCP.** The
+  tunnel's UPnP IGD now serves two Start9 vendor actions
+  (`X_START9_AddHostnameMapping` / `X_START9_DeleteHostnameMapping`, advertised
+  in its `WANIPConnection:1` SCPD) that bind a hostname on a shared external
+  port via SNI demultiplexing — the same capability the PCP `HOSTNAME` option
+  provides. A device that reaches the tunnel over UPnP but not PCP (for
+  example, UDP 5351 filtered by an intermediate device) previously kept its
+  ordinary port forwards but silently lost SNI demux; StartOS now falls back to
+  the vendor action automatically. Unlike standard UPnP mappings, these routes
+  are always lease-bearing and expire if the device stops renewing them, so a
+  vanished device can never squat a hostname against its legitimate owner.
+  A hostname grant (over either protocol) is now also refused outright when
+  the tunnel cannot bind the shared port's listener, instead of being
+  acknowledged while routing nothing.
+
+- **Generated WireGuard configs identify their gateway as accepting inbound
+  connections.** Each config includes the `# inbound: yes` gateway marker while retaining its
+  StartTunnel header for compatibility with older StartOS versions.
+
+### Fixed
+
+- **`start-tunnel` reaches a daemon that listens on a wildcard address.** With no
+  `--tunnel`, the CLI derives the daemon's address from `tunnel-listen` and
+  authenticates with the local authcookie, which it sends only to a loopback
+  address. A tunnel server binds `0.0.0.0` by nature, so the derived address was
+  never loopback: the CLI skipped the token and then, having no local auth, fell
+  through to dialling `https://0.0.0.0` — a request that can't succeed. A wildcard
+  listen address is now dialled over loopback, since binding every interface is not
+  a destination.
+
+- **`subnet <SUBNET> set-wan` and `subnet <SUBNET> set-ipv6` take the subnet
+  once, from the parent `subnet` command.** Both asked for it a second time
+  after the subcommand name, and no invocation satisfied that — giving the
+  subnet once failed argument parsing, giving it twice was rejected as a
+  duplicate key — so neither command could be run at all. They now inherit the
+  subnet the way `add`, `remove` and `set-dns` already did, matching the syntax
+  the documentation shows.
+
+- **An automatic port forward that asks for a time limit now expires when that
+  time runs out.** A device requesting a timed UPnP mapping had it kept as
+  though it were permanent, so a forward could outlive the app that asked for
+  it — staying open until the tunnel was next restarted. Automatic ports are
+  now lease-based as documented: one that stops being renewed is removed on its
+  own. Devices that ask for a permanent mapping, which is what StartOS does,
+  are unaffected.
+
+- **Third-party UPnP clients can now use the tunnel as a gateway.** The device
+  description didn't advertise the `WANCommonInterfaceConfig` service, and the
+  tunnel answered none of the actions a client uses to check a gateway before
+  using it (`GetStatusInfo`, `GetConnectionTypeInfo`, `GetNATRSIPStatus`) or to
+  read a mapping back (`GetSpecificPortMappingEntry`,
+  `GetGenericPortMappingEntry`). Software built on the common UPnP client
+  library — which includes many torrent clients and consumer apps — therefore
+  rejected the tunnel outright with "no valid UPnP Internet Gateway Device
+  found", or created a mapping and then reported it as failed because it could
+  not read it back. StartOS was unaffected; its client requires none of these.
+
+### Security
+
+- **The UPnP device description no longer identifies the tunnel to web
+  pages.** The description endpoint answered anyone who could reach it, and it
+  names the product ("StartTunnel") plus a stable identifier derived from the
+  tunnel's WireGuard key — so a malicious website could rebind its own domain
+  to the gateway and read it from any tunneled phone or laptop's browser: a
+  cross-site tracking beacon that re-identifies a visitor behind this tunnel
+  from any network. All UPnP endpoints now refuse requests whose `Host` is not
+  an IP address, which a real UPnP client always sends and a rebinding page
+  never can. As defense-in-depth, actions that change port forwards must also
+  be named in the `SOAPAction` header (every real client sends it; a
+  cross-origin page can never attach it), so even a browser running on a
+  device that has been granted automatic port forwarding cannot be used to
+  drive forwards blind.
+
+## [1.2.1]
+
+### Fixed
+
+- **IPv6 delegation now works when the WAN interface holds the delegated block
+  itself.** Some providers configure the delegated range directly on the WAN
+  interface at its exact size (DigitalOcean assigns its /124 this way), which
+  left the kernel with two equally-specific routes for the block — WAN and
+  tunnel — and the WAN won. Traffic toward device addresses, including replies
+  to connections devices opened, exited the WAN and was lost, so devices had
+  IPv6 addresses but no connectivity. The tunnel now installs an explicit host
+  route per device address, which always takes precedence. Routed prefixes,
+  and on-link blocks configured at a shorter length than the delegated prefix,
+  were unaffected.
+- **Port 80 is the HTTP→HTTPS redirect on every public IPv4.** Upgrading
+  re-enables the redirect on every public IPv4 (clearing any per-address
+  opt-outs) and removes any published forward that occupies port 80, so a plain
+  `http://` request always bounces to `https://`. Republish port 80 to a device
+  afterward if you need it there — turn the redirect off for that address first.
+
+## [1.2.0]
+
+### Changed
+
+- **Web UI and CLI authentication moved from session cookies to per-device
+  signing keys.** Logging in now enrolls an Ed25519 public key with the
+  server, and every API request is signed with the matching key instead of
+  carrying a session cookie. Enrolled keys appear in the key list with their
+  user agent and last-active time, and `auth session` commands now manage
+  enrolled keys. All existing sessions are signed out on upgrade — sign in
+  again on each device. Request signatures are bound to a server identity;
+  IPv6 addresses from the TLS certificate's SANs count in their URL form
+  (`[...]`), matching how clients actually address the server. HTTP cookies
+  are gone from the API entirely: the server no longer sets or reads any
+  cookie, and the `start-tunnel` CLI run on the server itself presents the
+  local authcookie as an `Authorization: Bearer` header instead of a `Cookie`
+  (its `--cookie-path` flag is removed).
+
+  The device key is a non-extractable WebCrypto key held in IndexedDB: page
+  scripts can sign with it while the page is open, but can never read the key
+  material out. Logging in requires a browser with Ed25519 WebCrypto support —
+  any evergreen browser (Safari 17, Firefox 130, Chrome/Edge 137, or newer).
+
+### Added
+
+- **DNS over the tunnel's IPv6.** Each subnet's DNS proxy now also listens on
+  the server's IPv6 address out of the subnet's delegated prefix, and RFC 2136
+  injection is authorized for a device's tunnel IPv6 on the same terms as its
+  IPv4 — so a StartOS server can publish (and refresh) its automatic records,
+  including the `AAAA` record for its `.local` name, over either family.
+
+### Fixed
+
+- **Deleting a fallback forward now actually deletes it.** A PCP delete
+  (lifetime 0) or UPnP `DeletePortMapping` for a hostname-less forward that had
+  become an SNI port's fallback reported success but silently left the fallback
+  in place, so the port stayed open to the fallback device until its lease
+  lapsed (up to an hour). Both delete paths now clear the fallback immediately;
+  named SNI routes on the port are unaffected.
+
+### Security
+
+- **The web UI ships a strict Content-Security-Policy.** Every response from
+  the UI origin now carries a CSP restricting scripts and network connections
+  to the server's own origin (no framing, no plugin content), plus
+  `X-Content-Type-Options: nosniff`. A script injection that slips into the
+  page can no longer pull in outside code or exfiltrate to a foreign host.
+
+### Documentation
+
+- **FAQ: `.local` on Android.** New entry explaining why `.local` addresses stop
+  resolving on Android once a WireGuard config carries the `DNS =` line (Android
+  excludes VPN connections from mDNS resolution, so the lookup goes to the
+  tunnel's resolver instead — breaking `.local` even on the home LAN), and how a
+  connected StartOS server now fixes this automatically by injecting a record for
+  its `.local` name over the tunnel (with the manual DNS-record workaround kept
+  for when DNS injection is disabled). The DNS Records page note now mentions the
+  `.local` name is injected too.
+
+## [1.1.2]
+
+### Fixed
+
+- **A bare public IP and named domains can now share one external port.** When a
+  connected device publishes both a hostname-less forward and one or more SNI
+  hostnames on the same external port, the hostname-less forward now acts as the
+  fallback: a connection whose TLS SNI matches a named route reaches that route's
+  device, and everything else — a bare-IP client, or an unmatched or absent SNI —
+  reaches the fallback device. The two used to conflict, so whichever was
+  requested second was rejected.
+
+## [1.1.1]
+
+### Changed
+
+- **Dialogs no longer steal focus when they open.** The Add Device, Add Subnet,
+  and Change Password dialogs no longer autofocus their first field, which on
+  mobile raised the keyboard the instant the dialog appeared.
+
+### Fixed
+
+- **Automatic port forwarding survives a network change.** Adding or removing a
+  device or subnet no longer interrupts the port forwarding that connected
+  devices set up automatically — their forwards, SNI routes, and IPv6 pinholes
+  keep being renewed instead of silently lapsing until the tunnel is next
+  restarted.
+
+## [1.1.0]
+
+### Added
+
+- **HTTP→HTTPS redirects on port 80.** StartTunnel now runs an HTTP→HTTPS redirect on port `80` of every public IPv4 it holds, so a plain `http://` request to an exposed service is answered with a redirect to the same host over `https://` instead of a connection error. These are **on by default** — every public IPv4 gets one on a fresh install and after an update — and reuse the same redirect handler the OS serves on its own TLS ports. Each address has a toggle in the **HTTP Redirect (80 → 443)** section of the `Settings` page (and `start-tunnel http-redirect list` / `set-enabled <ip> [--enabled]` on the CLI) to turn it off; your choice persists. A redirect and a port-80 forward are **mutually exclusive and never both enabled**: forwarding port 80 is rejected while the redirect is on (turn it off first), and enabling the redirect is rejected while port 80 is forwarded (delete the forward first). Port 80 is also never auto-forwarded — StartTunnel refuses PCP/UPnP requests to map it — and the Add published port dialog no longer offers to also forward `80 → 443`. See the HTTP Redirects page in the docs.
+
+- **Per-subnet IPv6.** A subnet can now carry a routed IPv6 prefix your VPS delegates, and every host on it — the tunnel and each device — gets one globally-routable `/128` with its tunnel IPv4 embedded (`prefix-network | tunnel-IPv4`), so a device's address is stable and derivable from its IPv4 alone. Configure it per subnet with `start-tunnel subnet <SUBNET> set-ipv6 --prefix <prefix>` or the subnet's Add/Edit dialog (disable by omitting the prefix). Configuring per subnet lets a server with multiple disjoint allocations point different subnets at different prefixes. On the common single-/64 case the tunnel answers Neighbor Discovery for each device's address on the VPS network; device IPv6 is carried full-tunnel (`AllowedIPs = ::/0`) so replies return through the tunnel. Devices can make outbound IPv6 connections, and — on a device running a current StartOS (0.4.0-beta.10+) — accept unsolicited inbound connections too, so a service can be hosted over IPv6. The subnets and devices tables show the prefix and each device's computed address. See the IPv6 page in the docs.
+- **`subnet … set-ipv6` validates the server can route the prefix.** Because a device with an IPv6 assignment routes all its IPv6 full-tunnel (`AllowedIPs = ::/0`), a prefix delegated on a server without working IPv6 egress just blackholes. The command **hard-errors** (leaving the config unchanged) when the server has no IPv6 default route, and logs an actionable warning when the prefix is neither on-link on a WAN interface nor otherwise verifiable — so operators catch a misconfigured VPS at set-time instead of discovering dead IPv6 on their devices.
+- **Port-range forwarding.** A manual port forward can now span a contiguous range of ports. Set "Number of Ports" in the Add published port dialog — or `--count` on `start-tunnel port-forward add` — to forward that many consecutive ports counting up from both the external and internal port. Ranges are plain port forwards and cannot be combined with SNI demux. (Automatic PCP PORT_SET range forwarding requested by connected devices was already supported; this exposes it to manually-added forwards.)
+- **IPv6 port forwarding (firewall pinholes).** A port forward can now expose a device over IPv6, not just IPv4. Because each device has its own globally-routable address (its GUA — see the IPv6 page), an IPv6 forward is a firewall _pinhole_ on `[GUA]:port` with no NAT, rather than a DNAT from a shared public IPv4. The Add published port dialog gained an **IP Version** selector (`IPv4` / `IPv6` / `IPv4 + IPv6`) so one dialog covers both stacks — the external/internal port fields apply to whichever you pick — and each published port's **IP** is the public IPv4 (v4) or the device's GUA (v6). Choosing an external port different from the internal one (e.g. the `80 → 443` redirect) turns the v6 side into a port-only translation on the same GUA. IPv6 requires the selected server's subnet to have a routed prefix; the dialog says so when it doesn't. Manage them from the CLI with `start-tunnel pinhole add|remove|set-enabled|update-label`. Connected StartOS servers open v6 pinholes **automatically** via PCP (including the `80 → 443` redirect) the same way they already do for IPv4, so hosting a service over IPv6 works end to end.
+- Contextual help sidebar with per-screen guidance, linking out to the docs.
+- Internationalization: a translatable UI with a language selector; English and Spanish included.
+- Sortable columns on the Subnets, Devices, Published Ports, and DNS tables.
+
+### Changed
+
+- **Automatic (PCP) mappings now honor their lease.** A forward, pinhole, or SNI route opened automatically by a connected device carries a finite lease that the device renews while it still wants the port. The tunnel now expires and tears down an automatic mapping whose device stops renewing it — because it went offline, rotated its key, or withdrew the exposure — instead of leaving a stale forward in place indefinitely. Manually-added forwards are unaffected and remain persistent.
+- **Admin actions retire a device's forwards immediately.** Deleting a device or demoting it to a client now clears all of its forwards, SNI routes, and IPv6 pinholes (previously a deleted device's v6 pinholes could linger); disabling **auto-publish** for a device clears its automatic forwards while leaving any you added manually. Cleanup no longer waits for the lease to lapse.
+- Renamed "Port Forwards" to "Published Ports" (and the device "Auto Port Forward" capability to "Auto-publish"); CLI/RPC unchanged.
+- Relabeled the DNS "Name" column as "Hostname".
+
+### Fixed
+
+- **`--version` now reports StartTunnel's own version** (`1.1.0`) instead of the StartOS
+  platform version.
+
+### Documentation
+
+- Expanded the Subnets and DNS Records pages, and renamed the Port Forwarding page to Published Ports.
+
+## [1.0.0]
+
+- **Independent versioning.** `start-tunnel` now carries its own version (starting at `1.0.0`) in its `Cargo.toml`, decoupled from the StartOS release line; its `.deb` is versioned from the manifest.
+
+### Changed
+
+- Relocated into the `start-os` monorepo as the `start-tunnel` product. The
+  daemon and API now build from the shared `start-core` crate
+  (`shared-libs/crates/start-core/src/tunnel/`); the Angular UI is a project in the
+  shared `shared-libs/ts-modules` workspace.
+
+## [0.4.0-beta.10]
+
+StartTunnel is a WireGuard virtual private router with kernel-level clearnet port
+forwarding, a web UI and `start-tunnel` CLI over one JSON-RPC API, and reactive
+on-demand HTTPS. The headline feature this release is gateway autoconfiguration;
+StartOS provides the client side — see
+[`../start-os/CHANGELOG.md`](../start-os/CHANGELOG.md).
+
+### Added
+
+- **Gateway autoconfiguration — port-control servers (#3306).** A StartOS server behind a StartTunnel can now open its public ports automatically. The tunnel runs:
+  - a **PCP server** (RFC 6887, UDP 5351) and **NAT-PMP** responder, plus a **UPnP IGD** fallback (SSDP discovery + device description + SCPD + SOAP), all `SO_BINDTODEVICE`-bound to the WireGuard interface and honoring only configured peers. PCP maps the requesting host, so a peer can only forward to itself; the IGD server enforces the same. Mappings land in the existing `port_forwards` table.
+  - **PCP HOSTNAME (SNI demux).** A per-`(extIP, extPort)` hostname binding table fronts a TCP listener that reads the TLS ClientHello, extracts `server_name`, and splices to the bound internal host (exact → wildcard → fallback). The internal leg is opened from the client's real source address via `IP_TRANSPARENT` egress, so the backend sees the true peer IP. PCP `MAP` requests carrying HOSTNAME options register/refresh/delete named bindings instead of creating an nft DNAT.
+  - **PCP `PORT_SET` (RFC 7753)** range mappings, capped at `MAX_PORT_SET`.
+  - **PCP `ANNOUNCE` capability discovery** + a Start9 capability option, so clients confirm the tunnel speaks the HOSTNAME extension before sending the Private-Use option code.
+- **SNI-demuxed forwards are a first-class, persistent forward type.** The port-forwards value is now an enum `PortForward = Dnat | Sni` (mutually exclusive per external address); SNI forwards hold per-hostname routes to backend targets, survive a restart, and appear in the dashboard. An operator can also create SNI routes manually. SNI hostname ownership is keyed to the target backend (a different target is rejected; the PCP layer forces `target = peer`).
+- **Per-subnet DNS proxy.** Each WireGuard subnet picks a DNS mode — **default** (the VPS's own resolvers), **device** (a selected device on the subnet), or **custom** (up to 3 servers) — and clients receive `DNS = <subnet .1>`. A forward-only hickory proxy binds per subnet to the in-tunnel address (`10.59.x.1:53`), reachable only over WireGuard, and forwards to the configured upstreams.
+- **RFC 2136 DNS injection from trusted devices (#3306).** A device with gateway autoconfiguration enabled may push `A`/`AAAA`/`CNAME`/`TXT` records to its subnet's DNS proxy via DNS UPDATE; the proxy answers them authoritatively and persists them to `db.dns_records`. UPDATEs are authenticated with **TSIG** (RFC 8945, HMAC-SHA256) keyed off a per-device key derived from the device's WireGuard PSK — fail-closed on any error. A DNS records page (view/add/delete) and the per-device toggle are exposed in the portal and via `start-cli tunnel dns …` / `tunnel device set-dns-injection`.
+- **Per-subnet and per-device WAN-IP assignment.** A public WAN IP can be assigned per WireGuard subnet (`WgSubnetConfig.wan_ip`) with an optional per-device override (`WgConfig.wan_ip`), unifying the external-IP model so PCP MAP / UPnP `GetExternalIPAddress` report the right public IP. Egress SNATs each subnet to its assigned WAN (per-device `/32` overrides win; unassigned stays masquerade), reconciled by stable comment tags and serialized against concurrent reconciles. New `set-subnet-wan` / `set-device-wan` RPCs, surfaced in the subnet/device Add/Edit dialogs with WAN columns.
+- **Device Client/Server kind.** `WgConfig.kind` (`Client`/`Server`) is stored and sticky; a Server defaults its autoconfiguration flags on, a Client off. The portal splits Devices into **Servers** and **Clients** tables (kind inferred from which Add button opened the dialog), and `set-device-kind` promotes/demotes.
+- **Gateway-autoconfiguration toggle** (per device) gates both DNS injection and PCP/UPnP port forwarding, backed by two independent flags (`allow_dns_injection`, `allow_auto_port_forward`); an untrusted device can neither inject DNS nor request forwards.
+- **Forwarded-protocols column** in the port-forwards table, surfacing that each forward exposes both TCP and UDP (fab7722a4).
+- **Portal restructure.** Tables are wrapped in titled cards (mirroring the StartOS interfaces UI); port-forwards and DNS split into **Manual** and **Automatic** tables driven by an explicit `auto` flag; the WAN-IP selector renders context-specific default labels.
+
+### Changed
+
+- **Firewall rules migrated from iptables to native nftables (5b9cf7313).** The tunnel's WireGuard forward-accept, TCP MSS clamp, and per-subnet masquerade now emit nft rules.
+- **A port forward's external IP is fixed to the target device's WAN.** A forward's inbound IP must equal the device's egress WAN or return traffic leaves the wrong interface (asymmetric routing breaks the forward), so the external IP is derived from the target device rather than chosen freely, and forwards are re-keyed when a device's or subnet's WAN assignment changes.
+- **Admin portal upgraded** to Angular 22 / TypeScript 6 / Taiga UI 5.11 (08de8e1e8).
+- **DNS proxy migrated to hickory 0.26** (f9f8ee8e1), clearing DNS RUSTSEC advisories.
+- Auto-created (PCP/UPnP) forwards get a consistent `PCP` label.
+
+### Fixed
+
+- **Forwarded TCP MSS is clamped to the WireGuard path MTU (#3262, #3261).** A `mangle FORWARD … TCPMSS --clamp-mss-to-pmtu` rule fixes hung TLS handshakes where a large ClientHello (e.g. desktop Firefox/Chromium with the X25519MLKEM768 post-quantum key share) split into a segment that exceeded the tunnel's effective path MTU after WireGuard encapsulation and was silently dropped.
+- **"Default" DNS mode falls back to `/etc/resolv.conf`** when systemd-resolved is absent, unreadable, or yields no usable servers (84e99f1e9).
+- **Gateway type is auto-detected from the StartTunnel marker** when a pasted config declares no type, so outbound-only configs (e.g. Mullvad) are no longer mislabeled as inbound-capable (f76ac4bfe).
+- **DNS injector serves `NODATA` for held names** instead of forwarding a missing-type query upstream (which returned `NXDOMAIN` for the private TLD and, per RFC 8020, poisoned the held record).
+- **UPnP IGD control calls are bounded by a timeout**, and the SNI-divert nft rule is installed on the tunnel host itself, fixing SNI-demuxed forwards that previously timed out because the reply path was never marked.
+
+### Security
+
+- **DNS injection is TSIG-authenticated** (see _Added_), closing a forgery vector where any service emitting from the server's tunnel IP could forge DNS injections into the gateway's resolver.
+- **Forward/DNS requests are honored only from devices that opted into gateway autoconfiguration** — the forward-authorization gate (`is_known_client`) and the DNS-injection authorizer each check their own per-device flag.
+
+[1.1.1]: https://github.com/Start9Labs/start-technologies/compare/start-tunnel/v1.1.0...HEAD
+[0.4.0-beta.10]: https://github.com/Start9Labs/start-technologies/releases/tag/v0.4.0-beta.10

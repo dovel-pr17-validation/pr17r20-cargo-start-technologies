@@ -1,0 +1,251 @@
+[tuiTheme='dark'] {
+  // Backgrounds
+  --tui-background-base: #07080c;
+  --tui-background-base-alt: #0b0c10;
+  --tui-background-elevation-1: #14151c;
+  --tui-background-elevation-2: #1c1d26;
+  --tui-background-elevation-3: #262833;
+  // Other
+  --tui-border-normal: #2a2c38;
+  --tui-border-hover: #333745;
+  // Statuses
+  --tui-status-negative: rgba(255, 73, 97, 1);
+  --tui-status-negative-pale: rgba(255, 73, 97, 0.12);
+  --tui-status-negative-pale-hover: rgba(255, 73, 97, 0.24);
+  --tui-status-positive: rgba(45, 213, 91, 1);
+  --tui-status-positive-pale: rgba(45, 213, 91, 0.32);
+  --tui-status-positive-pale-hover: rgba(45, 213, 91, 0.4);
+  --tui-status-warning: rgba(255, 196, 9, 1);
+  --tui-status-warning-pale: rgba(255, 196, 9, 0.32);
+  --tui-status-warning-pale-hover: rgba(255, 196, 9, 0.4);
+  --tui-status-info: rgba(192, 36, 122, 1);
+  --tui-status-info-pale: rgba(192, 36, 122, 0.12);
+  --tui-status-info-pale-hover: rgba(192, 36, 122, 0.24);
+  // Text
+  --tui-text-primary: #f0f0f0;
+  --tui-text-secondary: #a1a3ad;
+  --tui-text-tertiary: #6b6d78;
+  --tui-text-action: #3880ff;
+  --tui-text-action-hover: #4e8dff;
+  --tui-text-positive: rgba(45, 213, 91, 1);
+  --tui-text-positive-hover: #4ade80;
+  --tui-text-negative: rgba(255, 73, 97, 1);
+  --tui-text-negative-hover: #ff5f74;
+}
+
+:root,
+[tuiTheme='light'] {
+  --tui-background-accent-1: #3880ff;
+  --tui-background-accent-1-hover: #4e8dff;
+  --tui-background-accent-1-pressed: #1165d9;
+  --tui-background-accent-2: #c4247a;
+  --tui-background-accent-2-hover: #e12a8b;
+  --tui-background-accent-2-pressed: #b31a6c;
+  --tui-background-accent-opposite: #0b0c10;
+  --tui-background-accent-opposite-hover: #14151c;
+  --tui-background-accent-opposite-pressed: #07080c;
+  // Other
+  --tui-service-selection-background: rgba(255, 73, 97, 1);
+  // Statuses
+  --tui-status-negative: rgba(255, 73, 97, 1);
+  --tui-status-negative-pale: rgba(255, 73, 97, 0.12);
+  --tui-status-negative-pale-hover: rgba(255, 73, 97, 0.24);
+  --tui-status-positive: rgba(45, 213, 91, 1);
+  --tui-status-positive-pale: rgba(45, 213, 91, 0.32);
+  --tui-status-positive-pale-hover: rgba(45, 213, 91, 0.4);
+  --tui-status-warning: rgba(255, 196, 9, 1);
+  --tui-status-warning-pale: rgba(255, 196, 9, 0.32);
+  --tui-status-warning-pale-hover: rgba(255, 196, 9, 0.4);
+  --tui-status-info: rgba(192, 36, 122, 1);
+  --tui-status-info-pale: rgba(192, 36, 122, 0.12);
+  --tui-status-info-pale-hover: rgba(192, 36, 122, 0.24);
+  // Text
+  --tui-text-primary: rgba(11, 12, 16, 1);
+  --tui-text-secondary: rgba(11, 12, 16, 0.65);
+  --tui-text-tertiary: rgba(11, 12, 16, 0.4);
+  --tui-text-action: #3880ff;
+  --tui-text-action-hover: #4e8dff;
+  --tui-text-positive: rgba(45, 213, 91, 1);
+  --tui-text-positive-hover: #4ade80;
+  --tui-text-negative: rgba(255, 73, 97, 1);
+  --tui-text-negative-hover: #ff5f74;
+
+  --tui-stroke-width: 1.5px;
+  --tui-radius-m: 0.5rem;
+
+  --tui-typography-family-text: 'Hanken Grotesk', system-ui;
+  --tui-typography-family-display: 'Hanken Grotesk', system-ui;
+}
+
+::selection {
+  background-color: var(--tui-service-selection-background);
+}
+
+tui-textfield {
+  --tui-background-neutral-1: var(--tui-background-elevation-2);
+  --tui-background-neutral-1-hover: var(--tui-background-elevation-3);
+}
+
+html,
+body {
+  height: 100%;
+  isolation: isolate;
+  overflow-x: hidden;
+}
+
+tui-notification-middle {
+  --tui-background-accent-1: var(--tui-status-warning);
+}
+
+.g-table {
+  width: 100%;
+  background: var(--tui-background-elevation-1);
+  border: 1px solid var(--tui-background-neutral-1);
+  border-radius: var(--tui-radius-s);
+  // Separate borders (not collapse) so border-radius works; overflow clips the
+  // cell backgrounds to the rounded corners. No clip-path/box-shadow needed.
+  border-collapse: separate;
+  border-spacing: 0;
+  overflow: hidden;
+
+  thead tr {
+    background: var(--tui-background-elevation-2);
+  }
+
+  tr:nth-child(even) {
+    background: rgba(0, 0, 0, 0.1);
+  }
+
+  th,
+  td {
+    height: var(--tui-height-m);
+    padding: 0 1rem;
+    text-align: start;
+    // Taiga's tuiTh/tuiTd component `:host` styles put a full 1px border and an
+    // opaque background on every cell — that gridlines the table and hides our
+    // row striping / header band. Override both (a `.g-table` cell selector
+    // outspecifies `:host`) and keep only our single bottom row-line.
+    background: transparent;
+    border: none;
+    border-bottom: 1px solid var(--tui-background-neutral-1);
+
+    &:last-child {
+      text-align: end;
+    }
+  }
+
+  tbody tr:last-child td {
+    border-bottom: 0;
+  }
+
+  // Keep the loader hugging its switch so the overlay spinner sits on the
+  // toggle, not centered across the whole cell.
+  tui-loader {
+    inline-size: fit-content;
+  }
+}
+
+// Tables without an actions column shouldn't right-align their last (data) cell.
+.g-table.no-actions {
+  th:last-child,
+  td:last-child {
+    text-align: start;
+  }
+}
+
+qr-code {
+  display: flex;
+  justify-content: center;
+}
+
+ng-component {
+  display: block;
+}
+
+[tuiCardLarge] {
+  overflow: auto !important;
+  scrollbar-width: none;
+
+  [tuiHeader] {
+    position: sticky;
+    inset-inline-start: 0;
+  }
+}
+
+// Contextual help content (rendered from markdown in the help sidebar and the
+// in-dialog help popup). The `## Title` heading is hidden — it exists only as a
+// search/anchor label — and `<details>` render as animated accordions.
+.g-help {
+  padding: 0 1rem 1rem;
+
+  h2 {
+    display: none;
+  }
+
+  h3 {
+    margin-block: 0.75rem 0.25rem;
+    font: var(--tui-typography-body-l);
+    font-weight: bold;
+  }
+
+  p,
+  ul,
+  ol {
+    margin-block: 0.25rem;
+  }
+
+  a {
+    color: var(--tui-text-action);
+    text-decoration: underline;
+  }
+}
+
+.g-accordion,
+.g-help details {
+  display: grid;
+  grid-template-rows: var(--tui-height-m) 0fr;
+  transition: grid-template-rows 0.3s ease-in-out;
+
+  summary {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    cursor: pointer;
+    font: var(--tui-typography-body-m);
+    font-weight: bold;
+    list-style: none;
+
+    --chevron: url('data:image/svg+xml;charset=UTF-8,%3Csvg%0A%20%20%20%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%0A%20%20%20%20width%3D%2224%22%0A%20%20%20%20height%3D%2224%22%0A%20%20%20%20viewBox%3D%220%200%2024%2024%22%0A%20%20%20%20fill%3D%22none%22%0A%20%20%20%20stroke%3D%22currentColor%22%0A%20%20%20%20stroke-width%3D%22calc((100vw%20-%20100vh)%20%2F%2010)%22%0A%20%20%20%20stroke-linecap%3D%22round%22%0A%20%20%20%20stroke-linejoin%3D%22round%22%0A%3E%0A%20%20%20%20%3Cpath%20vector-effect%3D%22non-scaling-stroke%22%20d%3D%22m6%209%206%206%206-6%22%20%2F%3E%0A%3C%2Fsvg%3E%0A');
+
+    &::after {
+      content: '';
+      background: currentColor;
+      mask: var(--chevron) no-repeat center /
+        calc(min(1em, 100%) + 10 * var(--tui-stroke-width)) min(1em, 100%);
+      transition: transform 0.3s ease-in-out;
+      font-size: 1rem;
+      block-size: 1em;
+      inline-size: 1em;
+    }
+  }
+
+  &::details-content {
+    transition: all 0.3s ease-in-out;
+    transition-behavior: allow-discrete;
+    opacity: 0;
+    overflow: hidden;
+  }
+
+  &[open] {
+    grid-template-rows: var(--tui-height-m) 1fr;
+
+    summary::after {
+      transform: rotate(180deg);
+    }
+
+    &::details-content {
+      padding: 0.5rem 0;
+      opacity: 1;
+    }
+  }
+}

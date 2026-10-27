@@ -1,0 +1,253 @@
+name: Backport live-docs to master
+
+# Anything merged into live-docs is a fix to already-published documentation, so
+# it has to reach master too or the next tag will quietly revert it. It was
+# already reviewed on the way into live-docs, so this lands it on master
+# directly rather than asking for a second approval. A conflict is the one case
+# that still needs a human: it falls back to a branch + PR so the change can't
+# be silently dropped.
+#
+# The commit is created through the GraphQL API rather than `git commit`, so
+# GitHub signs it as the docs bot — master's `required_signatures` rule is
+# satisfied honestly instead of being bypassed. The same call takes an
+# expectedHeadOid, which makes the write an atomic compare-and-swap against
+# master's head: a race loses cleanly and retries instead of clobbering.
+#
+# The tag sync (docs-sync-on-tag.yml) must NOT bounce back here — it copies a
+# tag's tree, which already came from master. Its commits carry [skip-backport],
+# checked below. That marker is the only thing stopping the loop, since its push
+# raises a real push event.
+on:
+  push:
+    branches: ['live-docs']
+
+permissions:
+  contents: read
+
+# Serialized: two live-docs merges in quick succession would otherwise race each
+# other onto master.
+concurrency:
+  group: docs-backport
+  cancel-in-progress: false
+
+jobs:
+  backport:
+    name: Backport to master
+    # The marker only silences the backport for the docs bot's own sync commits.
+    # Keyed on the message alone, any docs commit that happened to contain the
+    # string — a page documenting this very workflow, say — would vanish from
+    # master silently. A non-bot commit carrying it is warned about below and
+    # backported anyway.
+    if: >-
+      ${{
+        !(
+          contains(github.event.head_commit.message, '[skip-backport]')
+          && github.event.head_commit.author.name == 'start9-docs-bot[bot]'
+        )
+      }}
+    runs-on: ubuntu-latest
+    # master is PR-protected with no bypass for github-actions[bot], so this
+    # needs the docs bot App, which IS a bypass actor. Its private key is an
+    # environment secret whose deployment policy admits only `live-docs` — a
+    # workflow run on any other ref is refused the secret and so cannot mint a
+    # token that bypasses master. That gate, not the App's existence, is what
+    # keeps this from being a repo-wide escalation. Keep it in step with the
+    # trigger above.
+    environment: docs-backport
+    steps:
+      - uses: actions/create-github-app-token@v2
+        id: app-token
+        with:
+          app-id: ${{ secrets.DOCS_BOT_APP_ID }}
+          private-key: ${{ secrets.DOCS_BOT_PRIVATE_KEY }}
+
+      - uses: actions/checkout@v6
+        with:
+          ref: master
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24.17.0'
+
+      - name: Warn about a stray skip marker
+        if: ${{ contains(github.event.head_commit.message, '[skip-backport]') }}
+        run: |
+          echo "::warning::The head commit contains [skip-backport] but was not authored by the docs bot, so it is being backported anyway. That marker is reserved for docs-sync-on-tag.yml."
+
+      - name: Backport onto master
+        id: pick
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
+        run: |
+          set -euo pipefail
+
+          if [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            echo "::notice::live-docs was just created — nothing to backport."
+            exit 0
+          fi
+
+          git fetch --no-tags origin live-docs master
+          git config user.name "start9-docs-bot[bot]"
+          git config user.email "start9-docs-bot[bot]@users.noreply.github.com"
+
+          RANGE="${BEFORE}..${AFTER}"
+          if [ -z "$(git rev-list "$RANGE")" ]; then
+            echo "::notice::No new commits in $RANGE."
+            exit 0
+          fi
+
+          for attempt in 1 2 3; do
+            git fetch --no-tags origin master
+            git reset --hard origin/master
+            BASE=$(git rev-parse origin/master)
+
+            # -n applies every patch to the index and commits once at the end.
+            # Cherry-picking commit-by-commit would abort on any patch that is
+            # already in master (an "empty" pick), which is the common case when
+            # a fix was written on live-docs and hand-copied to master first.
+            #
+            # --first-parent with -m 1 takes a merged PR as a single patch: the
+            # merge's own net change against the previous live-docs tip. Without
+            # -m 1 cherry-pick refuses a merge outright, and replaying the
+            # branch's commits instead re-fights a conflict the merge already
+            # settled and drops a resolution recorded only in the merge.
+            if ! git cherry-pick -x -n -m 1 $(git rev-list --reverse --first-parent "$RANGE"); then
+              git cherry-pick --abort || true
+              echo "fallback=conflict" >> "$GITHUB_OUTPUT"
+              echo "::warning::Backport conflicts with master — opening a PR instead."
+              exit 0
+            fi
+
+            if git diff --cached --quiet; then
+              echo "::notice::live-docs commits are already in master — nothing to backport."
+              exit 0
+            fi
+
+            {
+              echo "docs: backport live-docs $(git rev-parse --short "$AFTER") to master"
+              echo
+              echo "Backports the following from live-docs:"
+              echo
+              git log --reverse --format='- %h %s' "$RANGE"
+            } > /tmp/backport-msg
+
+            if node scripts/commit-staged.mjs /tmp/backport-msg master "$BASE" > /tmp/commit-result; then
+              echo "Committed to master: $(cat /tmp/commit-result)"
+              exit 0
+            else
+              status=$?
+              if [ "$status" = 2 ]; then
+                echo "fallback=unsupported-mode" >> "$GITHUB_OUTPUT"
+                echo "::warning::Backport carries a file mode the signed commit API cannot represent — opening a PR instead."
+                exit 0
+              fi
+            fi
+
+            # Don't name a cause. A lost compare-and-swap is the common one, but
+            # every other API failure lands here too, and asserting contention is
+            # what hid the argv overflow above until someone read the raw log.
+            echo "::notice::Attempt $attempt did not land — retrying. The API said:"
+            cat /tmp/commit-result || true
+          done
+
+          echo "fallback=api-failure" >> "$GITHUB_OUTPUT"
+          echo "::warning::The commit API refused this three times — opening a PR instead. Last response:"
+          cat /tmp/commit-result || true
+
+      # Only reached when the change could not land unattended. The commit is
+      # preserved on a branch so a maintainer can resolve it by hand.
+      - name: Open a PR instead
+        if: steps.pick.outputs.fallback != ''
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          AFTER: ${{ github.event.after }}
+          BEFORE: ${{ github.event.before }}
+          REASON: ${{ steps.pick.outputs.fallback }}
+        run: |
+          set -euo pipefail
+          echo "Falling back to a PR: $REASON"
+          BRANCH="backport/live-docs-$(git rev-parse --short "$AFTER")"
+          git fetch --no-tags origin master
+          git reset --hard origin/master
+          git checkout -b "$BRANCH"
+
+          # One commit at a time, and every conflict resolved by keeping the
+          # markers. Cherry-picking the whole range at once stops at the first
+          # conflict, and a single --continue only advances past that one — the
+          # tail would be dropped from a branch whose PR claims the whole range.
+          # --allow-empty keeps a patch already present in master from aborting
+          # the sequence. Same commit list as the bulk pick above, or the branch
+          # would carry something other than what was tried against master.
+          DROPPED=""
+          for commit in $(git rev-list --reverse --first-parent "${BEFORE}..${AFTER}"); do
+            if git cherry-pick -x -m 1 --allow-empty --keep-redundant-commits "$commit"; then
+              continue
+            fi
+            git add -A
+            if ! git -c core.editor=true cherry-pick --continue; then
+              git cherry-pick --abort || true
+              DROPPED="$DROPPED $commit"
+              echo "::warning::Could not carry $commit onto the backport branch."
+            fi
+          done
+
+          git push -f origin "$BRANCH"
+
+          # Keeping the markers leaves a branch GitHub still reports as
+          # mergeable, so the body has to say so out loud. --all-match is the
+          # per-file conjunction; -e A --and -e B would ask for both on one line.
+          MARKED=$(git grep -l --all-match -e '^<<<<<<< ' -e '^>>>>>>> ' HEAD -- . | sed 's|^HEAD:||' || true)
+          if [ -n "$MARKED" ]; then
+            echo "::warning::The backport branch carries unresolved conflict markers."
+          fi
+
+          # The PR body must describe what the branch actually carries. A commit
+          # that could not be applied at all is named here rather than left to be
+          # inferred from a range that no longer matches the diff.
+          {
+            echo "Automated backport of the documentation change published to docs.start9.com from \`live-docs\` (${AFTER})."
+            echo
+            case "$REASON" in
+              unsupported-mode)
+                echo "It carries a symlink or file-mode change, which the signed commit API cannot represent, so it comes as a branch instead. **Nothing is wrong with it** — review and merge normally."
+                ;;
+              api-failure)
+                echo "The signed-commit API refused it three times running — usually master moving underneath it, but the run log has the actual response. The branch is a clean cherry-pick either way: **nothing is wrong with the content** — review and merge normally."
+                ;;
+              conflict)
+                echo "It could not be applied to master unattended — **resolve the conflicts before merging**."
+                ;;
+              *)
+                echo "It could not be applied to master unattended (\`$REASON\`) — check the run log before merging."
+                ;;
+            esac
+            echo
+            echo "Until this lands, master's copy of the docs is out of step and the next tag will revert the published fix."
+            if [ -n "$MARKED" ]; then
+              echo
+              echo "> [!CAUTION]"
+              echo "> Conflicts were resolved by keeping the markers, so these files carry \`<<<<<<<\` / \`>>>>>>>\` and must be fixed before merging:"
+              echo ">"
+              printf '> - `%s`\n' $MARKED
+            fi
+            if [ -n "$DROPPED" ]; then
+              echo
+              echo "> [!WARNING]"
+              echo "> These commits could not be carried onto this branch at all and are **not** included. Apply them by hand:"
+              echo ">"
+              for commit in $DROPPED; do
+                echo "> - \`$(git rev-parse --short "$commit")\` $(git log -1 --format=%s "$commit")"
+              done
+            fi
+          } > /tmp/pr-body.md
+
+          gh pr create \
+            --base master \
+            --head "$BRANCH" \
+            --title "docs: backport live-docs $(git rev-parse --short "$AFTER") to master" \
+            --body-file /tmp/pr-body.md \
+            || echo "::warning::A PR for $BRANCH already exists."

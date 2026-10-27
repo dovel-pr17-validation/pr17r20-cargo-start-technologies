@@ -1,0 +1,16 @@
+{
+  "useMocks": true,
+  "ui": {
+    "api": {
+      "url": "rpc",
+      "version": "v1"
+    },
+    "mocks": {
+      "maskAs": "tor",
+      "maskAsHttps": true,
+      "skipStartupAlerts": true
+    }
+  },
+  "defaultRegistry": "https://registry.start9.com",
+  "gitHash": ""
+}

@@ -1,0 +1,52 @@
+# Published Ports
+
+Publishing a port exposes a device's port to the public Internet. StartTunnel can do this over **IPv4** (a DNAT from your VPS's public IPv4) and over **IPv6** (a firewall _pinhole_ on the device's own global address) — one dialog handles both.
+
+> [!WARNING]
+> **IPv4** publishing requires a **dedicated public IPv4 address** on your VPS. Shared IPv4 addresses (CGNAT, shared NAT, load-balanced IPs) cannot be used to expose services to the clearnet. **IPv6** publishing instead needs a routed IPv6 prefix delegated to the subnet (see [IPv6](./ipv6.md)); each device then has its own globally-routable address, so a dedicated public IPv4 isn't required for the IPv6 path.
+
+> [!NOTE]
+> StartTunnel acts as a port-control gateway for connected devices, speaking PCP (preferred) and UPnP. A StartOS server using this tunnel opens the ports it needs **automatically** — over IPv4 and, on a current StartOS (0.4.0-beta.10+) with an IPv6 prefix, over IPv6 too — when you enable a public address, and removes them when the address is disabled or deleted. Each automatic PCP mapping carries a **lease** that the device renews while it still wants the port; if the device stops renewing (it goes offline, or you withdraw the exposure), the tunnel drops the published port on its own rather than letting it linger. For security, an automatically published port or pinhole always targets the requesting device's own address; a device can only publish ports to itself. The steps below are for adding or managing published ports manually.
+
+## IPv4 published ports vs. IPv6 pinholes
+
+- An **IPv4** published port is a DNAT: clients connect to your VPS's public IPv4 on the external port, and the tunnel rewrites the destination to the device's tunnel IP and internal port.
+- An **IPv6** published port is a _pinhole_: the device already has a globally-routable address (its GUA — see [IPv6](./ipv6.md)), so there is no NAT. The tunnel simply permits inbound to `[GUA]:port`. If you pick an external port different from the internal port (e.g. an `80 → 443` redirect) it becomes a port-only translation on that same address.
+
+IPv4 UDP traffic initiated by the device from a forwarded internal port leaves through the forward's public interface using its public address and corresponding external port. A forwarded range maps each internal port to its matching external port.
+
+Because each device has its own IPv6 address, two different devices can both publish on the same external port over IPv6 (whereas over IPv4 they share one public address, so external ports must be unique).
+
+> [!NOTE]
+> Port 80 on each public IPv4 is claimed by default by an [HTTP→HTTPS redirect](./http-redirects.md), so you rarely need to publish it. A redirect and a published port 80 are mutually exclusive and never both enabled: publishing port 80 is rejected while the redirect is on (turn it off first, under `Settings`). See [HTTP Redirects](./http-redirects.md).
+
+## Manual and automatic ports
+
+The `Published Ports` page shows two tables: **Manual** ports you added by hand, and **Automatic** port uses created by connected devices. Automatic entries include PCP/UPnP port mappings and SNI hostname routes; their kind identifies which one they are. A row's **External IP** is your VPS's public IPv4 (a v4 published port) or the device's IPv6 GUA (a v6 pinhole). You can enable, disable, or remove either; automatic entries are owned by the device that created them and may be re-created if you remove one while the device still wants it. A disabled entry stays unavailable until you enable it again, including while its device renews the mapping. Manual ports stay until you delete them. Each external port — or, on a port shared by SNI, each hostname — holds a single entry, either manual or automatic. When a device requests one that a manual entry already holds, the manual entry keeps it: the request succeeds if it asks for the same mapping and is refused if it asks for a different one. A device can point an automatic entry it holds at a different port on itself. Automatic port uses are lease-based: one that stops being renewed (its device went offline or no longer wants the port) expires and is removed on its own.
+
+Deleting a device or demoting it to a client clears all of its published ports (manual and automatic, IPv4 and IPv6). Turning off **auto-publish** for a device clears its automatic ports but leaves any you added by hand.
+
+## Add a port manually
+
+1. In StartTunnel, navigate to `Published Ports` and click "Add".
+
+1. Enter the **External Port**, select the **Server** (the device to publish to), and enter the **Internal Port**. In almost all cases they are the same.
+
+1. Choose the **IP Version** — `IPv4`, `IPv6`, or `IPv4 + IPv6`. `IPv6` and `IPv4 + IPv6` require the selected server to have an IPv6 address, which means its subnet must carry a routed IPv6 prefix (see [IPv6](./ipv6.md)); the dialog tells you when the chosen server has none.
+
+1. To publish a **range** of ports, set "Number of Ports" to the size of the range. It counts up from both the external and internal ports — e.g. external `49152`, internal `49152`, count `100` publishes `49152–49251` on each side. Leave it at `1` for a single port.
+
+1. Click "Save".
+
+> [!NOTE]
+> There is no option to also publish port `80 → 443` — HTTP→HTTPS on port 80 is handled by the [HTTP redirect](./http-redirects.md) that runs by default on every public IPv4.
+
+## SNI hostnames (IPv4 only)
+
+When IP Version includes IPv4 (`IPv4` or `IPv4 + IPv6`), an optional **Hostname** routes by TLS SNI so several hostnames can share one external port. SNI demultiplexing is IPv4-only — in `IPv4 + IPv6` mode it applies to the IPv4 side only, and the IPv6 side is a plain pinhole (each device already has its own address, so no demux is needed) — and it cannot be combined with a port range.
+
+SNI hostnames can share the enabled admin UI's listen port. Connections with an unmatched hostname or without SNI reach the admin UI. Plain IPv4 forwards and port ranges that include the enabled UI's listen address are rejected. While the UI is disabled, its configured address can be used for plain forwards. Enabling the UI or changing its active listen address is rejected if an enabled plain forward or SNI fallback already uses that address; disable or remove that mapping first. Disabled forwards can remain configured, but cannot be enabled on the active UI's listen address.
+
+A device can access its own service through its published SNI hostname or the shared port's fallback. For these hairpin connections, the service sees StartTunnel's in-tunnel address as the client. Connections from other devices retain their original client address.
+
+Connected devices can also create SNI hostname routes **automatically**, the same way they open automatic ports. A device asks over PCP (preferred) or, when PCP can't get through, over a UPnP vendor action the tunnel advertises (`X_START9_AddHostnameMapping`). Either way the route appears in the **Automatic** table, carries a lease, and expires on its own if the device stops renewing it — and, like every automatic mapping, it can only point at the requesting device's own address.

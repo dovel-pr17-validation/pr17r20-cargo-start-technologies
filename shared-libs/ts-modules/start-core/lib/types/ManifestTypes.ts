@@ -1,0 +1,180 @@
+import { T } from '..'
+import { ImageId, ImageSourceInput } from '../types'
+
+export type SDKManifest = {
+  /**
+   * The package identifier used by StartOS. This must be unique amongst all other known packages.
+   * @example nextcloud
+   * */
+  readonly id: string
+  /**
+   * The human readable name of your service
+   * @example Nextcloud
+   * */
+  readonly title: string
+  /**
+   * The name of the software license for this project. The license itself should be included in the root of the project directory.
+   * @example MIT
+   */
+  readonly license: string
+  /**
+   * URL of the StartOS package repository
+   * @example `https://github.com/Start9Labs/nextcloud-startos`
+   */
+  readonly packageRepo: string
+  /**
+   * URL of the upstream service repository
+   * @example `https://github.com/nextcloud/docker`
+   */
+  readonly upstreamRepo: string
+  /**
+   * URL where users can learn more about the upstream service
+   * @example `https://nextcloud.com`
+   */
+  readonly marketingUrl: string
+  /**
+   * (optional) URL where users can donate to the upstream project
+   * @example `https://nextcloud.com/contribute/`
+   */
+  readonly donationUrl: string | null
+  /** Localized Markdown shown before downloading an update from a matching installed version. */
+  readonly preDownloadAlert?: {
+    readonly message: T.LocaleString
+    readonly when: {
+      readonly sourceVersion: string
+    }
+  }
+  readonly description: {
+    /**
+     * Short description, shown on the marketplace list page. The tile clamps it
+     * to two lines — about 80 characters — and hides the rest. Max 120.
+     */
+    readonly short: T.LocaleString
+    /**
+     * Long description, shown on the marketplace details page. Rendered
+     * unclamped. Max 2000.
+     */
+    readonly long: T.LocaleString
+  }
+  /**
+   * override the StartOS version this package was made for
+   * defaults to the version the SDK was built for
+   */
+  osVersion?: string
+  /**
+   * @description A mapping of OS images needed to run the container processes. Each image ID is a unique key.
+   * @example
+   * Using dockerTag...
+   *
+   * ```
+    images: {
+      main: {
+        source: {
+          dockerTag: 'start9/hello-world',
+        },
+      },
+    },
+   * ```
+   * @example
+   * Using dockerBuild...
+   *
+   * ```
+    images: {
+      main: {
+        source: {
+          dockerBuild: {
+            dockerFile: '../Dockerfile',
+            workdir: '.',
+          },
+        },
+      },
+    },
+   * ```
+   */
+  readonly images: Record<ImageId, SDKImageInputSpec>
+  /**
+   * @description A list of data volumes that will mount to the container. Must contain at least one volume.
+   * @example ['main']
+   */
+  readonly volumes: string[]
+
+  /**
+   * @description (optional) A set of hardware requirements for this service. A machine that does
+   *   not meet them is not offered this service at all — so tightening a requirement on an
+   *   already-published package cuts hosts below it off from further updates.
+   * @property {object[]} device - Device filters; at least one device of the given `class` must
+   *    match each filter. `product` and `vendor` are regular expressions (`null` matches any), and
+   *    `description` is what the user is shown about the hardware required.
+   * @property {number} ram - Minimum RAM, **in bytes**, compared against the host's total RAM.
+   *    No unit conversion is applied, so write it as a power-of-two expression: a bare `8192`
+   *    declares 8 KiB, which every machine satisfies, and gates nothing.
+   * @example
+   * ```
+    hardwareRequirements: {
+      device: [
+        { class: 'display', product: null, vendor: null, driver: 'nvidia', description: 'An NVIDIA GPU' },
+      ],
+      ram: 8 * 1024 ** 3, // 8 GiB
+    },
+   * ```
+   */
+  readonly hardwareRequirements?: {
+    readonly device?: T.DeviceFilterInput[]
+    readonly ram?: number | null
+  }
+
+  /**
+   * @description Enable access to hardware acceleration devices (such as /dev/dri, or /dev/nvidia*)
+   */
+  readonly hardwareAcceleration?: boolean
+
+  /**
+   * @description Mount /dev/fuse so this service can use fuse-overlayfs — the
+   * rootless storage driver used to host a nested OCI runtime (e.g. rootless
+   * Podman or Docker) inside the service's LXC.
+   */
+  readonly userspaceFilesystems?: boolean
+
+  /**
+   * @description Mount /dev/net/tun so this service can create kernel tunnel
+   * interfaces (VPN / WireGuard / tun-class workloads).
+   */
+  readonly virtualNetworking?: boolean
+
+  /**
+   * @description Grants /dev/kvm when present. The opening process must run as container root.
+   */
+  readonly hardwareVirtualization?: boolean
+
+  /**
+   * @description Enable OS plugins
+   */
+  readonly plugins?: T.PluginId[]
+}
+
+type ArchOptions = {
+  0: ['x86_64', 'aarch64', 'riscv64']
+  1: ['aarch64', 'x86_64', 'riscv64']
+  2: ['x86_64', 'riscv64', 'aarch64']
+  3: ['aarch64', 'riscv64', 'x86_64']
+  4: ['riscv64', 'x86_64', 'aarch64']
+  5: ['riscv64', 'aarch64', 'x86_64']
+  6: ['x86_64', 'aarch64']
+  7: ['aarch64', 'x86_64']
+  8: ['x86_64', 'riscv64']
+  9: ['aarch64', 'riscv64']
+  10: ['riscv64', 'aarch64']
+  11: ['riscv64', 'x86_64']
+  12: ['x86_64']
+  13: ['aarch64']
+  14: ['riscv64']
+}
+export type SDKImageInputSpec = {
+  [A in keyof ArchOptions]: {
+    source: Exclude<ImageSourceInput, 'packed'>
+    arch?: ArchOptions[A]
+    /** Run an available image under CPU emulation on other architectures. Defaults to true. */
+    emulateMissing?: boolean
+    nvidiaContainer?: boolean
+  }
+}[keyof ArchOptions]

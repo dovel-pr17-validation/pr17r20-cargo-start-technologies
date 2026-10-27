@@ -1,0 +1,715 @@
+use std::future::Future;
+use std::io::SeekFrom;
+use std::os::fd::AsRawFd;
+use std::path::Path;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::Poll;
+use std::time::Duration;
+
+use axum::body::Body;
+use axum::extract::Request;
+use axum::response::Response;
+use bytes::Bytes;
+use futures::{Stream, StreamExt, ready};
+use http::header::{CONTENT_LENGTH, CONTENT_RANGE};
+use http::{HeaderMap, StatusCode};
+use imbl_value::InternedString;
+use tokio::io::{AsyncRead, AsyncSeek, AsyncSeekExt, AsyncWriteExt};
+use tokio::sync::watch;
+
+use crate::context::RpcContext;
+use crate::prelude::*;
+use crate::progress::{PhaseProgressTrackerHandle, ProgressUnits};
+use crate::rpc_continuations::{Guid, RpcContinuation};
+use crate::s9pk::merkle_archive::source::ArchiveSource;
+use crate::s9pk::merkle_archive::source::multi_cursor_file::{FileCursor, MultiCursorFile};
+use crate::util::io::{TmpDir, create_file};
+use crate::util::writeback::{self, WritebackPacer};
+
+pub async fn upload(
+    ctx: &RpcContext,
+    session: Option<InternedString>,
+    progress: PhaseProgressTrackerHandle,
+) -> Result<(Guid, UploadingFile), Error> {
+    let guid = Guid::new();
+    let (mut handle, file) = UploadingFile::new(progress).await?;
+    ctx.rpc_continuations
+        .add(
+            guid.clone(),
+            RpcContinuation::rest_authed(
+                ctx,
+                session,
+                |request| async move {
+                    handle.upload(request).await;
+
+                    Response::builder()
+                        .status(StatusCode::NO_CONTENT)
+                        .body(Body::empty())
+                        .with_kind(ErrorKind::Network)
+                },
+                Duration::from_secs(30),
+            ),
+        )
+        .await;
+    Ok((guid, file))
+}
+
+struct Progress {
+    tracker: PhaseProgressTrackerHandle,
+    expected_size: Option<u64>,
+    written: u64,
+    complete: bool,
+    error: Option<Error>,
+}
+impl Progress {
+    fn handle_error(&mut self, e: &std::io::Error) -> bool {
+        if self.error.is_none() {
+            self.error = Some(Error::new(eyre!("{e}"), ErrorKind::Network));
+            true
+        } else {
+            false
+        }
+    }
+    async fn expected_size(watch: &mut watch::Receiver<Self>) -> Option<u64> {
+        watch
+            .wait_for(|progress| progress.error.is_some() || progress.expected_size.is_some())
+            .await
+            .ok()
+            .and_then(|a| a.expected_size)
+    }
+    /// `None` = keep waiting; `Some(res)` = stop waiting with `res`.
+    fn check(&self, target: WaitTarget) -> Option<Result<(), Error>> {
+        if let Some(e) = &self.error {
+            return Some(Err(e.clone_output()));
+        }
+        match target {
+            WaitTarget::Complete => self.complete.then(|| Ok(())),
+            WaitTarget::DataAt(position) => {
+                (self.complete || self.written > position).then(|| Ok(()))
+            }
+            WaitTarget::SizeAtLeast(size) => {
+                if self.written >= size {
+                    Some(Ok(()))
+                } else if self.expected_size.map_or(false, |e| e < size) {
+                    Some(Err(Error::new(
+                        eyre!("file size is less than requested"),
+                        ErrorKind::Network,
+                    )))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+    async fn wait(watch: &mut watch::Receiver<Self>, target: WaitTarget) -> Result<(), Error> {
+        watch
+            .wait_for(|progress| progress.check(target).is_some())
+            .await
+            .map_err(|_| {
+                Error::new(
+                    eyre!("failed to determine upload progress"),
+                    ErrorKind::Network,
+                )
+            })?
+            .check(target)
+            .expect("wait_for predicate held")
+    }
+    async fn ready_for(watch: &mut watch::Receiver<Self>, size: u64) -> Result<(), Error> {
+        Self::wait(watch, WaitTarget::SizeAtLeast(size)).await
+    }
+    async fn ready(watch: &mut watch::Receiver<Self>) -> Result<(), Error> {
+        Self::wait(watch, WaitTarget::Complete).await
+    }
+    fn complete(&mut self) -> bool {
+        let mut changed = !self.complete;
+        self.tracker.complete();
+        changed |= match self {
+            Self {
+                expected_size: Some(size),
+                written,
+                ..
+            } if *written == *size => false,
+            Self {
+                expected_size: Some(size),
+                written,
+                error,
+                ..
+            } if *written > *size && error.is_none() => {
+                *error = Some(Error::new(
+                    eyre!("Too many bytes received"),
+                    ErrorKind::Network,
+                ));
+                true
+            }
+            Self {
+                error,
+                expected_size: Some(_),
+                ..
+            } if error.is_none() => {
+                *error = Some(Error::new(
+                    eyre!("Connection closed or timed out before full file received"),
+                    ErrorKind::Network,
+                ));
+                true
+            }
+            Self {
+                expected_size,
+                written,
+                ..
+            } if expected_size.is_none() => {
+                *expected_size = Some(*written);
+                true
+            }
+            _ => false,
+        };
+        self.complete = true;
+        changed
+    }
+}
+
+#[derive(Clone)]
+pub struct UploadingFile {
+    tmp_dir: Option<Arc<TmpDir>>,
+    file: MultiCursorFile,
+    progress: watch::Receiver<Progress>,
+}
+impl UploadingFile {
+    pub async fn with_path(
+        path: impl AsRef<Path>,
+        mut progress: PhaseProgressTrackerHandle,
+    ) -> Result<(UploadHandle, Self), Error> {
+        progress.set_units(Some(ProgressUnits::Bytes));
+        let progress = watch::channel(Progress {
+            tracker: progress,
+            expected_size: None,
+            written: 0,
+            error: None,
+            complete: false,
+        });
+        let file = create_file(&path).await?;
+        writeback::set_no_cow(&path).await;
+        let multi_cursor = MultiCursorFile::open(&file).await?;
+        let pacer = WritebackPacer::new(file.as_raw_fd());
+        let uploading = Self {
+            tmp_dir: None,
+            file: multi_cursor,
+            progress: progress.1,
+        };
+        Ok((
+            UploadHandle {
+                tmp_dir: None,
+                file,
+                pacer,
+                progress: progress.0,
+            },
+            uploading,
+        ))
+    }
+    pub async fn new(progress: PhaseProgressTrackerHandle) -> Result<(UploadHandle, Self), Error> {
+        let tmp_dir = Arc::new(TmpDir::new().await?);
+        let (mut handle, mut file) = Self::with_path(tmp_dir.join("upload.tmp"), progress).await?;
+        handle.tmp_dir = Some(tmp_dir.clone());
+        file.tmp_dir = Some(tmp_dir);
+        Ok((handle, file))
+    }
+    pub async fn with_path_for_download(
+        path: impl AsRef<Path>,
+        mut progress: PhaseProgressTrackerHandle,
+    ) -> Result<(DownloadHandle, Self), Error> {
+        progress.set_units(Some(ProgressUnits::Bytes));
+        let progress = watch::channel(Progress {
+            tracker: progress,
+            expected_size: None,
+            written: 0,
+            error: None,
+            complete: false,
+        });
+        let file = create_file(&path).await?;
+        writeback::set_no_cow(&path).await;
+        let multi_cursor = MultiCursorFile::open(&file).await?;
+        let pacer = WritebackPacer::new(file.as_raw_fd());
+        let uploading = Self {
+            tmp_dir: None,
+            file: multi_cursor,
+            progress: progress.1,
+        };
+        Ok((
+            DownloadHandle {
+                tmp_dir: None,
+                file,
+                pacer,
+                progress: progress.0,
+            },
+            uploading,
+        ))
+    }
+    pub async fn new_for_download(
+        progress: PhaseProgressTrackerHandle,
+    ) -> Result<(DownloadHandle, Self), Error> {
+        let tmp_dir = Arc::new(TmpDir::new().await?);
+        let (mut handle, mut file) =
+            Self::with_path_for_download(tmp_dir.join("download.tmp"), progress).await?;
+        handle.tmp_dir = Some(tmp_dir.clone());
+        file.tmp_dir = Some(tmp_dir);
+        Ok((handle, file))
+    }
+    pub async fn wait_for_complete(&self) -> Result<(), Error> {
+        Progress::ready(&mut self.progress.clone()).await
+    }
+    pub async fn delete(self) -> Result<(), Error> {
+        if let Some(Ok(tmp_dir)) = self.tmp_dir.map(Arc::try_unwrap) {
+            tmp_dir.delete().await?;
+        }
+        Ok(())
+    }
+}
+impl ArchiveSource for UploadingFile {
+    type FetchReader = <MultiCursorFile as ArchiveSource>::FetchReader;
+    type FetchAllReader = UploadingFileReader;
+    async fn size(&self) -> Option<u64> {
+        Progress::expected_size(&mut self.progress.clone()).await
+    }
+    async fn fetch_all(&self) -> Result<Self::FetchAllReader, Error> {
+        let mut file = self.file.cursor().await?;
+        file.seek(SeekFrom::Start(0)).await?;
+        Ok(UploadingFileReader {
+            tmp_dir: self.tmp_dir.clone(),
+            file,
+            position: 0,
+            to_seek: None,
+            progress: self.progress.clone(),
+            wait: None,
+        })
+    }
+    async fn fetch(&self, position: u64, size: u64) -> Result<Self::FetchReader, Error> {
+        Progress::ready_for(&mut self.progress.clone(), position + size).await?;
+        self.file.fetch(position, size).await
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WaitTarget {
+    Complete,
+    SizeAtLeast(u64),
+    DataAt(u64),
+}
+
+#[pin_project::pin_project(project = UploadingFileReaderProjection)]
+pub struct UploadingFileReader {
+    tmp_dir: Option<Arc<TmpDir>>,
+    position: u64,
+    to_seek: Option<SeekFrom>,
+    #[pin]
+    file: FileCursor,
+    progress: watch::Receiver<Progress>,
+    wait: Option<(
+        WaitTarget,
+        Pin<Box<dyn Future<Output = Result<(), Error>> + Send + Sync>>,
+    )>,
+}
+impl<'a> UploadingFileReaderProjection<'a> {
+    // The wait future is kept across polls — dropping it would deregister its waker.
+    fn poll_wait(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        target: WaitTarget,
+    ) -> Result<bool, std::io::Error> {
+        if self.wait.as_ref().map(|(t, _)| *t) != Some(target) {
+            // fast path: already satisfied — skip allocating a wait future
+            let ready = self.progress.borrow().check(target);
+            if let Some(res) = ready {
+                *self.wait = None;
+                res.map_err(|e| std::io::Error::other(e.source))?;
+                return Ok(true);
+            }
+            let mut progress = self.progress.clone();
+            *self.wait = Some((
+                target,
+                Box::pin(async move { Progress::wait(&mut progress, target).await }),
+            ));
+        }
+        let (_, wait) = self.wait.as_mut().expect("wait future was just created");
+        match wait.as_mut().poll(cx) {
+            Poll::Ready(res) => {
+                *self.wait = None;
+                res.map_err(|e| std::io::Error::other(e.source))?;
+                Ok(true)
+            }
+            Poll::Pending => Ok(false),
+        }
+    }
+}
+impl AsyncRead for UploadingFileReader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let mut this = self.project();
+
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        let position = *this.position;
+        if this.poll_wait(cx, WaitTarget::DataAt(position))? {
+            let start = buf.filled().len();
+            ready!(this.file.as_mut().poll_read(cx, buf))?;
+            let read = (buf.filled().len() - start) as u64;
+            *this.position += read;
+            if read == 0 {
+                let eof = {
+                    let p = this.progress.borrow();
+                    p.error.is_none() && p.complete && p.written <= *this.position
+                };
+                if !eof {
+                    // A mirror retry truncated the file out from under us (or its bytes
+                    // aren't visible yet) — retry rather than report a false EOF. The
+                    // self-wake yields so the writer task can catch up.
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+            }
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Pending
+        }
+    }
+}
+impl AsyncSeek for UploadingFileReader {
+    fn start_seek(self: Pin<&mut Self>, position: SeekFrom) -> std::io::Result<()> {
+        let this = self.project();
+        *this.to_seek = Some(position);
+        Ok(())
+    }
+    fn poll_complete(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::io::Result<u64>> {
+        let mut this = self.project();
+        if let Some(to_seek) = *this.to_seek {
+            let size = match to_seek {
+                SeekFrom::Current(n) => (*this.position as i64 + n) as u64,
+                SeekFrom::Start(n) => n,
+                SeekFrom::End(n) => {
+                    let expected_size = this.progress.borrow().expected_size;
+                    match expected_size {
+                        Some(end) => (end as i64 + n) as u64,
+                        None => {
+                            if !this.poll_wait(cx, WaitTarget::Complete)? {
+                                return Poll::Pending;
+                            }
+                            (this.progress.borrow().expected_size.ok_or_else(|| {
+                                std::io::Error::new(
+                                    std::io::ErrorKind::Other,
+                                    eyre!("upload marked complete without expected size"),
+                                )
+                            })? as i64
+                                + n) as u64
+                        }
+                    }
+                }
+            };
+            if !this.poll_wait(cx, WaitTarget::SizeAtLeast(size))? {
+                return Poll::Pending;
+            }
+        }
+        if let Some(seek) = this.to_seek.take() {
+            this.file.as_mut().start_seek(seek)?;
+        }
+        *this.position = ready!(this.file.as_mut().poll_complete(cx)?);
+        Poll::Ready(Ok(*this.position))
+    }
+}
+
+pub struct UploadHandle {
+    tmp_dir: Option<Arc<TmpDir>>,
+    file: tokio::fs::File,
+    pacer: WritebackPacer,
+    progress: watch::Sender<Progress>,
+}
+impl UploadHandle {
+    pub async fn upload(&mut self, request: Request) {
+        self.process_headers(request.headers());
+        self.process_body(request.into_body().into_data_stream())
+            .await;
+        self.progress.send_if_modified(|p| p.complete());
+    }
+    fn process_headers(&mut self, headers: &HeaderMap) {
+        if let Some(content_length) = headers
+            .get(CONTENT_LENGTH)
+            .and_then(|a| a.to_str().log_err())
+            .and_then(|a| a.parse::<u64>().log_err())
+        {
+            self.progress
+                .send_modify(|p| p.expected_size = Some(content_length));
+        }
+    }
+    async fn process_body<E: Into<Box<dyn std::error::Error + Send + Sync + 'static>>>(
+        &mut self,
+        body: impl Stream<Item = Result<Bytes, E>> + Unpin,
+    ) {
+        let expected = self.progress.borrow().expected_size;
+        if let Some(total) = expected {
+            // See set_expected_size: reserve before set_total so the phase spins.
+            writeback::preallocate(self.file.as_raw_fd(), total)
+                .await
+                .log_err();
+            self.progress.send_modify(|p| p.tracker.set_total(total));
+        }
+        match write_stream(body, &mut self.file, &self.progress, &mut self.pacer).await {
+            Err(StreamError::Read(e)) => {
+                let e = std::io::Error::other(e);
+                self.progress.send_if_modified(|p| p.handle_error(&e));
+            }
+            Err(StreamError::Write(e)) => {
+                self.progress.send_if_modified(|p| p.handle_error(&e));
+            }
+            Ok(()) => (),
+        }
+        if let Err(e) = self.file.sync_all().await {
+            self.progress.send_if_modified(|p| p.handle_error(&e));
+        }
+    }
+}
+impl Drop for UploadHandle {
+    fn drop(&mut self) {
+        self.progress.send_if_modified(|p| p.complete());
+    }
+}
+
+enum StreamError<E> {
+    Read(E),
+    Write(std::io::Error),
+}
+
+/// Publishes each chunk once flushed (readers open their own handle) while the next is received;
+/// a read error surfaces only after every chunk received before it is published.
+async fn write_stream<E>(
+    mut stream: impl Stream<Item = Result<Bytes, E>> + Unpin,
+    file: &mut tokio::fs::File,
+    progress: &watch::Sender<Progress>,
+    pacer: &mut WritebackPacer,
+) -> Result<(), StreamError<E>> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(4);
+    let read = async move {
+        while let Some(chunk) = stream.next().await {
+            if tx.send(chunk?).await.is_err() {
+                break;
+            }
+        }
+        Ok::<_, E>(())
+    };
+    let write = async move {
+        while let Some(chunk) = rx.recv().await {
+            file.write_all(&chunk).await?;
+            file.flush().await?;
+            report_written(progress, pacer, chunk.len() as u64).await;
+        }
+        Ok::<_, std::io::Error>(())
+    };
+    let mut read = std::pin::pin!(read);
+    let mut write = std::pin::pin!(write);
+    // The writer only finishes first by failing; dropping the reader then stops reception.
+    let read = tokio::select! {
+        read = &mut read => read,
+        write = &mut write => return write.map_err(StreamError::Write),
+    };
+    write.await.map_err(StreamError::Write)?;
+    read.map_err(StreamError::Read)
+}
+
+async fn report_written(progress: &watch::Sender<Progress>, pacer: &mut WritebackPacer, len: u64) {
+    if len == 0 {
+        return;
+    }
+    progress.send_modify(|p| {
+        p.written += len;
+        p.tracker += len;
+    });
+    let written = progress.borrow().written;
+    pacer.pace(written).await.log_err();
+}
+
+pub struct DownloadAttemptContext {
+    pub bytes_written: u64,
+    pub expected_size: Option<u64>,
+    pub last_error: Option<Error>,
+}
+
+pub struct DownloadHandle {
+    tmp_dir: Option<Arc<TmpDir>>,
+    file: tokio::fs::File,
+    pacer: WritebackPacer,
+    progress: watch::Sender<Progress>,
+}
+impl DownloadHandle {
+    async fn set_expected_size(&mut self, total: u64) {
+        // Reserve before setting the total so the phase shows a spinner during
+        // the reserve (which can stall on fragmented btrfs) rather than a frozen 0%.
+        writeback::preallocate(self.file.as_raw_fd(), total)
+            .await
+            .log_err();
+        self.progress.send_modify(|p| {
+            p.expected_size = Some(total);
+            p.tracker.set_total(total);
+        });
+    }
+    async fn restart(&mut self) -> Result<(), Error> {
+        self.file
+            .set_len(0)
+            .await
+            .map_err(|e| Error::new(e, ErrorKind::Filesystem))?;
+        self.file
+            .seek(SeekFrom::Start(0))
+            .await
+            .map_err(|e| Error::new(e, ErrorKind::Filesystem))?;
+        self.pacer.reset();
+        self.progress.send_modify(|p| {
+            p.written = 0;
+            p.expected_size = None;
+            p.tracker.set_done(0);
+        });
+        Ok(())
+    }
+    pub async fn download_from<F, Fut>(&mut self, mut next_response: F)
+    where
+        F: FnMut(DownloadAttemptContext) -> Fut,
+        Fut: Future<Output = Result<reqwest::Response, Error>>,
+    {
+        let mut last_error: Option<Error> = None;
+        let outcome: Result<(), Error> = loop {
+            let (bytes_written, expected_size) = {
+                let p = self.progress.borrow();
+                (p.written, p.expected_size)
+            };
+            let response = match next_response(DownloadAttemptContext {
+                bytes_written,
+                expected_size,
+                last_error: last_error.as_ref().map(|e| e.clone_output()),
+            })
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => break Err(e),
+            };
+            let response = match response.error_for_status() {
+                Ok(r) => r,
+                Err(e) => {
+                    last_error = Some(Error::new(e, ErrorKind::Network));
+                    continue;
+                }
+            };
+
+            let new_size = if response.status() == StatusCode::PARTIAL_CONTENT {
+                // Re-sync the write head: a failed write may have committed
+                // bytes past `bytes_written` before erroring.
+                if let Err(e) = self.file.seek(SeekFrom::Start(bytes_written)).await {
+                    break Err(Error::new(e, ErrorKind::Filesystem));
+                }
+                parse_content_range_total(response.headers())
+            } else {
+                let content_length = response
+                    .headers()
+                    .get(CONTENT_LENGTH)
+                    .and_then(|a| a.to_str().log_err())
+                    .and_then(|a| a.parse::<u64>().log_err());
+                if let Err(e) = self.restart().await {
+                    break Err(e);
+                }
+                content_length
+            };
+            // A size change between attempts means the mirror's file changed
+            // mid-download. Already-consumed bytes (here and in concurrent
+            // readers) may be from another generation, so fail rather than
+            // splice them together.
+            if matches!((expected_size, new_size), (Some(prev), Some(new)) if prev != new) {
+                break Err(Error::new(
+                    eyre!("file changed on mirror mid-download"),
+                    ErrorKind::Network,
+                ));
+            }
+            if let Some(size) = new_size {
+                self.set_expected_size(size).await;
+            }
+
+            let stream_result: Result<(), Error> = async {
+                write_stream(
+                    response.bytes_stream(),
+                    &mut self.file,
+                    &self.progress,
+                    &mut self.pacer,
+                )
+                .await
+                .map_err(|e| match e {
+                    StreamError::Read(e) => Error::new(e, ErrorKind::Network),
+                    StreamError::Write(e) => Error::new(e, ErrorKind::Filesystem),
+                })?;
+                Ok(())
+            }
+            .await;
+
+            if let Err(e) = stream_result {
+                last_error = Some(e);
+                continue;
+            }
+
+            let (written, expected) = {
+                let p = self.progress.borrow();
+                (p.written, p.expected_size)
+            };
+            match expected {
+                Some(total) if written < total => {
+                    last_error = Some(Error::new(
+                        eyre!("download ended after {written} bytes, expected {total}"),
+                        ErrorKind::Network,
+                    ));
+                    continue;
+                }
+                Some(total) if written > total => {
+                    break Err(Error::new(
+                        eyre!("Too many bytes received"),
+                        ErrorKind::Network,
+                    ));
+                }
+                _ => break Ok(()),
+            }
+        };
+
+        match outcome {
+            Ok(()) => {
+                if let Err(e) = self.file.sync_all().await {
+                    self.progress.send_if_modified(|p| p.handle_error(&e));
+                }
+            }
+            Err(e) => {
+                self.progress.send_if_modified(|p| {
+                    if p.error.is_none() {
+                        p.error = Some(e);
+                        true
+                    } else {
+                        false
+                    }
+                });
+            }
+        }
+        self.progress.send_if_modified(|p| p.complete());
+    }
+}
+impl Drop for DownloadHandle {
+    fn drop(&mut self) {
+        self.progress.send_if_modified(|p| p.complete());
+    }
+}
+
+fn parse_content_range_total(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(CONTENT_RANGE)?
+        .to_str()
+        .ok()?
+        .rsplit_once('/')?
+        .1
+        .trim()
+        .parse()
+        .ok()
+}

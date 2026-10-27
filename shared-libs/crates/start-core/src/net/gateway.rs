@@ -1,0 +1,4492 @@
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::future::Future;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
+use std::task::Poll;
+use std::time::{Duration, Instant};
+
+use chrono::Utc;
+use clap::Parser;
+use futures::{FutureExt, Stream, StreamExt, TryStreamExt};
+use imbl::{OrdMap, OrdSet};
+use imbl_value::{InternedString, Value};
+use ipnet::IpNet;
+use itertools::Itertools;
+use nix::net::if_::if_nametoindex;
+use patch_db::json_ptr::JsonPointer;
+use rpc_toolkit::{Context, HandlerArgs, HandlerExt, ParentHandler, from_fn_async};
+use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::net::TcpListener;
+use tokio::process::Command;
+use tokio::sync::oneshot;
+use url::Url;
+use visit_rs::{Visit, VisitFields};
+use zbus::proxy::{PropertyChanged, PropertyStream, SignalStream};
+use zbus::zvariant::{
+    DeserializeDict, Dict, OwnedObjectPath, OwnedValue, Type as ZType, Value as ZValue,
+};
+use zbus::{Connection, proxy};
+
+use crate::context::{CliContext, RpcContext};
+use crate::db::model::Database;
+use crate::db::model::public::{
+    CapabilityVerdict, GatewayPortMapCapabilities, IpInfo, NetworkInterfaceInfo,
+    NetworkInterfaceType,
+};
+use crate::net::dns::{OutboundDnsUpdate, validate_dns_update};
+use crate::net::forward::{START9_BRIDGE_IFACE, nft_ensure_base};
+use crate::net::gateway::device::DeviceProxy;
+use crate::net::host::all_hosts;
+use crate::net::port_map::{candidate_gateways, probe};
+use crate::net::utils::{
+    bind_mio_listener, find_wifi_iface, ipv6_is_link_local, ipv6_is_local, is_global_ip,
+};
+use crate::net::web_server::{Accept, AcceptStream, MetadataVisitor, TcpMetadata};
+use crate::net::{
+    DEFAULT_OUTBOUND_REJECT_RULE_PRIORITY, DEFAULT_OUTBOUND_RULE_PRIORITY, LOCAL_OUTBOUND_MARK,
+    MAIN_RULE_PRIORITY, REPLY_RULE_PRIORITY, SOURCE_RULE_PRIORITY, TUNNEL_REPLY_RULE_PRIORITY,
+    WG_ENCAP_RULE_PRIORITY, rule_at_priority,
+};
+use crate::prelude::*;
+use crate::util::Invoke;
+use crate::util::collections::OrdMapIterMut;
+use crate::util::future::{NonDetachingJoinHandle, Until};
+use crate::util::io::open_file;
+use crate::util::serde::{HandlerExtSerde, display_serializable};
+use crate::util::sync::Watch;
+use crate::{GatewayId, PackageId};
+
+pub fn gateway_api<C: Context>() -> ParentHandler<C> {
+    ParentHandler::new()
+        .subcommand(
+            "list",
+            from_fn_async(list_interfaces)
+                .with_display_serializable()
+                .with_custom_display_fn(|HandlerArgs { params, .. }, res| {
+                    use prettytable::*;
+
+                    if let Some(format) = params.format {
+                        return display_serializable(format, res);
+                    }
+
+                    let mut table = Table::new();
+                    table.add_row(row![bc => "INTERFACE", "TYPE", "SECURE", "ADDRESSES", "WAN IP"]);
+                    for (iface, info) in res {
+                        table.add_row(row![
+                            iface,
+                            info.ip_info
+                                .as_ref()
+                                .and_then(|ip_info| ip_info.device_type)
+                                .map_or_else(|| "UNKNOWN".to_owned(), |ty| format!("{ty:?}")),
+                            match info.secure {
+                                Some(true) => "YES",
+                                Some(false) => "NO",
+                                None if info.secure() => "YES (auto)",
+                                None => "NO (auto)",
+                            },
+                            info.ip_info.as_ref().map_or_else(
+                                || "<DISCONNECTED>".to_owned(),
+                                |ip_info| ip_info
+                                    .subnets
+                                    .iter()
+                                    .map(|ipnet| match ipnet.addr() {
+                                        IpAddr::V4(ip) => format!("{ip}/{}", ipnet.prefix_len()),
+                                        IpAddr::V6(ip) => format!(
+                                            "[{ip}%{}]/{}",
+                                            ip_info.scope_id,
+                                            ipnet.prefix_len()
+                                        ),
+                                    })
+                                    .join(", ")
+                            ),
+                            info.ip_info
+                                .as_ref()
+                                .and_then(|ip_info| ip_info.wan_ip)
+                                .map_or_else(|| "N/A".to_owned(), |ip| ip.to_string())
+                        ]);
+                    }
+
+                    print_table(&table)?;
+
+                    Ok(())
+                })
+                .with_about("about.show-gateways-startos-can-listen-on")
+                .with_call_remote::<CliContext>(),
+        )
+        .subcommand(
+            "forget",
+            from_fn_async(forget_iface)
+                .with_metadata("sync_db", Value::Bool(true))
+                .no_display()
+                .with_about("about.forget-disconnected-gateway")
+                .with_call_remote::<CliContext>(),
+        )
+        .subcommand(
+            "set-name",
+            from_fn_async(set_name)
+                .with_metadata("sync_db", Value::Bool(true))
+                .no_display()
+                .with_about("about.rename-gateway")
+                .with_call_remote::<CliContext>(),
+        )
+        .subcommand(
+            "edit",
+            from_fn_async(edit_gateway)
+                .with_metadata("sync_db", Value::Bool(true))
+                .no_cli(),
+        )
+        .subcommand(
+            "set-secure",
+            from_fn_async(set_secure)
+                .with_metadata("sync_db", Value::Bool(true))
+                .no_display()
+                .with_about("about.mark-gateway-network-secure")
+                .with_call_remote::<CliContext>(),
+        )
+        .subcommand(
+            "unset-secure",
+            from_fn_async(unset_secure)
+                .with_metadata("sync_db", Value::Bool(true))
+                .no_display()
+                .with_about("about.allow-gateway-infer-network-security")
+                .with_call_remote::<CliContext>(),
+        )
+        .subcommand(
+            "check-port",
+            from_fn_async(check_port)
+                .with_display_serializable()
+                .with_about("about.check-port-reachability")
+                .with_call_remote::<CliContext>(),
+        )
+        .subcommand(
+            "check-port-v6",
+            from_fn_async(check_port_v6)
+                .with_display_serializable()
+                .with_about("about.check-port-v6-reachability")
+                .with_call_remote::<CliContext>(),
+        )
+        .subcommand(
+            "check-dns",
+            from_fn_async(check_dns)
+                .with_display_serializable()
+                .with_about("about.check-dns-configuration")
+                .with_call_remote::<CliContext>(),
+        )
+        .subcommand(
+            "set-default-outbound",
+            from_fn_async(set_default_outbound)
+                .with_metadata("sync_db", Value::Bool(true))
+                .no_display()
+                .with_about("about.set-default-outbound-gateway")
+                .with_call_remote::<CliContext>(),
+        )
+}
+
+async fn list_interfaces(
+    ctx: RpcContext,
+) -> Result<OrdMap<GatewayId, NetworkInterfaceInfo>, Error> {
+    Ok(ctx.net_controller.net_iface.watcher.ip_info())
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Parser, VisitFields)]
+#[group(skip)]
+struct ForgetGatewayParams {
+    #[arg(help = "help.arg.gateway-id")]
+    gateway: GatewayId,
+}
+
+rpc_toolkit::reflect_ts!(ForgetGatewayParams);
+rpc_toolkit::ts_export!(ForgetGatewayParams, namespaces = [""]);
+
+async fn forget_iface(
+    ctx: RpcContext,
+    ForgetGatewayParams { gateway }: ForgetGatewayParams,
+) -> Result<(), Error> {
+    ctx.net_controller.net_iface.forget(&gateway).await
+}
+
+/// The WireGuard preshared key NetworkManager holds for `interface`'s peer, if
+/// any. `GetSecrets` is root-only, so a sandboxed service can't read it — which
+/// is what makes a TSIG key derived from it unforgeable. `None` for a
+/// non-WireGuard gateway or a peer configured without a PSK.
+pub(crate) async fn wireguard_psk(interface: &str) -> Result<Option<[u8; 32]>, Error> {
+    let connection = Connection::system().await?;
+    let netman = NetworkManagerProxy::new(&connection).await?;
+    let device = netman.get_device_by_ip_iface(interface).await?;
+    if &*device == "/" {
+        return Ok(None);
+    }
+    let device = DeviceProxy::new(&connection, device).await?;
+    let ac = device.active_connection().await?;
+    if &*ac == "/" {
+        return Ok(None);
+    }
+    let ac = active_connection::ActiveConnectionProxy::new(&connection, ac).await?;
+    let settings = ConnectionSettingsProxy::new(&connection, ac.connection().await?).await?;
+    let secrets = settings.get_secrets("wireguard").await?;
+    let Some(peers) = secrets.get("wireguard").and_then(|wg| wg.get("peers")) else {
+        return Ok(None);
+    };
+    let peers = peers
+        .downcast_ref::<zbus::zvariant::Array>()
+        .with_kind(ErrorKind::Network)?;
+    for peer in peers.inner() {
+        let Ok(dict) = peer.downcast_ref::<Dict>() else {
+            continue;
+        };
+        let psk = dict
+            .get::<_, String>(&zbus::zvariant::Str::from_static("preshared-key"))
+            .with_kind(ErrorKind::Network)?;
+        if let Some(psk) = psk.filter(|s| !s.is_empty()) {
+            return Ok(Some(psk.parse::<crate::util::serde::Base64<[u8; 32]>>()?.0));
+        }
+    }
+    Ok(None)
+}
+
+/// Update2 flag: persist the change to disk (NM_SETTINGS_UPDATE2_FLAG_TO_DISK).
+const NM_UPDATE2_TO_DISK: u32 = 0x1;
+const WG_DNS_PRIORITY: i32 = 10;
+
+fn endpoint_domain(endpoint: &str) -> Option<InternedString> {
+    let (host, port) = endpoint.rsplit_once(':')?;
+    port.parse::<u16>().ok()?;
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.');
+    if host.parse::<IpAddr>().is_ok() {
+        return None;
+    }
+    let name = hickory_server::proto::rr::Name::from_ascii(host).ok()?;
+    Some(InternedString::intern(
+        name.to_lowercase().to_utf8().trim_end_matches('.'),
+    ))
+}
+
+pub(crate) fn wireguard_config_domains(config: &str) -> Result<OrdSet<InternedString>, Error> {
+    Ok(WgConfig::parse(config)?
+        .peers
+        .into_iter()
+        .filter_map(|peer| peer.endpoint)
+        .filter_map(|endpoint| endpoint_domain(&endpoint))
+        .collect())
+}
+
+fn settings_endpoint_domains(
+    settings: &HashMap<String, HashMap<String, OwnedValue>>,
+) -> Result<OrdSet<InternedString>, Error> {
+    let Some(peers) = settings.get("wireguard").and_then(|wg| wg.get("peers")) else {
+        return Ok(OrdSet::new());
+    };
+    let peers = Vec::<HashMap<String, OwnedValue>>::try_from(
+        peers.try_clone().with_kind(ErrorKind::Network)?,
+    )
+    .with_kind(ErrorKind::Network)?;
+    Ok(peers
+        .into_iter()
+        .filter_map(|mut peer| peer.remove("endpoint"))
+        .map(String::try_from)
+        .collect::<Result<Vec<_>, _>>()
+        .with_kind(ErrorKind::Network)?
+        .into_iter()
+        .filter_map(|endpoint| endpoint_domain(&endpoint))
+        .collect())
+}
+
+struct WgPeer {
+    public_key: String,
+    preshared_key: Option<String>,
+    endpoint: Option<String>,
+    persistent_keepalive: Option<u32>,
+}
+
+struct WgConfig {
+    private_key: String,
+    addresses: Vec<(IpAddr, u8)>,
+    dns: Vec<IpAddr>,
+    listen_port: Option<u32>,
+    peers: Vec<WgPeer>,
+}
+
+impl WgConfig {
+    fn parse(config: &str) -> Result<Self, Error> {
+        let invalid = |what: &str| {
+            Error::new(
+                eyre!("invalid WireGuard config: {what}"),
+                ErrorKind::InvalidRequest,
+            )
+        };
+        enum Section {
+            None,
+            Interface,
+            Peer,
+        }
+        let mut section = Section::None;
+        let mut private_key = None;
+        let mut addresses = Vec::new();
+        let mut dns = Vec::new();
+        let mut listen_port = None;
+        let mut peers: Vec<WgPeer> = Vec::new();
+
+        for raw in config.lines() {
+            let line = raw.split(['#', ';']).next().unwrap_or("").trim();
+            if line.is_empty() {
+                continue;
+            }
+            if line.eq_ignore_ascii_case("[interface]") {
+                section = Section::Interface;
+                continue;
+            }
+            if line.eq_ignore_ascii_case("[peer]") {
+                section = Section::Peer;
+                peers.push(WgPeer {
+                    public_key: String::new(),
+                    preshared_key: None,
+                    endpoint: None,
+                    persistent_keepalive: None,
+                });
+                continue;
+            }
+            let Some((key, val)) = line.split_once('=') else {
+                continue;
+            };
+            let (key, val) = (key.trim().to_ascii_lowercase(), val.trim());
+            match section {
+                Section::Interface => match key.as_str() {
+                    "privatekey" => private_key = Some(val.to_string()),
+                    "address" => {
+                        for part in val.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                            let (ip, prefix) = match part.split_once('/') {
+                                Some((ip, p)) => (
+                                    ip.trim().parse().map_err(|_| invalid("address"))?,
+                                    p.trim().parse().map_err(|_| invalid("prefix"))?,
+                                ),
+                                None => {
+                                    let ip: IpAddr =
+                                        part.parse().map_err(|_| invalid("address"))?;
+                                    (ip, if ip.is_ipv4() { 32 } else { 128 })
+                                }
+                            };
+                            if (ip.is_ipv4() && prefix > 32) || (ip.is_ipv6() && prefix > 128) {
+                                return Err(invalid("address prefix out of range"));
+                            }
+                            addresses.push((ip, prefix));
+                        }
+                    }
+                    "dns" => {
+                        for part in val.split(',').map(str::trim) {
+                            if let Ok(ip) = part.parse::<IpAddr>() {
+                                dns.push(ip);
+                            }
+                        }
+                    }
+                    "listenport" => listen_port = val.parse().ok(),
+                    _ => {}
+                },
+                Section::Peer => {
+                    if let Some(p) = peers.last_mut() {
+                        match key.as_str() {
+                            "publickey" => p.public_key = val.to_string(),
+                            "presharedkey" => p.preshared_key = Some(val.to_string()),
+                            "endpoint" => p.endpoint = Some(val.to_string()),
+                            "persistentkeepalive" => p.persistent_keepalive = val.parse().ok(),
+                            _ => {}
+                        }
+                    }
+                }
+                Section::None => {}
+            }
+        }
+
+        Ok(Self {
+            private_key: private_key.ok_or_else(|| invalid("missing PrivateKey"))?,
+            addresses,
+            dns,
+            listen_port,
+            peers,
+        })
+    }
+
+    /// Build the NetworkManager settings dict that `nmcli connection import` of
+    /// this (sanitized) config would produce, so an in-place Update2 is
+    /// equivalent to a fresh import.
+    fn to_nm_settings(
+        &self,
+        iface: &str,
+        uuid: Option<&str>,
+    ) -> Result<HashMap<String, HashMap<String, OwnedValue>>, Error> {
+        let ov = |v: ZValue<'_>| v.try_to_owned().with_kind(ErrorKind::Network);
+        let mut settings: HashMap<String, HashMap<String, OwnedValue>> = HashMap::new();
+
+        let mut conn = HashMap::from([
+            ("id".into(), ov(iface.into())?),
+            ("type".into(), ov("wireguard".into())?),
+            ("interface-name".into(), ov(iface.into())?),
+        ]);
+        // On add NM generates the uuid; on update we keep the existing one so the
+        // profile is replaced rather than redefined.
+        if let Some(uuid) = uuid {
+            conn.insert("uuid".into(), ov(uuid.into())?);
+        }
+        settings.insert("connection".into(), conn);
+
+        let mut wg: HashMap<String, OwnedValue> = HashMap::new();
+        wg.insert("private-key".into(), ov(self.private_key.as_str().into())?);
+        if let Some(port) = self.listen_port {
+            wg.insert("listen-port".into(), ov(port.into())?);
+        }
+        let peers: Vec<HashMap<String, ZValue>> = self
+            .peers
+            .iter()
+            .map(|p| {
+                let mut d: HashMap<String, ZValue> = HashMap::new();
+                d.insert("public-key".into(), p.public_key.as_str().into());
+                if let Some(psk) = &p.preshared_key {
+                    d.insert("preshared-key".into(), psk.as_str().into());
+                    // NM_SETTING_SECRET_FLAG_NONE (system-owned, stored). Required
+                    // for the update-config path: `Update2` persists the interface
+                    // `private-key` but silently DROPS this nested peer secret when
+                    // no flag is set, so a re-issued tunnel loses its PSK and the
+                    // handshake fails. `AddAndActivateConnection` normalizes the
+                    // flag for us; `Update2` does not — so we set it explicitly.
+                    d.insert("preshared-key-flags".into(), 0u32.into());
+                }
+                if let Some(ep) = &p.endpoint {
+                    d.insert("endpoint".into(), ep.as_str().into());
+                }
+                if let Some(ka) = p.persistent_keepalive {
+                    d.insert("persistent-keepalive".into(), ka.into());
+                }
+                d.insert(
+                    "allowed-ips".into(),
+                    vec!["0.0.0.0/0".to_string(), "::/0".to_string()].into(),
+                );
+                d
+            })
+            .collect();
+        wg.insert("peers".into(), ov(peers.into())?);
+        settings.insert("wireguard".into(), wg);
+
+        for (proto, is_v4) in [("ipv4", true), ("ipv6", false)] {
+            let addrs: Vec<_> = self
+                .addresses
+                .iter()
+                .filter(|(ip, _)| ip.is_ipv4() == is_v4)
+                .collect();
+            let dns: Vec<_> = self.dns.iter().filter(|ip| ip.is_ipv4() == is_v4).collect();
+            let mut s: HashMap<String, OwnedValue> = HashMap::new();
+            if addrs.is_empty() {
+                s.insert("method".into(), ov("disabled".into())?);
+            } else {
+                s.insert("method".into(), ov("manual".into())?);
+                let address_data: Vec<HashMap<String, ZValue>> = addrs
+                    .iter()
+                    .map(|(ip, prefix)| {
+                        HashMap::from([
+                            ("address".into(), ip.to_string().into()),
+                            ("prefix".into(), (*prefix as u32).into()),
+                        ])
+                    })
+                    .collect();
+                s.insert("address-data".into(), ov(address_data.into())?);
+                s.insert("dns-priority".into(), ov(WG_DNS_PRIORITY.into())?);
+                if !dns.is_empty() {
+                    let dns_val = if is_v4 {
+                        // ipv4.dns is au: the address octets as a little-endian u32.
+                        ZValue::from(
+                            dns.iter()
+                                .filter_map(|ip| match ip {
+                                    IpAddr::V4(v4) => Some(u32::from_le_bytes(v4.octets())),
+                                    _ => None,
+                                })
+                                .collect::<Vec<u32>>(),
+                        )
+                    } else {
+                        // ipv6.dns is aay: each address as 16 raw bytes.
+                        ZValue::from(
+                            dns.iter()
+                                .filter_map(|ip| match ip {
+                                    IpAddr::V6(v6) => Some(v6.octets().to_vec()),
+                                    _ => None,
+                                })
+                                .collect::<Vec<Vec<u8>>>(),
+                        )
+                    };
+                    s.insert("dns".into(), ov(dns_val)?);
+                    s.insert("dns-search".into(), ov(vec!["~".to_string()].into())?);
+                }
+            }
+            settings.insert(proto.into(), s);
+        }
+
+        Ok(settings)
+    }
+}
+
+/// Apply a re-issued WireGuard config to `interface`'s existing NM connection in
+/// place via D-Bus Update2 + Device.Reapply. The wg device is never deleted, so
+/// the tunnel — and the request that triggered the update, when it rides this
+/// same tunnel — is not torn down. Reapply applies the change to the live device
+/// without bringing the interface down (NM supports this for WireGuard).
+pub(crate) async fn update_wireguard_config(interface: &str, config: &str) -> Result<(), Error> {
+    let parsed = WgConfig::parse(config)?;
+
+    let connection = Connection::system().await?;
+    let netman = NetworkManagerProxy::new(&connection).await?;
+    let device = netman.get_device_by_ip_iface(interface).await?;
+    if &*device == "/" {
+        return Err(Error::new(
+            eyre!("{interface} not found in NetworkManager"),
+            ErrorKind::NotFound,
+        ));
+    }
+    let device_proxy = DeviceProxy::new(&connection, device).await?;
+    let ac = device_proxy.active_connection().await?;
+    if &*ac == "/" {
+        return Err(Error::new(
+            eyre!("{interface} has no active connection to update"),
+            ErrorKind::InvalidRequest,
+        ));
+    }
+    let ac_proxy = active_connection::ActiveConnectionProxy::new(&connection, ac).await?;
+    let settings = ConnectionSettingsProxy::new(&connection, ac_proxy.connection().await?).await?;
+
+    // Preserve the connection's uuid so this updates the existing profile rather
+    // than defining a new one.
+    let existing = settings.get_settings().await?;
+    let uuid = existing
+        .get("connection")
+        .and_then(|c| c.get("uuid"))
+        .and_then(|u| u.downcast_ref::<zbus::zvariant::Str>().ok())
+        .map(|s| s.to_string())
+        .ok_or_else(|| {
+            Error::new(
+                eyre!("{interface} connection is missing its uuid"),
+                ErrorKind::Network,
+            )
+        })?;
+
+    settings
+        .update2(
+            parsed.to_nm_settings(interface, Some(uuid.as_str()))?,
+            NM_UPDATE2_TO_DISK,
+            HashMap::new(),
+        )
+        .await?;
+    // Full settings so Reapply doesn't strip the connection's other peer fields.
+    device_proxy
+        .reapply(parsed.to_nm_settings(interface, Some(uuid.as_str()))?, 0, 0)
+        .await?;
+    // NM (<=1.52) drops WG peer PSKs on Reapply even when passed explicitly;
+    // restore them on the kernel device directly (PSK over stdin, never argv).
+    for peer in &parsed.peers {
+        if let Some(psk) = &peer.preshared_key {
+            Command::new("wg")
+                .arg("set")
+                .arg(interface)
+                .arg("peer")
+                .arg(&peer.public_key)
+                .arg("preshared-key")
+                .arg("/dev/stdin")
+                .input(Some(&mut std::io::Cursor::new(psk.clone().into_bytes())))
+                .invoke(ErrorKind::Network)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Create `interface`'s WireGuard connection from a config and bring it up, using
+/// the same parse + conversion as [`update_wireguard_config`] so an added gateway
+/// and an updated one are byte-for-byte identical. Replaces the old
+/// `nmcli connection import` helper.
+pub(crate) async fn add_wireguard_config(interface: &str, config: &str) -> Result<(), Error> {
+    let settings = WgConfig::parse(config)?.to_nm_settings(interface, None)?;
+    let connection = Connection::system().await?;
+    let netman = NetworkManagerProxy::new(&connection).await?;
+    // `/` for device + specific_object: NM creates the virtual wg device on activation.
+    let root = zbus::zvariant::ObjectPath::try_from("/").with_kind(ErrorKind::Network)?;
+    netman
+        .add_and_activate_connection(settings, &root, &root)
+        .await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Parser, VisitFields)]
+#[group(skip)]
+struct RenameGatewayParams {
+    #[arg(help = "help.arg.gateway-id")]
+    id: GatewayId,
+    #[arg(help = "help.arg.gateway-name")]
+    name: InternedString,
+}
+
+rpc_toolkit::reflect_ts!(RenameGatewayParams);
+rpc_toolkit::ts_export!(RenameGatewayParams, namespaces = [""]);
+
+async fn set_name(
+    ctx: RpcContext,
+    RenameGatewayParams { id, name }: RenameGatewayParams,
+) -> Result<(), Error> {
+    ctx.net_controller.net_iface.set_name(&id, name).await
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, VisitFields)]
+#[serde(rename_all = "camelCase")]
+struct EditGatewayParams {
+    id: GatewayId,
+    name: Option<InternedString>,
+    dns: Option<OutboundDnsUpdate>,
+}
+
+rpc_toolkit::reflect_ts!(EditGatewayParams);
+rpc_toolkit::ts_export!(EditGatewayParams, namespaces = [""]);
+
+async fn edit_gateway(ctx: RpcContext, params: EditGatewayParams) -> Result<(), Error> {
+    ctx.net_controller.net_iface.edit(params).await
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Parser, VisitFields)]
+#[group(skip)]
+#[serde(rename_all = "camelCase")]
+struct SetGatewaySecureParams {
+    #[arg(help = "help.arg.gateway-id")]
+    gateway: GatewayId,
+    #[arg(help = "help.arg.is-secure")]
+    secure: Option<bool>,
+}
+
+rpc_toolkit::reflect_ts!(SetGatewaySecureParams);
+rpc_toolkit::ts_export!(SetGatewaySecureParams, namespaces = [""]);
+
+async fn set_secure(
+    ctx: RpcContext,
+    SetGatewaySecureParams { gateway, secure }: SetGatewaySecureParams,
+) -> Result<(), Error> {
+    ctx.net_controller
+        .net_iface
+        .set_secure(&gateway, Some(secure.unwrap_or(true)))
+        .await
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Parser, VisitFields)]
+#[group(skip)]
+#[serde(rename_all = "camelCase")]
+struct UnsetGatewaySecureParams {
+    #[arg(help = "help.arg.gateway-id")]
+    gateway: GatewayId,
+}
+
+rpc_toolkit::reflect_ts!(UnsetGatewaySecureParams);
+rpc_toolkit::ts_export!(UnsetGatewaySecureParams, namespaces = [""]);
+
+async fn unset_secure(
+    ctx: RpcContext,
+    UnsetGatewaySecureParams { gateway }: UnsetGatewaySecureParams,
+) -> Result<(), Error> {
+    ctx.net_controller
+        .net_iface
+        .set_secure(&gateway, None)
+        .await
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Parser, VisitFields)]
+#[group(skip)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckPortParams {
+    #[arg(help = "help.arg.port")]
+    pub port: u16,
+    #[arg(help = "help.arg.gateway-id")]
+    pub gateway: GatewayId,
+}
+
+rpc_toolkit::reflect_ts!(CheckPortParams);
+rpc_toolkit::ts_export!(CheckPortParams, namespaces = [""]);
+
+#[derive(Debug, Clone, Deserialize, Serialize, VisitFields)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckPortRes {
+    pub ip: Ipv4Addr,
+    pub port: u16,
+    pub open_externally: bool,
+    pub open_internally: bool,
+    pub hairpinning: bool,
+}
+
+rpc_toolkit::reflect_ts!(CheckPortRes);
+rpc_toolkit::ts_export!(CheckPortRes, namespaces = [""]);
+
+/// v6 reachability of the box's GUA at a port. v6 is NAT-free (the GUA is the
+/// box's own address), so there is no hairpinning. Queried separately from
+/// [`CheckPortRes`] so the IPv4 and IPv6 checks can run independently.
+#[derive(Debug, Clone, Deserialize, Serialize, VisitFields)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckPortV6Res {
+    pub ip: Ipv6Addr,
+    pub open_externally: bool,
+    pub open_internally: bool,
+}
+
+rpc_toolkit::reflect_ts!(CheckPortV6Res);
+rpc_toolkit::ts_export!(CheckPortV6Res, namespaces = [""]);
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IfconfigPortRes {
+    pub ip: Ipv4Addr,
+    pub port: u16,
+    pub reachable: bool,
+}
+
+#[derive(Deserialize)]
+struct PortReachable {
+    reachable: bool,
+}
+
+pub async fn check_port(
+    ctx: RpcContext,
+    CheckPortParams { port, gateway }: CheckPortParams,
+) -> Result<CheckPortRes, Error> {
+    let db = ctx.db.peek().await;
+    let base_urls = db.as_public().as_server_info().as_echoip_urls().de()?;
+    let gateways = db
+        .as_public()
+        .as_server_info()
+        .as_network()
+        .as_gateways()
+        .de()?;
+    let gw_info = gateways
+        .get(&gateway)
+        .ok_or_else(|| Error::new(eyre!("unknown gateway: {gateway}"), ErrorKind::NotFound))?;
+    let ip_info = gw_info.ip_info.as_ref().ok_or_else(|| {
+        Error::new(
+            eyre!("gateway {gateway} has no IP info"),
+            ErrorKind::NotFound,
+        )
+    })?;
+
+    let internal_ips = ip_info
+        .subnets
+        .iter()
+        .map(|i| i.addr())
+        .filter(|a| a.is_ipv4())
+        .map(|a| SocketAddr::new(a, port))
+        .collect::<Vec<_>>();
+
+    let open_internally = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::TcpStream::connect(&*internal_ips),
+    )
+    .await
+    .map_or(false, |r| r.is_ok());
+
+    let local_ipv4 = ip_info
+        .subnets
+        .iter()
+        .find_map(|s| match s.addr() {
+            IpAddr::V4(v4) => Some(v4),
+            _ => None,
+        })
+        .unwrap_or(Ipv4Addr::UNSPECIFIED);
+
+    // If automatic port forwarding (PCP/NAT-PMP/UPnP) already succeeded for this
+    // port, it's reachable — skip the remote echo service and report success.
+    // The mapping reports the gateway-assigned external IP, so we still know our
+    // public address without a third-party round-trip.
+    for ip in ip_info.subnets.iter().filter_map(|s| match s.addr() {
+        IpAddr::V4(v4) => Some(v4),
+        _ => None,
+    }) {
+        if let Ok(Some(IpAddr::V4(ip))) = tokio::time::timeout(
+            Duration::from_secs(2),
+            ctx.net_controller
+                .port_map
+                .mapped_external_ip(IpAddr::V4(ip), port),
+        )
+        .await
+        {
+            let hairpinning = check_hairpin(gateway, local_ipv4, ip, port).await;
+            return Ok(CheckPortRes {
+                ip,
+                port,
+                open_externally: true,
+                open_internally,
+                hairpinning,
+            });
+        }
+    }
+
+    let client = reqwest::Client::builder();
+    #[cfg(target_os = "linux")]
+    let client = client
+        .interface(gateway.as_str())
+        .local_address(IpAddr::V4(local_ipv4));
+    let client = client.build()?;
+
+    let mut res = None;
+    for base_url in base_urls {
+        let url = base_url
+            .join(&format!("/port/{port}"))
+            .with_kind(ErrorKind::ParseUrl)?;
+        res = Some(
+            async {
+                client
+                    .get(url)
+                    .timeout(Duration::from_secs(5))
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await
+            }
+            .await,
+        );
+        if res.as_ref().map_or(false, |r| r.is_ok()) {
+            break;
+        }
+    }
+    let Some(IfconfigPortRes {
+        ip,
+        port,
+        reachable: open_externally,
+    }) = res.transpose()?
+    else {
+        return Err(Error::new(
+            eyre!("{}", t!("net.gateway.no-configured-echoip-urls")),
+            ErrorKind::Network,
+        ));
+    };
+
+    let hairpinning = check_hairpin(gateway, local_ipv4, ip, port).await;
+
+    Ok(CheckPortRes {
+        ip,
+        port,
+        open_externally,
+        open_internally,
+        hairpinning,
+    })
+}
+
+/// v6 counterpart of [`check_port`]: probe the box's IPv6 GUA reachability at
+/// `port` on `gateway`. `None` when the gateway has no GUA.
+pub async fn check_port_v6(
+    ctx: RpcContext,
+    CheckPortParams { port, gateway }: CheckPortParams,
+) -> Result<Option<CheckPortV6Res>, Error> {
+    let db = ctx.db.peek().await;
+    let base_urls = db.as_public().as_server_info().as_echoip_urls().de()?;
+    let gateways = db
+        .as_public()
+        .as_server_info()
+        .as_network()
+        .as_gateways()
+        .de()?;
+    let gw_info = gateways
+        .get(&gateway)
+        .ok_or_else(|| Error::new(eyre!("unknown gateway: {gateway}"), ErrorKind::NotFound))?;
+    let ip_info = gw_info.ip_info.as_ref().ok_or_else(|| {
+        Error::new(
+            eyre!("gateway {gateway} has no IP info"),
+            ErrorKind::NotFound,
+        )
+    })?;
+    check_gua_port(
+        &gateway,
+        ip_info,
+        port,
+        &base_urls,
+        &ctx.net_controller.port_map,
+    )
+    .await
+}
+
+/// Probe the box's IPv6 GUA reachability at `port` on `gateway`, if it has one.
+/// v6 is NAT-free — the GUA is the box's own address — so "external" reachability
+/// is just whether the upstream firewall lets an inbound connection through; there
+/// is no hairpinning. An open PCP pinhole is taken as reachable; otherwise the
+/// echoip backends (which support v6) probe the GUA from outside.
+async fn check_gua_port(
+    gateway: &GatewayId,
+    ip_info: &IpInfo,
+    port: u16,
+    base_urls: &[Url],
+    port_map: &crate::net::port_map::PortMapController,
+) -> Result<Option<CheckPortV6Res>, Error> {
+    let Some(gua) = ip_info.subnets.iter().find_map(|s| match s.addr() {
+        IpAddr::V6(v6) if !ipv6_is_local(v6) => Some(v6),
+        _ => None,
+    }) else {
+        return Ok(None);
+    };
+
+    let open_internally = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::TcpStream::connect(SocketAddr::new(IpAddr::V6(gua), port)),
+    )
+    .await
+    .map_or(false, |r| r.is_ok());
+
+    if let Ok(Some(_)) = tokio::time::timeout(
+        Duration::from_secs(2),
+        port_map.mapped_external_ip(IpAddr::V6(gua), port),
+    )
+    .await
+    {
+        return Ok(Some(CheckPortV6Res {
+            ip: gua,
+            open_externally: true,
+            open_internally,
+        }));
+    }
+
+    let client = reqwest::Client::builder();
+    #[cfg(target_os = "linux")]
+    let client = client
+        .interface(gateway.as_str())
+        .local_address(IpAddr::V6(gua));
+    let client = client.build()?;
+
+    let mut open_externally = false;
+    for base_url in base_urls {
+        let url = base_url
+            .join(&format!("/port/{port}"))
+            .with_kind(ErrorKind::ParseUrl)?;
+        if let Ok(PortReachable { reachable }) = async {
+            client
+                .get(url)
+                .timeout(Duration::from_secs(5))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await
+        }
+        .await
+        {
+            open_externally = reachable;
+            break;
+        }
+    }
+
+    Ok(Some(CheckPortV6Res {
+        ip: gua,
+        open_externally,
+        open_internally,
+    }))
+}
+
+#[cfg(target_os = "linux")]
+async fn check_hairpin(gateway: GatewayId, local_ipv4: Ipv4Addr, ip: Ipv4Addr, port: u16) -> bool {
+    let hairpinning = tokio::time::timeout(Duration::from_secs(5), async {
+        let dest = SocketAddr::new(ip.into(), port);
+        let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)?;
+        socket.bind_device(Some(gateway.as_str().as_bytes()))?;
+        socket.bind(&SocketAddr::new(IpAddr::V4(local_ipv4), 0).into())?;
+        socket.set_nonblocking(true)?;
+        let socket = unsafe {
+            use std::os::fd::{FromRawFd, IntoRawFd};
+            tokio::net::TcpSocket::from_raw_fd(socket.into_raw_fd())
+        };
+        socket.connect(dest).await.map(|_| ())
+    })
+    .await
+    .map_or(false, |r| r.is_ok());
+    hairpinning
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn check_hairpin(_: GatewayId, _: Ipv4Addr, _: Ipv4Addr, _: u16) -> bool {
+    false
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Parser, VisitFields)]
+#[group(skip)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckDnsParams {
+    #[arg(help = "help.arg.gateway-id")]
+    pub gateway: GatewayId,
+    #[arg(help = "help.arg.fqdn")]
+    pub fqdn: InternedString,
+}
+
+rpc_toolkit::reflect_ts!(CheckDnsParams);
+rpc_toolkit::ts_export!(CheckDnsParams, namespaces = [""]);
+
+/// Verify a private domain works on the LAN by asking the LAN's own DNS
+/// server(s) for `fqdn` and confirming the answer is one of this server's
+/// addresses on that gateway — i.e. the record actually resolves correctly on
+/// the LAN, rather than merely checking whether we are the LAN's DNS server.
+pub async fn check_dns(
+    ctx: RpcContext,
+    CheckDnsParams { gateway, fqdn }: CheckDnsParams,
+) -> Result<bool, Error> {
+    use hickory_server::resolver::Resolver;
+    use hickory_server::resolver::config::{ResolverConfig, ResolverOpts};
+
+    use crate::net::dns::forward_name_server;
+    use crate::net::dns::upstream::GatewayRuntime;
+
+    let ip_info = ctx.net_controller.net_iface.watcher.ip_info();
+    let gw_info = ip_info
+        .get(&gateway)
+        .ok_or_else(|| Error::new(eyre!("unknown gateway: {gateway}"), ErrorKind::NotFound))?;
+    let gw_ip_info = gw_info.ip_info.as_ref().ok_or_else(|| {
+        Error::new(
+            eyre!("gateway {gateway} has no IP info"),
+            ErrorKind::NotFound,
+        )
+    })?;
+
+    // The private domain should resolve to one of our addresses on this LAN.
+    let expected: BTreeSet<IpAddr> = gw_ip_info.subnets.iter().map(|s| s.addr()).collect();
+    if expected.is_empty() {
+        return Ok(false);
+    }
+
+    // Query each resolver this gateway advertises — for a StartTunnel link this
+    // is the imported config's `DNS =` (the in-tunnel `.1` that injects/serves
+    // the record), now tracked in dns_servers (see poll_ip_info).
+    for dns_ip in &gw_ip_info.dns_servers {
+        let mut config = ResolverConfig::from_parts(None, Vec::new(), Vec::new());
+        config.add_name_server(forward_name_server(SocketAddr::new(*dns_ip, 53)));
+        let mut opts = ResolverOpts::default();
+        opts.timeout = Duration::from_secs(5);
+        opts.attempts = 1;
+
+        let resolver = Resolver::builder_with_config(
+            config,
+            GatewayRuntime::new(gateway.clone(), gw_ip_info.scope_id),
+        )
+        .with_options(opts)
+        .build()
+        .map_err(|e| Error::new(eyre!("{e}"), ErrorKind::Network))?;
+
+        if let Ok(lookup) = resolver.lookup_ip(&*fqdn).await {
+            if lookup.iter().any(|ip| expected.contains(&ip)) {
+                return Ok(true);
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Parser, VisitFields)]
+#[group(skip)]
+#[serde(rename_all = "camelCase")]
+struct SetDefaultOutboundParams {
+    #[arg(help = "help.arg.gateway-id")]
+    gateway: Option<GatewayId>,
+    #[arg(skip)]
+    dns: Option<OutboundDnsUpdate>,
+}
+
+rpc_toolkit::reflect_ts!(SetDefaultOutboundParams);
+rpc_toolkit::ts_export!(SetDefaultOutboundParams, namespaces = [""]);
+
+async fn set_default_outbound(
+    ctx: RpcContext,
+    params: SetDefaultOutboundParams,
+) -> Result<(), Error> {
+    params
+        .save(&ctx.db, &ctx.net_controller.net_iface.watcher.ip_info())
+        .await
+}
+
+fn validate_outbound_gateway_change(
+    previous: Option<GatewayId>,
+    gateway: &Option<GatewayId>,
+    interfaces: &OrdMap<GatewayId, NetworkInterfaceInfo>,
+) -> Result<(), Error> {
+    if previous.as_ref() == gateway.as_ref() {
+        return Ok(());
+    }
+    if let Some(gw) = gateway {
+        let info = interfaces
+            .get(gw)
+            .ok_or_else(|| Error::new(eyre!("unknown gateway: {gw}"), ErrorKind::NotFound))?;
+        ensure_code!(
+            info.ip_info.is_some(),
+            ErrorKind::InvalidRequest,
+            "gateway {gw} is not connected"
+        );
+    }
+    Ok(())
+}
+
+impl SetDefaultOutboundParams {
+    async fn save(
+        self,
+        db: &TypedPatchDb<Database>,
+        interfaces: &OrdMap<GatewayId, NetworkInterfaceInfo>,
+    ) -> Result<(), Error> {
+        let dns = validate_dns_update(self.dns, interfaces)?;
+        db.mutate(|db| {
+            let network = db.as_public_mut().as_server_info_mut().as_network_mut();
+            validate_outbound_gateway_change(
+                network.as_default_outbound().de()?,
+                &self.gateway,
+                interfaces,
+            )?;
+            network.as_default_outbound_mut().ser(&self.gateway)?;
+            if let Some(dns) = dns {
+                network.as_outbound_dns_mut().ser(&dns)?;
+            }
+            Ok(())
+        })
+        .await
+        .result
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Parser, VisitFields)]
+#[group(skip)]
+#[serde(rename_all = "camelCase")]
+pub struct SetOutboundGatewayParams {
+    #[arg(help = "help.arg.package-id")]
+    package: PackageId,
+    #[arg(help = "help.arg.gateway-id")]
+    gateway: Option<GatewayId>,
+    #[arg(skip)]
+    dns: Option<OutboundDnsUpdate>,
+}
+
+rpc_toolkit::reflect_ts!(SetOutboundGatewayParams);
+rpc_toolkit::ts_export!(SetOutboundGatewayParams, namespaces = [""]);
+
+pub async fn set_outbound_gateway(
+    ctx: RpcContext,
+    params: SetOutboundGatewayParams,
+) -> Result<(), Error> {
+    params
+        .save(&ctx.db, &ctx.net_controller.net_iface.watcher.ip_info())
+        .await
+}
+
+impl SetOutboundGatewayParams {
+    async fn save(
+        self,
+        db: &TypedPatchDb<Database>,
+        interfaces: &OrdMap<GatewayId, NetworkInterfaceInfo>,
+    ) -> Result<(), Error> {
+        let dns = validate_dns_update(self.dns, interfaces)?;
+        db.mutate(|db| {
+            let package = db
+                .as_public_mut()
+                .as_package_data_mut()
+                .as_idx_mut(&self.package)
+                .or_not_found(&self.package)?;
+            validate_outbound_gateway_change(
+                package.as_outbound_gateway().de()?,
+                &self.gateway,
+                interfaces,
+            )?;
+            package.as_outbound_gateway_mut().ser(&self.gateway)?;
+            if let Some(dns) = dns {
+                package.as_outbound_dns_mut().ser(&dns)?;
+            }
+            Ok(())
+        })
+        .await
+        .result
+    }
+}
+
+#[proxy(
+    interface = "org.freedesktop.NetworkManager",
+    default_service = "org.freedesktop.NetworkManager",
+    default_path = "/org/freedesktop/NetworkManager"
+)]
+trait NetworkManager {
+    fn get_device_by_ip_iface(&self, iface: &str) -> Result<OwnedObjectPath, Error>;
+
+    /// Add a persistent connection from the given settings and activate it in one
+    /// call. Pass `/` for device/specific_object to let NM pick or create the
+    /// device (a virtual WireGuard interface is created on activation).
+    fn add_and_activate_connection(
+        &self,
+        connection: HashMap<String, HashMap<String, OwnedValue>>,
+        device: &zbus::zvariant::ObjectPath<'_>,
+        specific_object: &zbus::zvariant::ObjectPath<'_>,
+    ) -> Result<(OwnedObjectPath, OwnedObjectPath), Error>;
+
+    #[zbus(property)]
+    fn all_devices(&self) -> Result<Vec<OwnedObjectPath>, Error>;
+
+    #[zbus(property)]
+    fn startup(&self) -> Result<bool, Error>;
+
+    #[zbus(signal)]
+    fn device_added(&self) -> Result<(), Error>;
+
+    #[zbus(signal)]
+    fn device_removed(&self) -> Result<(), Error>;
+
+    #[zbus(signal)]
+    fn state_changed(&self) -> Result<(), Error>;
+}
+
+mod active_connection {
+    use zbus::proxy;
+    use zbus::zvariant::OwnedObjectPath;
+
+    use crate::prelude::*;
+
+    #[proxy(
+        interface = "org.freedesktop.NetworkManager.Connection.Active",
+        default_service = "org.freedesktop.NetworkManager"
+    )]
+    pub trait ActiveConnection {
+        #[zbus(property)]
+        fn connection(&self) -> Result<OwnedObjectPath, Error>;
+
+        #[zbus(property)]
+        fn id(&self) -> Result<String, Error>;
+
+        #[zbus(property)]
+        fn state_flags(&self) -> Result<u32, Error>;
+
+        #[zbus(property, name = "Type")]
+        fn connection_type(&self) -> Result<String, Error>;
+
+        #[zbus(signal)]
+        fn state_changed(&self) -> Result<(), Error>;
+
+        #[zbus(property)]
+        fn dhcp4_config(&self) -> Result<OwnedObjectPath, Error>;
+    }
+}
+
+#[proxy(
+    interface = "org.freedesktop.NetworkManager.Settings.Connection",
+    default_service = "org.freedesktop.NetworkManager"
+)]
+trait ConnectionSettings {
+    fn delete(&self) -> Result<(), Error>;
+
+    fn get_settings(&self) -> Result<HashMap<String, HashMap<String, OwnedValue>>, Error>;
+
+    fn get_secrets(
+        &self,
+        setting_name: &str,
+    ) -> Result<HashMap<String, HashMap<String, OwnedValue>>, Error>;
+
+    fn update2(
+        &self,
+        settings: HashMap<String, HashMap<String, OwnedValue>>,
+        flags: u32,
+        args: HashMap<String, ZValue<'_>>,
+    ) -> Result<HashMap<String, OwnedValue>, Error>;
+
+    #[zbus(signal)]
+    fn updated(&self) -> Result<(), Error>;
+}
+
+#[proxy(
+    interface = "org.freedesktop.NetworkManager.IP4Config",
+    default_service = "org.freedesktop.NetworkManager"
+)]
+trait Ip4Config {
+    #[zbus(property)]
+    fn address_data(&self) -> Result<Vec<AddressData>, Error>;
+
+    #[zbus(property)]
+    fn route_data(&self) -> Result<Vec<RouteData>, Error>;
+
+    #[zbus(property)]
+    fn gateway(&self) -> Result<String, Error>;
+
+    #[zbus(property)]
+    fn nameserver_data(&self) -> Result<Vec<NameserverData>, Error>;
+}
+
+#[proxy(
+    interface = "org.freedesktop.NetworkManager.IP6Config",
+    default_service = "org.freedesktop.NetworkManager"
+)]
+trait Ip6Config {
+    #[zbus(property)]
+    fn address_data(&self) -> Result<Vec<AddressData>, Error>;
+
+    #[zbus(property)]
+    fn route_data(&self) -> Result<Vec<RouteData>, Error>;
+
+    #[zbus(property)]
+    fn gateway(&self) -> Result<String, Error>;
+
+    // IP6Config has no `NameserverData`; its resolvers are `Nameservers` (aay),
+    // each a raw 16-byte address.
+    #[zbus(property)]
+    fn nameservers(&self) -> Result<Vec<Vec<u8>>, Error>;
+}
+
+#[derive(Clone, Debug, DeserializeDict, ZValue, ZType)]
+#[zvariant(signature = "dict")]
+struct AddressData {
+    address: String,
+    prefix: u32,
+}
+impl TryFrom<AddressData> for IpNet {
+    type Error = Error;
+    fn try_from(value: AddressData) -> Result<Self, Self::Error> {
+        IpNet::new(value.address.parse()?, value.prefix as u8).with_kind(ErrorKind::ParseNetAddress)
+    }
+}
+
+#[derive(Clone, Debug, DeserializeDict, ZValue, ZType)]
+#[zvariant(signature = "dict")]
+struct RouteData {
+    dest: String,
+    prefix: u32,
+    table: Option<u32>,
+    metric: Option<u32>,
+}
+
+#[derive(Clone, Debug, DeserializeDict, ZValue, ZType)]
+#[zvariant(signature = "dict")]
+struct NameserverData {
+    address: String,
+}
+
+#[proxy(
+    interface = "org.freedesktop.NetworkManager.DHCP4Config",
+    default_service = "org.freedesktop.NetworkManager"
+)]
+trait Dhcp4Config {
+    #[zbus(property)]
+    fn options(&self) -> Result<Dhcp4Options, Error>;
+}
+
+#[derive(Clone, Debug, DeserializeDict, ZType)]
+#[zvariant(signature = "dict")]
+struct Dhcp4Options {
+    ntp_servers: Option<String>,
+    domain_name_servers: Option<String>,
+}
+impl TryFrom<OwnedValue> for Dhcp4Options {
+    type Error = zbus::Error;
+    fn try_from(value: OwnedValue) -> Result<Self, Self::Error> {
+        let dict = value.downcast_ref::<Dict>()?;
+        Ok(Self {
+            ntp_servers: dict.get::<_, String>(&zbus::zvariant::Str::from_static("ntp_servers"))?,
+            domain_name_servers: dict
+                .get::<_, String>(&zbus::zvariant::Str::from_static("domain_name_servers"))?,
+        })
+    }
+}
+
+mod device {
+    use std::collections::HashMap;
+
+    use zbus::proxy;
+    use zbus::zvariant::{OwnedObjectPath, OwnedValue};
+
+    use crate::prelude::*;
+
+    #[proxy(
+        interface = "org.freedesktop.NetworkManager.Device",
+        default_service = "org.freedesktop.NetworkManager"
+    )]
+    pub trait Device {
+        fn delete(&self) -> Result<(), Error>;
+
+        /// Apply changed connection settings to the live device without
+        /// deactivating it. Empty `connection` reapplies the active connection's
+        /// current (just-updated) settings; `version_id` 0 skips the version check.
+        fn reapply(
+            &self,
+            connection: HashMap<String, HashMap<String, OwnedValue>>,
+            version_id: u64,
+            flags: u32,
+        ) -> Result<(), Error>;
+
+        #[zbus(property)]
+        fn ip_interface(&self) -> Result<String, Error>;
+
+        #[zbus(property)]
+        fn managed(&self) -> Result<bool, Error>;
+
+        #[zbus(property)]
+        fn active_connection(&self) -> Result<OwnedObjectPath, Error>;
+
+        #[zbus(property)]
+        fn ip4_config(&self) -> Result<OwnedObjectPath, Error>;
+
+        #[zbus(property)]
+        fn ip6_config(&self) -> Result<OwnedObjectPath, Error>;
+
+        #[zbus(property, name = "State")]
+        fn _state(&self) -> Result<u32, Error>;
+
+        #[zbus(property)]
+        fn device_type(&self) -> Result<u32, Error>;
+
+        #[zbus(signal)]
+        fn state_changed(&self) -> Result<(), Error>;
+    }
+}
+
+trait StubStream<'a> {
+    fn stub(self) -> impl Stream<Item = Result<(), Error>> + 'a;
+}
+impl<'a, T> StubStream<'a> for PropertyStream<'a, T>
+where
+    T: Unpin + TryFrom<OwnedValue> + std::fmt::Debug + 'a,
+    T::Error: Into<zbus::Error>,
+{
+    fn stub(self) -> impl Stream<Item = Result<(), Error>> + 'a {
+        StreamExt::then(self, |d| async move {
+            PropertyChanged::get(&d).await.map(|_| ())
+        })
+        .map_err(Error::from)
+    }
+}
+impl<'a> StubStream<'a> for SignalStream<'a> {
+    fn stub(self) -> impl Stream<Item = Result<(), Error>> + 'a {
+        self.map(|_| Ok(()))
+    }
+}
+
+#[instrument(skip_all)]
+async fn watcher(
+    watch_ip_info: Watch<OrdMap<GatewayId, NetworkInterfaceInfo>>,
+    watch_activation: Watch<BTreeMap<GatewayId, bool>>,
+    db: Option<TypedPatchDb<Database>>,
+) {
+    loop {
+        let res: Result<(), Error> = async {
+            Command::new("systemctl")
+                .arg("start")
+                .arg("NetworkManager")
+                .invoke(ErrorKind::Network)
+                .await?;
+
+            let connection = Connection::system().await?;
+
+            let netman_proxy = NetworkManagerProxy::new(&connection).await?;
+
+            let mut until = Until::new()
+                .with_stream(netman_proxy.receive_all_devices_changed().await.stub())
+                .with_stream(
+                    netman_proxy
+                        .receive_device_added()
+                        .await?
+                        .into_inner()
+                        .stub(),
+                )
+                .with_stream(
+                    netman_proxy
+                        .receive_device_removed()
+                        .await?
+                        .into_inner()
+                        .stub(),
+                )
+                .with_stream(
+                    netman_proxy
+                        .receive_state_changed()
+                        .await?
+                        .into_inner()
+                        .stub(),
+                );
+
+            loop {
+                until
+                    .run(async {
+                        let devices = netman_proxy.all_devices().await?;
+                        ensure_code!(
+                            !devices.is_empty(),
+                            ErrorKind::Network,
+                            "{}",
+                            t!("net.gateway.no-devices-returned")
+                        );
+                        let mut ifaces = BTreeSet::new();
+                        let mut policy_ifaces: BTreeMap<GatewayId, u32> = BTreeMap::new();
+                        let mut jobs = Vec::new();
+                        for device in devices {
+                            use futures::future::Either;
+
+                            let device_proxy =
+                                device::DeviceProxy::new(&connection, device.clone()).await?;
+                            let iface = InternedString::intern(device_proxy.ip_interface().await?);
+                            if iface.is_empty() {
+                                continue;
+                            }
+                            let iface: GatewayId = iface.into();
+                            // Only policy-route managed, connected gateways —
+                            // mirrors the gating in `watch_ip` and excludes
+                            // unmanaged plumbing like container veth pairs.
+                            if device_proxy.managed().await?
+                                && &*device_proxy.active_connection().await? != "/"
+                                && let Some(table_id) = policy_table_for(
+                                    device_type_of(device_proxy.device_type().await?),
+                                    &iface,
+                                )
+                            {
+                                policy_ifaces.insert(iface.clone(), table_id);
+                            }
+                            if watch_activation.peek(|a| a.contains_key(&iface)) {
+                                jobs.push(Either::Left(watch_activated(
+                                    &connection,
+                                    device_proxy.clone(),
+                                    iface.clone(),
+                                    &watch_activation,
+                                )));
+                            }
+
+                            jobs.push(Either::Right(watch_ip(
+                                &connection,
+                                device_proxy.clone(),
+                                iface.clone(),
+                                &watch_ip_info,
+                                db.as_ref(),
+                            )));
+                            ifaces.insert(iface);
+                        }
+
+                        watch_ip_info.send_if_modified(|m| {
+                            let mut changed = false;
+                            for (iface, info) in OrdMapIterMut::from(m) {
+                                if !ifaces.contains(iface) {
+                                    info.ip_info = None;
+                                    changed = true;
+                                }
+                            }
+                            changed
+                        });
+                        gc_policy_routing(&ifaces).await;
+                        reconcile_mangle_rules(&policy_ifaces).await.log_err();
+                        if !policy_ifaces.is_empty() {
+                            for v6 in [false, true] {
+                                ensure_main_suppress_rule(v6).await.log_err();
+                            }
+                        }
+                        for result in futures::future::join_all(jobs).await {
+                            result.log_err();
+                        }
+
+                        Ok::<_, Error>(())
+                    })
+                    .await?;
+            }
+        }
+        .await;
+        if let Err(e) = res {
+            tracing::error!("{e}");
+            tracing::debug!("{e:?}");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+}
+
+/// Sentinel key used to rate-limit the per-interface UPnP WAN-IP probe inside
+/// the echoip rate-limit map (it is not a real echoip URL and is never fetched).
+fn upnp_probe_key() -> Url {
+    Url::parse("upnp://get-external-ip-address").unwrap()
+}
+
+/// Rate-limit sentinel for the per-interface PCP/NAT-PMP capability probe.
+fn pcp_probe_key() -> Url {
+    Url::parse("pcp://capability-probe").unwrap()
+}
+
+async fn get_wan_ipv4(
+    iface: &str,
+    base_url: &Url,
+    local_ipv4: Ipv4Addr,
+) -> Result<Option<Ipv4Addr>, Error> {
+    let url = base_url.join("/ip").with_kind(ErrorKind::ParseUrl)?;
+    let text = tokio::time::timeout(
+        Duration::from_secs(5),
+        get_via_gateway(iface, &url, local_ipv4),
+    )
+    .await
+    .map_err(|_| Error::new(eyre!("request to {url} timed out"), ErrorKind::Network))??;
+    parse_echoip(&text)
+}
+
+async fn get_via_gateway(iface: &str, url: &Url, local_ipv4: Ipv4Addr) -> Result<String, Error> {
+    let mut connector = hyper_util::client::legacy::connect::HttpConnector::new();
+    connector.enforce_http(false);
+    connector.set_local_address(Some(local_ipv4.into()));
+    #[cfg(target_os = "linux")]
+    {
+        let index = if_nametoindex(iface).with_kind(ErrorKind::Network)?;
+        connector.set_interface(iface);
+        connector.set_mark(Some(gateway_table_id(index)));
+    }
+    let tls = native_tls::TlsConnector::new().with_kind(ErrorKind::Network)?;
+    let connector = hyper_tls::HttpsConnector::from((connector, tls.into()));
+    let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+        .build(connector);
+    get_echoip_response(&client, url).await
+}
+
+async fn get_echoip_response<C>(
+    client: &hyper_util::client::legacy::Client<C, http_body_util::Empty<bytes::Bytes>>,
+    url: &Url,
+) -> Result<String, Error>
+where
+    C: hyper_util::client::legacy::connect::Connect + Clone + Send + Sync + 'static,
+{
+    use http_body_util::BodyExt;
+    use hyper::StatusCode;
+
+    let mut url = url.clone();
+    for redirects in 0..=10 {
+        ensure_code!(
+            matches!(url.scheme(), "http" | "https"),
+            ErrorKind::ParseUrl,
+            "unsupported echoip URL {url}"
+        );
+        let res = client
+            .get(
+                url.as_str()
+                    .parse::<hyper::Uri>()
+                    .with_kind(ErrorKind::ParseUrl)?,
+            )
+            .await
+            .with_kind(ErrorKind::Network)?;
+        if matches!(
+            res.status(),
+            StatusCode::MOVED_PERMANENTLY
+                | StatusCode::FOUND
+                | StatusCode::SEE_OTHER
+                | StatusCode::TEMPORARY_REDIRECT
+                | StatusCode::PERMANENT_REDIRECT
+        ) && let Some(location) = res.headers().get(hyper::header::LOCATION)
+        {
+            ensure_code!(
+                redirects < 10,
+                ErrorKind::Network,
+                "too many echoip redirects"
+            );
+            url = url
+                .join(location.to_str().with_kind(ErrorKind::ParseUrl)?)
+                .with_kind(ErrorKind::ParseUrl)?;
+            continue;
+        }
+        ensure_code!(
+            !res.status().is_client_error() && !res.status().is_server_error(),
+            ErrorKind::Network,
+            "echoip responded {}",
+            res.status()
+        );
+        return Ok(String::from_utf8(
+            res.into_body().collect().await?.to_bytes().to_vec(),
+        )?);
+    }
+    unreachable!()
+}
+
+/// A routable WAN address from an echoip response.
+fn parse_echoip(text: &str) -> Result<Option<Ipv4Addr>, Error> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let ip: Ipv4Addr = trimmed.parse()?;
+    Ok(Some(ip).filter(|&ip| {
+        crate::net::port_map::upnp::is_wan_candidate(ip) && is_global_ip(IpAddr::V4(ip))
+    }))
+}
+
+struct PolicyRoutingGuard {
+    table_id: u32,
+}
+
+/// Removes the reply rules, source rules, and tables of interfaces that no
+/// longer exist.
+async fn gc_policy_routing(active_ifaces: &BTreeSet<GatewayId>) {
+    let active_tables: BTreeSet<u32> = active_ifaces
+        .iter()
+        .filter_map(|iface| if_nametoindex(iface.as_str()).ok().map(gateway_table_id))
+        .collect();
+
+    // A source rule is deleted by the selector it was added with.
+    let mut stale = BTreeSet::<u32>::new();
+    let mut stale_src = Vec::<(bool, u32, String)>::new();
+    for v6 in [false, true] {
+        let mut cmd = Command::new("ip");
+        if v6 {
+            cmd.arg("-6");
+        }
+        let Ok(rules) = cmd
+            .arg("rule")
+            .arg("show")
+            .invoke(ErrorKind::Network)
+            .await
+            .and_then(|b| String::from_utf8(b).with_kind(ErrorKind::Utf8))
+        else {
+            continue;
+        };
+        for line in rules.lines() {
+            let reply = rule_at_priority(line, REPLY_RULE_PRIORITY);
+            let source = rule_at_priority(line, SOURCE_RULE_PRIORITY);
+            let Some(rest) = reply.or(source) else {
+                continue;
+            };
+            let Some(pos) = rest.find("lookup ") else {
+                continue;
+            };
+            let token = rest[pos + 7..].split_whitespace().next().unwrap_or("");
+            let Ok(table_id) = token.parse::<u32>() else {
+                continue;
+            };
+            if table_id < GATEWAY_TABLE_BASE || active_tables.contains(&table_id) {
+                continue;
+            }
+            stale.insert(table_id);
+            if source.is_some() {
+                let mut toks = rest.split_whitespace();
+                if let Some(addr) = toks.find(|t| *t == "from").and_then(|_| toks.next()) {
+                    stale_src.push((v6, table_id, addr.to_owned()));
+                }
+            }
+        }
+    }
+
+    for (v6, table_id, addr) in stale_src {
+        let mut cmd = Command::new("ip");
+        if v6 {
+            cmd.arg("-6");
+        }
+        cmd.arg("rule")
+            .arg("del")
+            .arg("from")
+            .arg(&addr)
+            .arg("lookup")
+            .arg(table_id.to_string())
+            .arg("priority")
+            .arg(SOURCE_RULE_PRIORITY.to_string())
+            .invoke(ErrorKind::Network)
+            .await
+            .ok();
+    }
+
+    // For each stale table, remove its fwmark rules and flush its routing table
+    // in both families, so a removed interface leaves no stale reply-routing
+    // rule, v4 default, or v6 default/blackhole behind.
+    for table_id in stale {
+        let table_str = table_id.to_string();
+        tracing::debug!("gc_policy_routing: removing stale table {table_id}");
+        for v6 in [false, true] {
+            let mut del = Command::new("ip");
+            if v6 {
+                del.arg("-6");
+            }
+            del.arg("rule")
+                .arg("del")
+                .arg("fwmark")
+                .arg(&table_str)
+                .arg("lookup")
+                .arg(&table_str)
+                .arg("priority")
+                .arg(REPLY_RULE_PRIORITY.to_string())
+                .invoke(ErrorKind::Network)
+                .await
+                .ok();
+            if v6 {
+                Command::new("ip")
+                    .arg("-6")
+                    .arg("rule")
+                    .arg("del")
+                    .arg("fwmark")
+                    .arg(&table_str)
+                    .arg("lookup")
+                    .arg(&table_str)
+                    .arg("priority")
+                    .arg(TUNNEL_REPLY_RULE_PRIORITY.to_string())
+                    .invoke(ErrorKind::Network)
+                    .await
+                    .ok();
+            }
+            let mut flush = Command::new("ip");
+            if v6 {
+                flush.arg("-6");
+            }
+            flush
+                .arg("route")
+                .arg("flush")
+                .arg("table")
+                .arg(&table_str)
+                .invoke(ErrorKind::Network)
+                .await
+                .ok();
+        }
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct OutboundRules {
+    wireguard_fwmarks: BTreeSet<u32>,
+    gateway_tables: BTreeSet<u32>,
+    reject: bool,
+}
+
+fn parse_outbound_rules(output: &str) -> OutboundRules {
+    let mut rules = OutboundRules::default();
+    for line in output.lines() {
+        if let Some(rest) = rule_at_priority(line, WG_ENCAP_RULE_PRIORITY) {
+            let Some(pos) = rest.find("fwmark ") else {
+                continue;
+            };
+            let token = rest[pos + 7..].split_whitespace().next().unwrap_or("");
+            if let Ok(fwmark) = u32::from_str_radix(token.strip_prefix("0x").unwrap_or(token), 16) {
+                rules.wireguard_fwmarks.insert(fwmark);
+            }
+        } else if let Some(rest) = rule_at_priority(line, DEFAULT_OUTBOUND_RULE_PRIORITY) {
+            let Some(pos) = rest.find("lookup ") else {
+                continue;
+            };
+            let token = rest[pos + 7..].split_whitespace().next().unwrap_or("");
+            if let Ok(table) = token.parse::<u32>() {
+                rules.gateway_tables.insert(table);
+            }
+        } else if let Some(rest) = rule_at_priority(line, DEFAULT_OUTBOUND_REJECT_RULE_PRIORITY) {
+            rules.reject |= rest.split_whitespace().eq(["from", "all", "unreachable"]);
+        }
+    }
+    rules
+}
+
+async fn snapshot_outbound_rules(v6: bool) -> OutboundRules {
+    match async {
+        let mut cmd = Command::new("ip");
+        if v6 {
+            cmd.arg("-6");
+        }
+        let output = String::from_utf8(
+            cmd.arg("rule")
+                .arg("show")
+                .invoke(ErrorKind::Network)
+                .await?,
+        )?;
+        Ok::<_, Error>(parse_outbound_rules(&output))
+    }
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("failed to snapshot outbound rules: {e}");
+            OutboundRules::default()
+        }
+    }
+}
+
+async fn reconcile_outbound_rules(v6: bool, existing: &OutboundRules, desired: &OutboundRules) {
+    let ip = || {
+        let mut c = Command::new("ip");
+        if v6 {
+            c.arg("-6");
+        }
+        c
+    };
+    for fwmark in desired
+        .wireguard_fwmarks
+        .difference(&existing.wireguard_fwmarks)
+    {
+        ip().arg("rule")
+            .arg("add")
+            .arg("fwmark")
+            .arg(fwmark.to_string())
+            .arg("lookup")
+            .arg("main")
+            .arg("priority")
+            .arg(WG_ENCAP_RULE_PRIORITY.to_string())
+            .invoke(ErrorKind::Network)
+            .await
+            .log_err();
+    }
+    for table in desired.gateway_tables.difference(&existing.gateway_tables) {
+        ip().arg("rule")
+            .arg("add")
+            .arg("table")
+            .arg(table.to_string())
+            .arg("priority")
+            .arg(DEFAULT_OUTBOUND_RULE_PRIORITY.to_string())
+            .invoke(ErrorKind::Network)
+            .await
+            .log_err();
+    }
+    // Installed after the lookup it backs and removed before it.
+    if desired.reject != existing.reject {
+        ip().arg("rule")
+            .arg(if desired.reject { "add" } else { "del" })
+            .arg("from")
+            .arg("all")
+            .arg("unreachable")
+            .arg("priority")
+            .arg(DEFAULT_OUTBOUND_REJECT_RULE_PRIORITY.to_string())
+            .invoke(ErrorKind::Network)
+            .await
+            .log_err();
+    }
+    for fwmark in existing
+        .wireguard_fwmarks
+        .difference(&desired.wireguard_fwmarks)
+    {
+        ip().arg("rule")
+            .arg("del")
+            .arg("fwmark")
+            .arg(fwmark.to_string())
+            .arg("lookup")
+            .arg("main")
+            .arg("priority")
+            .arg(WG_ENCAP_RULE_PRIORITY.to_string())
+            .invoke(ErrorKind::Network)
+            .await
+            .log_err();
+    }
+    for table in existing.gateway_tables.difference(&desired.gateway_tables) {
+        ip().arg("rule")
+            .arg("del")
+            .arg("table")
+            .arg(table.to_string())
+            .arg("priority")
+            .arg(DEFAULT_OUTBOUND_RULE_PRIORITY.to_string())
+            .invoke(ErrorKind::Network)
+            .await
+            .log_err();
+    }
+}
+
+/// Map a NetworkManager device-type id to our [`NetworkInterfaceType`].
+fn device_type_of(raw: u32) -> Option<NetworkInterfaceType> {
+    match raw {
+        1 => Some(NetworkInterfaceType::Ethernet),
+        2 => Some(NetworkInterfaceType::Wireless),
+        13 => Some(NetworkInterfaceType::Bridge),
+        29 => Some(NetworkInterfaceType::Wireguard),
+        32 => Some(NetworkInterfaceType::Loopback),
+        _ => None,
+    }
+}
+
+const GATEWAY_TABLE_BASE: u32 = 1000;
+
+pub(crate) const fn gateway_table_id(index: u32) -> u32 {
+    GATEWAY_TABLE_BASE + index
+}
+
+fn policy_table_for(device_type: Option<NetworkInterfaceType>, iface: &GatewayId) -> Option<u32> {
+    if matches!(
+        device_type,
+        Some(NetworkInterfaceType::Bridge | NetworkInterfaceType::Loopback)
+    ) {
+        return None;
+    }
+    if_nametoindex(iface.as_str())
+        .map(gateway_table_id)
+        .log_err()
+}
+
+/// Rebuilds the mangle chains in one transaction. The gateway coordinator is
+/// their only writer.
+async fn reconcile_mangle_rules(policy_ifaces: &BTreeMap<GatewayId, u32>) -> Result<(), Error> {
+    nft_ensure_base().await?;
+    let mut script = String::new();
+    script.push_str("flush chain ip startos mangle_prerouting\n");
+    script.push_str("flush chain ip startos mangle_output\n");
+    script.push_str("flush chain ip6 startos mangle_prerouting\n");
+    script.push_str("flush chain ip6 startos mangle_output\n");
+    script.push_str(
+        "add rule ip startos mangle_prerouting meta mark 0x00000000 meta mark set ct mark comment \"restore-mark\"\n",
+    );
+    // Divert replies destined to a local transparent (SNI-demux) socket back into
+    // it: mark them so the priority-49 ip rule routes them to the local table.
+    script.push_str(&crate::net::transparent::divert_mark_rule());
+    script.push_str(
+        "add rule ip startos mangle_output meta mark 0x00000000 meta mark set ct mark comment \"restore-mark\"\n",
+    );
+    script.push_str("add rule ip startos mangle_output jump mangle_local_outbound\n");
+    script.push_str(
+        "add rule ip6 startos mangle_prerouting meta mark 0x00000000 meta mark set ct mark comment \"restore-mark\"\n",
+    );
+    script.push_str(
+        "add rule ip6 startos mangle_output meta mark 0x00000000 meta mark set ct mark comment \"restore-mark\"\n",
+    );
+    script.push_str("add rule ip6 startos mangle_output jump mangle_local_outbound\n");
+    // The reverse-path check reads the packet mark, not the connection mark.
+    for (iface, table_id) in policy_ifaces {
+        script.push_str(&format!(
+            "add rule ip startos mangle_prerouting iifname \"{iface}\" ct state new ct mark set {table_id} meta mark set {table_id} comment \"mark-{iface}\"\n",
+            iface = iface.as_str(),
+        ));
+        script.push_str(&format!(
+            "add rule ip6 startos mangle_prerouting iifname \"{iface}\" ct state new ct mark set {table_id} meta mark set {table_id} comment \"mark-{iface}\"\n",
+            iface = iface.as_str(),
+        ));
+    }
+    Command::new("nft")
+        .arg(&script)
+        .invoke(ErrorKind::Network)
+        .await?;
+    Ok(())
+}
+
+/// Rebuilds the chain `mangle_output` jumps to. The default-outbound reconciler
+/// is its only writer.
+async fn reconcile_local_outbound_mark(selected: bool) -> Result<(), Error> {
+    nft_ensure_base().await?;
+    let mut script = String::new();
+    for family in ["ip", "ip6"] {
+        script.push_str(&format!(
+            "flush chain {family} startos mangle_local_outbound\n"
+        ));
+        if selected {
+            // IPv6 retries a failed lookup with a source address, which a source rule then matches.
+            script.push_str(&format!(
+                "add rule {family} startos mangle_local_outbound ct state new meta mark 0x00000000 meta mark set {LOCAL_OUTBOUND_MARK:#010x} comment \"mark-local-outbound\"\n"
+            ));
+        }
+    }
+    Command::new("nft")
+        .arg(&script)
+        .invoke(ErrorKind::Network)
+        .await?;
+    Ok(())
+}
+
+/// An interface absent from the table stays absent.
+fn disconnected(write_to: &Watch<OrdMap<GatewayId, NetworkInterfaceInfo>>, iface: &GatewayId) {
+    write_to.send_if_modified(|m| {
+        m.get_mut(iface)
+            .filter(|i| i.ip_info.is_some())
+            .map(|i| i.ip_info = None)
+            .is_some()
+    });
+}
+
+#[instrument(skip(connection, device_proxy, write_to, db))]
+async fn watch_ip(
+    connection: &Connection,
+    device_proxy: device::DeviceProxy<'_>,
+    iface: GatewayId,
+    write_to: &Watch<OrdMap<GatewayId, NetworkInterfaceInfo>>,
+    db: Option<&TypedPatchDb<Database>>,
+) -> Result<(), Error> {
+    let mut until = Until::new()
+        .with_stream(
+            device_proxy
+                .receive_active_connection_changed()
+                .await
+                .stub(),
+        )
+        .with_stream(
+            device_proxy
+                .receive_state_changed()
+                .await?
+                .into_inner()
+                .stub(),
+        )
+        .with_stream(device_proxy.receive_ip4_config_changed().await.stub())
+        .with_stream(device_proxy.receive_ip6_config_changed().await.stub())
+        .with_async_fn(|| {
+            async {
+                tokio::time::sleep(Duration::from_secs(600)).await;
+                Ok(())
+            }
+            .fuse()
+        });
+
+    let mut echoip_ratelimit_state: BTreeMap<Url, Instant> = BTreeMap::new();
+
+    loop {
+        until
+            .run(async {
+                let ip4_config = device_proxy.ip4_config().await?;
+                let ip6_config = device_proxy.ip6_config().await?;
+
+                let managed = device_proxy.managed().await?;
+                if !managed {
+                    disconnected(write_to, &iface);
+                    return Ok(());
+                }
+                let dac = device_proxy.active_connection().await?;
+                if &*dac == "/" {
+                    disconnected(write_to, &iface);
+                    return Ok(());
+                }
+
+                let active_connection_proxy =
+                    active_connection::ActiveConnectionProxy::new(&connection, dac).await?;
+
+                let settings_proxy = ConnectionSettingsProxy::new(
+                    &connection,
+                    active_connection_proxy.connection().await?,
+                )
+                .await?;
+
+                let mut until = Until::new()
+                    .with_stream(
+                        active_connection_proxy
+                            .receive_state_changed()
+                            .await?
+                            .into_inner()
+                            .stub(),
+                    )
+                    .with_stream(
+                        active_connection_proxy
+                            .receive_dhcp4_config_changed()
+                            .await
+                            .stub(),
+                    )
+                    .with_stream(settings_proxy.receive_updated().await?.into_inner().stub());
+
+                loop {
+                    until
+                        .run(async {
+                            let device_type = device_type_of(device_proxy.device_type().await?);
+                            let domains =
+                                settings_endpoint_domains(&settings_proxy.get_settings().await?)?;
+                            write_to.send_if_modified(|interfaces| {
+                                if interfaces
+                                    .get(&iface)
+                                    .is_some_and(|info| info.wireguard_endpoint_domains == domains)
+                                {
+                                    return false;
+                                }
+                                interfaces
+                                    .entry(iface.clone())
+                                    .or_default()
+                                    .wireguard_endpoint_domains = domains;
+                                true
+                            });
+
+                            let name = InternedString::from(active_connection_proxy.id().await?);
+
+                            let dhcp4_config = active_connection_proxy.dhcp4_config().await?;
+                            let ip4_proxy =
+                                Ip4ConfigProxy::new(&connection, ip4_config.clone()).await?;
+                            let ip6_proxy =
+                                Ip6ConfigProxy::new(&connection, ip6_config.clone()).await?;
+                            let mut until = Until::new()
+                                .with_stream(ip4_proxy.receive_address_data_changed().await.stub())
+                                .with_stream(ip4_proxy.receive_route_data_changed().await.stub())
+                                .with_stream(ip4_proxy.receive_gateway_changed().await.stub())
+                                .with_stream(
+                                    ip4_proxy.receive_nameserver_data_changed().await.stub(),
+                                )
+                                .with_stream(ip6_proxy.receive_address_data_changed().await.stub())
+                                .with_stream(ip6_proxy.receive_route_data_changed().await.stub())
+                                .with_stream(ip6_proxy.receive_gateway_changed().await.stub())
+                                .with_stream(ip6_proxy.receive_nameservers_changed().await.stub());
+
+                            let dhcp4_proxy = if &*dhcp4_config != "/" {
+                                let dhcp4_proxy =
+                                    Dhcp4ConfigProxy::new(&connection, dhcp4_config).await?;
+                                until = until.with_stream(
+                                    dhcp4_proxy.receive_options_changed().await.stub(),
+                                );
+                                Some(dhcp4_proxy)
+                            } else {
+                                None
+                            };
+
+                            let policy_guard: Option<PolicyRoutingGuard> =
+                                policy_table_for(device_type, &iface)
+                                    .map(|table_id| PolicyRoutingGuard { table_id });
+
+                            loop {
+                                until
+                                    .run(poll_ip_info(
+                                        &ip4_proxy,
+                                        &ip6_proxy,
+                                        &dhcp4_proxy,
+                                        &policy_guard,
+                                        &iface,
+                                        &mut echoip_ratelimit_state,
+                                        db,
+                                        write_to,
+                                        device_type,
+                                        &name,
+                                    ))
+                                    .await?;
+                            }
+                        })
+                        .await?;
+                }
+            })
+            .await?;
+    }
+}
+
+fn rule_has(line: &str, key: &str, value: &str) -> bool {
+    line.split_whitespace()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .any(|w| w[0] == key && w[1] == value)
+}
+
+fn main_suppress_rule(line: &str) -> bool {
+    rule_at_priority(line, MAIN_RULE_PRIORITY).is_some_and(|rule| {
+        rule.split_whitespace().eq([
+            "from",
+            "all",
+            "lookup",
+            "main",
+            "suppress_prefixlength",
+            "0",
+        ])
+    })
+}
+
+/// Specific routes are `main`'s; per-interface tables hold only defaults.
+async fn ensure_main_suppress_rule(v6: bool) -> Result<(), Error> {
+    // Reject-type defaults terminate before suppression; `throw` routes fall through.
+    let mut ip = Command::new("ip");
+    if v6 {
+        ip.arg("-6");
+    }
+    let rules = String::from_utf8(
+        ip.arg("rule")
+            .arg("show")
+            .invoke(ErrorKind::Network)
+            .await?,
+    )?;
+    if !rules.lines().any(main_suppress_rule) {
+        let mut ip = Command::new("ip");
+        if v6 {
+            ip.arg("-6");
+        }
+        ip.arg("rule")
+            .arg("add")
+            .arg("lookup")
+            .arg("main")
+            .arg("suppress_prefixlength")
+            .arg("0")
+            .arg("priority")
+            .arg(MAIN_RULE_PRIORITY.to_string())
+            .invoke(ErrorKind::Network)
+            .await?;
+    }
+    Ok(())
+}
+
+const GLOBAL_UNICAST_V6: &str = "2000::/3";
+
+/// The priority-48 rule that routes a table's marked replies ahead of `main`.
+fn outranking_reply_rule(line: &str, table_id: u32) -> bool {
+    rule_at_priority(line, TUNNEL_REPLY_RULE_PRIORITY).is_some()
+        && rule_has(line, "to", GLOBAL_UNICAST_V6)
+        && rule_has(line, "fwmark", &format!("0x{table_id:x}"))
+        && rule_has(line, "lookup", &table_id.to_string())
+}
+
+/// With `replies_outrank_main`, a marked reply to a global destination takes
+/// the table before `main`; the table must then reach every client by itself.
+async fn ensure_table_rules(
+    v6: bool,
+    table_id: u32,
+    replies_outrank_main: bool,
+    rules_output: &str,
+) {
+    let ip = || {
+        let mut c = Command::new("ip");
+        if v6 {
+            c.arg("-6");
+        }
+        c
+    };
+    let table_str = table_id.to_string();
+    let mut reply_rule = false;
+    let mut outranking_reply_rule_present = false;
+    for line in rules_output.lines().map(str::trim) {
+        if !(rule_has(line, "fwmark", &format!("0x{table_id:x}"))
+            && rule_has(line, "lookup", &table_str))
+        {
+            continue;
+        }
+        if replies_outrank_main && outranking_reply_rule(line, table_id) {
+            outranking_reply_rule_present = true;
+            continue;
+        }
+        match line.split(':').next() {
+            Some(priority) if priority.parse() == Ok(REPLY_RULE_PRIORITY) => reply_rule = true,
+            Some(priority) => {
+                ip().arg("rule")
+                    .arg("del")
+                    .arg("fwmark")
+                    .arg(&table_str)
+                    .arg("lookup")
+                    .arg(&table_str)
+                    .arg("priority")
+                    .arg(priority)
+                    .invoke(ErrorKind::Network)
+                    .await
+                    .log_err();
+            }
+            None => {}
+        }
+    }
+    if !reply_rule {
+        ip().arg("rule")
+            .arg("add")
+            .arg("fwmark")
+            .arg(&table_str)
+            .arg("lookup")
+            .arg(&table_str)
+            .arg("priority")
+            .arg(REPLY_RULE_PRIORITY.to_string())
+            .invoke(ErrorKind::Network)
+            .await
+            .log_err();
+    }
+    if replies_outrank_main && !outranking_reply_rule_present {
+        // Without `to`, the rule returns container-bound packets to the tunnel.
+        ip().arg("rule")
+            .arg("add")
+            .arg("fwmark")
+            .arg(&table_str)
+            .arg("to")
+            .arg(GLOBAL_UNICAST_V6)
+            .arg("lookup")
+            .arg(&table_str)
+            .arg("priority")
+            .arg(TUNNEL_REPLY_RULE_PRIORITY.to_string())
+            .invoke(ErrorKind::Network)
+            .await
+            .log_err();
+    }
+}
+
+async fn apply_policy_routing(
+    guard: &PolicyRoutingGuard,
+    iface: &GatewayId,
+    lan_ip: &OrdSet<IpAddr>,
+    subnets: &OrdSet<IpNet>,
+) -> Result<(), Error> {
+    let table_id = guard.table_id;
+    let table_str = table_id.to_string();
+
+    let ipv4_gateway: Option<Ipv4Addr> = lan_ip
+        .iter()
+        .find_map(|ip| match ip {
+            IpAddr::V4(v4) => Some(v4),
+            _ => None,
+        })
+        .copied();
+
+    let mut cmd = Command::new("ip");
+    cmd.arg("route").arg("replace").arg("default");
+    if let Some(gw) = ipv4_gateway {
+        cmd.arg("via").arg(gw.to_string());
+    }
+    cmd.arg("dev")
+        .arg(iface.as_str())
+        .arg("table")
+        .arg(&table_str);
+    if ipv4_gateway.is_none() {
+        cmd.arg("scope").arg("link");
+    }
+    cmd.invoke(ErrorKind::Network).await.log_err();
+
+    // Set on `all`, it would validate a diverted reply against its local route.
+    Command::new("sysctl")
+        .arg("-qw")
+        .arg(format!("net/ipv4/conf/{}/src_valid_mark=1", iface.as_str()))
+        .invoke(ErrorKind::Network)
+        .await
+        .log_err();
+
+    let rules_output = String::from_utf8(
+        Command::new("ip")
+            .arg("rule")
+            .arg("list")
+            .invoke(ErrorKind::Network)
+            .await?,
+    )?;
+    ensure_table_rules(false, table_id, false, &rules_output).await;
+
+    let own_v4: BTreeSet<String> = subnets
+        .iter()
+        .filter_map(|n| match n {
+            IpNet::V4(v4n) => Some(v4n.addr().to_string()),
+            _ => None,
+        })
+        .collect();
+    reconcile_source_rules(false, table_id, &own_v4, &rules_output).await;
+
+    Ok(())
+}
+
+/// Sending needs an address of the interface's own beyond link-local; without
+/// a gateway it must be global.
+fn carries_v6(gateway: Option<Ipv6Addr>, addrs: impl IntoIterator<Item = Ipv6Addr>) -> bool {
+    let (mut own, mut global) = (false, false);
+    for addr in addrs {
+        own |= !ipv6_is_link_local(addr);
+        global |= !ipv6_is_local(addr);
+    }
+    own && (gateway.is_some() || global)
+}
+
+/// The table's one route is a default, or `blackhole default` on an interface
+/// that cannot carry v6.
+async fn apply_policy_routing_v6(
+    guard: &PolicyRoutingGuard,
+    iface: &GatewayId,
+    device_type: Option<NetworkInterfaceType>,
+    lan_ip: &OrdSet<IpAddr>,
+    subnets: &OrdSet<IpNet>,
+) -> Result<(), Error> {
+    let table_id = guard.table_id;
+    let table_str = table_id.to_string();
+
+    let ipv6_gateway: Option<Ipv6Addr> = lan_ip.iter().find_map(|ip| match ip {
+        IpAddr::V6(v6) => Some(*v6),
+        _ => None,
+    });
+    let own_v6: BTreeSet<String> = subnets
+        .iter()
+        .filter_map(|n| match n {
+            IpNet::V6(v6n) if !ipv6_is_link_local(v6n.addr()) => Some(v6n.addr().to_string()),
+            _ => None,
+        })
+        .collect();
+    let v6_capable = carries_v6(
+        ipv6_gateway,
+        subnets.iter().filter_map(|n| match n {
+            IpNet::V6(v6n) => Some(v6n.addr()),
+            _ => None,
+        }),
+    );
+
+    // Replace the default: a real route when the interface can carry v6, else a
+    // blackhole so a non-v6 gateway selected as default outbound drops v6.
+    {
+        let mut cmd = Command::new("ip");
+        cmd.arg("-6").arg("route").arg("replace");
+        if v6_capable {
+            cmd.arg("default");
+            if let Some(gw) = ipv6_gateway {
+                cmd.arg("via").arg(gw.to_string());
+            }
+            cmd.arg("dev")
+                .arg(iface.as_str())
+                .arg("table")
+                .arg(&table_str);
+        } else {
+            cmd.arg("blackhole")
+                .arg("default")
+                .arg("table")
+                .arg(&table_str);
+        }
+        cmd.invoke(ErrorKind::Network).await.log_err();
+    }
+
+    let rules_output = String::from_utf8(
+        Command::new("ip")
+            .arg("-6")
+            .arg("rule")
+            .arg("list")
+            .invoke(ErrorKind::Network)
+            .await?,
+    )?;
+    // A tunnel has no on-link neighbours; its default alone reaches every client.
+    let replies_outrank_main = v6_capable && device_type == Some(NetworkInterfaceType::Wireguard);
+    ensure_table_rules(true, table_id, replies_outrank_main, &rules_output).await;
+
+    reconcile_source_rules(true, table_id, &own_v6, &rules_output).await;
+
+    Ok(())
+}
+
+/// A reply is first routed unmarked, by its source address alone.
+async fn reconcile_source_rules(
+    v6: bool,
+    table_id: u32,
+    addrs: &BTreeSet<String>,
+    rules_output: &str,
+) {
+    let table_str = table_id.to_string();
+    let existing: BTreeSet<String> = rules_output
+        .lines()
+        .filter_map(|l| {
+            let toks: Vec<&str> = rule_at_priority(l, SOURCE_RULE_PRIORITY)?
+                .split_whitespace()
+                .collect();
+            toks.windows(2)
+                .any(|w| w[0] == "lookup" && w[1].parse::<u32>().ok() == Some(table_id))
+                .then(|| toks.windows(2).find(|w| w[0] == "from").map(|w| w[1]))
+                .flatten()
+                .map(|addr| addr.to_owned())
+        })
+        .collect();
+    for (action, addrs) in [
+        ("add", addrs.difference(&existing)),
+        ("del", existing.difference(addrs)),
+    ] {
+        for addr in addrs {
+            let mut cmd = Command::new("ip");
+            if v6 {
+                cmd.arg("-6");
+            }
+            cmd.arg("rule")
+                .arg(action)
+                .arg("from")
+                .arg(addr)
+                .arg("fwmark")
+                .arg("0/0xffffffff")
+                .arg("lookup")
+                .arg(&table_str)
+                .arg("priority")
+                .arg(SOURCE_RULE_PRIORITY.to_string())
+                .invoke(ErrorKind::Network)
+                .await
+                .log_err();
+        }
+    }
+}
+
+async fn poll_ip_info(
+    ip4_proxy: &Ip4ConfigProxy<'_>,
+    ip6_proxy: &Ip6ConfigProxy<'_>,
+    dhcp4_proxy: &Option<Dhcp4ConfigProxy<'_>>,
+    policy_guard: &Option<PolicyRoutingGuard>,
+    iface: &GatewayId,
+    echoip_ratelimit_state: &mut BTreeMap<Url, Instant>,
+    db: Option<&TypedPatchDb<Database>>,
+    write_to: &Watch<OrdMap<GatewayId, NetworkInterfaceInfo>>,
+    device_type: Option<NetworkInterfaceType>,
+    name: &InternedString,
+) -> Result<(), Error> {
+    let addresses = ip4_proxy
+        .address_data()
+        .await?
+        .into_iter()
+        .chain(ip6_proxy.address_data().await?)
+        .collect_vec();
+    let lan_ip: OrdSet<IpAddr> = [
+        Some(ip4_proxy.gateway().await?)
+            .filter(|g| !g.is_empty())
+            .and_then(|g| g.parse::<IpAddr>().log_err()),
+        Some(ip6_proxy.gateway().await?)
+            .filter(|g| !g.is_empty())
+            .and_then(|g| g.parse::<IpAddr>().log_err()),
+    ]
+    .into_iter()
+    .filter_map(|a| a)
+    .collect();
+    let mut ntp_servers = OrdSet::new();
+    let mut dns_servers = OrdSet::new();
+    if let Some(dhcp4_proxy) = dhcp4_proxy {
+        let dhcp = dhcp4_proxy.options().await?;
+        if let Some(ntp) = dhcp.ntp_servers {
+            ntp_servers.extend(ntp.split_whitespace().map(InternedString::intern));
+        }
+        if let Some(dns) = dhcp.domain_name_servers {
+            dns_servers.extend(
+                dns.split_ascii_whitespace()
+                    .filter_map(|s| s.parse::<IpAddr>().log_err())
+                    .collect::<Vec<_>>(),
+            );
+        }
+    }
+    // Applied resolvers from the active IP config — the only source for a static
+    // link, e.g. an imported WireGuard config's `DNS =` (NM stores it as
+    // ipv4.dns and surfaces it here); DHCP options miss it entirely.
+    dns_servers.extend(
+        ip4_proxy
+            .nameserver_data()
+            .await?
+            .into_iter()
+            .filter_map(|ns| ns.address.parse::<IpAddr>().log_err()),
+    );
+    dns_servers.extend(
+        ip6_proxy
+            .nameservers()
+            .await?
+            .into_iter()
+            .filter_map(|raw| <[u8; 16]>::try_from(raw).ok())
+            .map(|octets| IpAddr::V6(Ipv6Addr::from(octets))),
+    );
+    let scope_id = if_nametoindex(iface.as_str()).with_kind(ErrorKind::Network)?;
+    let subnets: OrdSet<IpNet> = addresses.into_iter().map(IpNet::try_from).try_collect()?;
+
+    // Policy routing: ensure replies exit the same interface they arrived on,
+    // eliminating the need for MASQUERADE.
+    if let Some(guard) = policy_guard {
+        apply_policy_routing(guard, iface, &lan_ip, &subnets).await?;
+        // v6 has no NAT/SNI-demux reply layer, but this now installs the v6
+        // CONNMARK reply-routing rule (priority 51, IPv4 parity — marks set by
+        // `reconcile_mangle_rules`) alongside readying the interface's v6 table
+        // for the default-outbound catch-all and the per-gateway leak-guard
+        // blackhole (when the interface can't carry v6).
+        apply_policy_routing_v6(guard, iface, device_type, &lan_ip, &subnets).await?;
+    }
+
+    // Write IP info to the watch immediately so the gateway appears in the
+    // DB without waiting for the (slow) WAN IP fetch.  The echoip HTTP
+    // request has a 5-second timeout per URL and is easily cancelled by
+    // D-Bus signals via the Until mechanism, which would prevent the
+    // gateway from ever appearing if we waited.
+    let default_metric = |routes: Vec<RouteData>| {
+        routes
+            .into_iter()
+            .filter(|r| r.prefix == 0 && r.table.unwrap_or(254) == 254)
+            .filter_map(|r| r.metric)
+            .min()
+    };
+    let mut ip_info = IpInfo {
+        default_route_v4: default_metric(ip4_proxy.route_data().await?),
+        default_route_v6: default_metric(ip6_proxy.route_data().await?),
+        name: name.clone(),
+        scope_id,
+        device_type,
+        subnets: subnets.clone(),
+        lan_ip,
+        wan_ip: None,
+        ntp_servers,
+        dns_servers,
+    };
+
+    write_to.send_if_modified(|m: &mut OrdMap<GatewayId, NetworkInterfaceInfo>| {
+        let wireguard_endpoint_domains = m
+            .get(iface)
+            .map(|i| i.wireguard_endpoint_domains.clone())
+            .unwrap_or_default();
+        let mut dns = m.get(iface).map(|i| i.dns.clone()).unwrap_or_default();
+        dns.refresh(Some(&ip_info));
+        let (name, secure, gateway_type, prev_wan_ip, port_map, dns_update) = m.get(iface).map_or(
+            (
+                None,
+                None,
+                Default::default(),
+                None,
+                Default::default(),
+                Default::default(),
+            ),
+            |i| {
+                (
+                    i.name.clone(),
+                    i.secure,
+                    i.gateway_type,
+                    i.ip_info.as_ref().and_then(|i| i.wan_ip),
+                    i.port_map,
+                    i.dns_update,
+                )
+            },
+        );
+        ip_info.wan_ip = prev_wan_ip;
+        let ip_info = Arc::new(ip_info);
+        m.insert(
+            iface.clone(),
+            NetworkInterfaceInfo {
+                wireguard_endpoint_domains,
+                dns,
+                name,
+                secure,
+                ip_info: Some(ip_info.clone()),
+                gateway_type,
+                port_map,
+                dns_update,
+            },
+        )
+        .filter(|old| &old.ip_info == &Some(ip_info))
+        .is_none()
+    });
+
+    // Now fetch the WAN IP in a second pass.  Even if this is slow or
+    // gets cancelled, the gateway already has valid ip_info above.
+    let echoip_urls = if let Some(db) = db {
+        db.peek()
+            .await
+            .as_public()
+            .as_server_info()
+            .as_echoip_urls()
+            .de()
+            .unwrap_or_else(|_| crate::db::model::public::default_echoip_urls())
+    } else {
+        crate::db::model::public::default_echoip_urls()
+    };
+    let mut wan_ip = None;
+    let mut err = None;
+    let local_ipv4 = subnets.iter().find_map(|s| match s.addr() {
+        IpAddr::V4(v4) => Some(v4),
+        _ => None,
+    });
+    let forwardable = !subnets.is_empty()
+        && !matches!(
+            device_type,
+            Some(NetworkInterfaceType::Bridge | NetworkInterfaceType::Loopback)
+        );
+
+    // Capability verdicts collected this poll, written back at the end.
+    let mut probed_caps: Option<GatewayPortMapCapabilities> = None;
+
+    // Ask the gateway's own UPnP IGD first. This works for a home router and
+    // for a StartTunnel gateway, which answers GetExternalIPAddress over the
+    // WireGuard link (see crate::tunnel::forward::igd). Rate-limited like echoip below,
+    // keyed by a sentinel URL in the shared rate-limit map. One SSDP discovery
+    // doubles as the UPnP capability verdict.
+    if let Some(local_ipv4) = local_ipv4.filter(|_| forwardable) {
+        let upnp_probe_key = upnp_probe_key();
+        if echoip_ratelimit_state
+            .get(&upnp_probe_key)
+            .map_or(true, |i| i.elapsed() > Duration::from_secs(300))
+        {
+            echoip_ratelimit_state.insert(upnp_probe_key, Instant::now());
+            match crate::net::port_map::upnp::discover(local_ipv4).await {
+                Ok(upnp_gw) => {
+                    probed_caps
+                        .get_or_insert_with(|| {
+                            write_to
+                                .read()
+                                .get(iface)
+                                .map(|i| i.port_map)
+                                .unwrap_or_default()
+                        })
+                        .upnp = CapabilityVerdict::supported(true);
+                    match crate::net::port_map::upnp::external_ipv4(&upnp_gw).await {
+                        Ok(Some(ip)) => wan_ip = Some(ip),
+                        Ok(None) => (),
+                        Err(e) => {
+                            crate::dev_log!(debug, "UPnP WAN IP probe on {iface} failed: {e}")
+                        }
+                    }
+                }
+                Err(e) => {
+                    probed_caps
+                        .get_or_insert_with(|| {
+                            write_to
+                                .read()
+                                .get(iface)
+                                .map(|i| i.port_map)
+                                .unwrap_or_default()
+                        })
+                        .upnp = CapabilityVerdict::supported(false);
+                    crate::dev_log!(debug, "UPnP WAN IP probe on {iface} failed: {e}");
+                }
+            }
+        }
+    }
+
+    for echoip_url in echoip_urls {
+        if wan_ip.is_some() {
+            break;
+        }
+        if echoip_ratelimit_state
+            .get(&echoip_url)
+            .map_or(true, |i| i.elapsed() > Duration::from_secs(300))
+            && forwardable
+        {
+            let local_ipv4 = local_ipv4.unwrap_or(Ipv4Addr::UNSPECIFIED);
+            match get_wan_ipv4(iface.as_str(), &echoip_url, local_ipv4).await {
+                Ok(a) => {
+                    wan_ip = a;
+                }
+                Err(e) => {
+                    err = Some(e);
+                }
+            };
+            echoip_ratelimit_state.insert(echoip_url, Instant::now());
+            if wan_ip.is_some() {
+                break;
+            }
+        };
+    }
+    if wan_ip.is_none()
+        && let Some(e) = err
+    {
+        tracing::error!(
+            "{}",
+            t!(
+                "net.gateway.failed-to-determine-wan-ip",
+                iface = iface.to_string(),
+                error = e.to_string()
+            )
+        );
+        tracing::debug!("{e:?}");
+    }
+
+    // Update with WAN IP if we obtained one
+    if wan_ip.is_some() {
+        write_to.send_if_modified(|m: &mut OrdMap<GatewayId, NetworkInterfaceInfo>| {
+            let Some(entry) = m.get_mut(iface) else {
+                return false;
+            };
+            let Some(ref existing_ip) = entry.ip_info else {
+                return false;
+            };
+            if existing_ip.wan_ip == wan_ip {
+                return false;
+            }
+            let mut updated = (**existing_ip).clone();
+            updated.wan_ip = wan_ip;
+            entry.ip_info = Some(Arc::new(updated));
+            true
+        });
+    }
+
+    // Probe the interface's candidate port-map gateways for PCP/NAT-PMP (and
+    // the Start9 HOSTNAME marker), but only once any of those verdicts has
+    // gone stale — a fresh verdict is trusted, so a healthy gateway is
+    // re-probed hourly and a refusing one every five minutes (the TTLs in
+    // `CapabilityVerdict::fresh`), never per mapping attempt.
+    {
+        let now = Utc::now();
+        let caps_now = write_to
+            .read()
+            .get(iface)
+            .map(|i| i.port_map)
+            .unwrap_or_default();
+        let stale = caps_now.pcp.fresh(now).is_none()
+            || caps_now.pcp_hostname.fresh(now).is_none()
+            || caps_now.nat_pmp.fresh(now).is_none();
+        let candidates = write_to
+            .read()
+            .get(iface)
+            .map(|info| candidate_gateways(info))
+            .unwrap_or_default();
+        if stale && forwardable && !candidates.is_empty() {
+            let pcp_probe_key = pcp_probe_key();
+            if echoip_ratelimit_state
+                .get(&pcp_probe_key)
+                .map_or(true, |i| i.elapsed() > Duration::from_secs(300))
+            {
+                let local_v6 = subnets.iter().find_map(|s| match s.addr() {
+                    IpAddr::V6(v6) if !ipv6_is_link_local(v6) => Some(v6),
+                    _ => None,
+                });
+                let mut pcp = false;
+                let mut pcp_hostname = false;
+                let mut nat_pmp = false;
+                for (gw, scope_id) in candidates {
+                    let local = match gw {
+                        IpAddr::V4(_) => local_ipv4.map(IpAddr::V4),
+                        IpAddr::V6(_) => local_v6.map(IpAddr::V6),
+                    };
+                    let Some(local) = local else {
+                        continue;
+                    };
+                    let probe = probe::probe_gateway(local, gw, scope_id).await;
+                    pcp |= probe.pcp;
+                    pcp_hostname |= probe.pcp_hostname;
+                    nat_pmp |= probe.nat_pmp;
+                }
+                echoip_ratelimit_state.insert(pcp_probe_key, Instant::now());
+                let caps = probed_caps.get_or_insert(caps_now);
+                caps.pcp = CapabilityVerdict::supported(pcp);
+                caps.pcp_hostname = CapabilityVerdict::supported(pcp_hostname);
+                caps.nat_pmp = CapabilityVerdict::supported(nat_pmp);
+            }
+        }
+    }
+
+    if let Some(caps) = probed_caps {
+        write_to.send_if_modified(|m: &mut OrdMap<GatewayId, NetworkInterfaceInfo>| {
+            let Some(entry) = m.get_mut(iface) else {
+                return false;
+            };
+            if entry.port_map == caps {
+                return false;
+            }
+            entry.port_map = caps;
+            true
+        });
+    }
+
+    Ok(())
+}
+
+#[instrument(skip(_connection, device_proxy, watch_activation))]
+async fn watch_activated(
+    _connection: &Connection,
+    device_proxy: device::DeviceProxy<'_>,
+    iface: GatewayId,
+    watch_activation: &Watch<BTreeMap<GatewayId, bool>>,
+) -> Result<(), Error> {
+    let mut until = Until::new()
+        .with_stream(
+            device_proxy
+                .receive_active_connection_changed()
+                .await
+                .stub(),
+        )
+        .with_stream(
+            device_proxy
+                .receive_state_changed()
+                .await?
+                .into_inner()
+                .stub(),
+        );
+
+    loop {
+        until
+            .run(async {
+                let activated = device_proxy._state().await? == 100;
+                watch_activation.send_if_modified(|a| {
+                    a.get_mut(&iface)
+                        .map_or(false, |a| std::mem::replace(a, activated) != activated)
+                });
+                Ok(())
+            })
+            .await?;
+    }
+}
+
+pub struct NetworkInterfaceWatcher {
+    activated: Watch<BTreeMap<GatewayId, bool>>,
+    ip_info: Watch<OrdMap<GatewayId, NetworkInterfaceInfo>>,
+    _watcher: NonDetachingJoinHandle<()>,
+}
+impl NetworkInterfaceWatcher {
+    pub fn new(
+        seed: impl Future<Output = OrdMap<GatewayId, NetworkInterfaceInfo>> + Send + Sync + 'static,
+        watch_activated: impl IntoIterator<Item = GatewayId>,
+        db: TypedPatchDb<Database>,
+    ) -> Self {
+        let ip_info = Watch::new(OrdMap::new());
+        let activated = Watch::new(watch_activated.into_iter().map(|k| (k, false)).collect());
+        Self {
+            activated: activated.clone(),
+            ip_info: ip_info.clone(),
+            _watcher: tokio::spawn(async move {
+                let seed = seed.await;
+                if !seed.is_empty() {
+                    ip_info.send_replace(seed);
+                }
+                watcher(ip_info, activated, Some(db)).await
+            })
+            .into(),
+        }
+    }
+
+    pub fn activated(&self) -> Watch<BTreeMap<GatewayId, bool>> {
+        self.activated.clone_unseen()
+    }
+
+    pub fn wait_for_activated(
+        &self,
+        interface: GatewayId,
+    ) -> impl Future<Output = ()> + Send + Sync + 'static {
+        let mut activated = self.activated();
+        async move {
+            activated
+                .wait_for(|a| a.get(&interface).copied().unwrap_or(false))
+                .await;
+        }
+    }
+
+    pub fn subscribe(&self) -> Watch<OrdMap<GatewayId, NetworkInterfaceInfo>> {
+        self.ip_info.clone_unseen()
+    }
+
+    pub fn ip_info(&self) -> OrdMap<GatewayId, NetworkInterfaceInfo> {
+        self.ip_info.read()
+    }
+}
+
+const SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+pub struct NetworkInterfaceController {
+    pub(crate) db: TypedPatchDb<Database>,
+    pub watcher: NetworkInterfaceWatcher,
+    synced: Watch<OrdMap<GatewayId, NetworkInterfaceInfo>>,
+    _sync: NonDetachingJoinHandle<()>,
+}
+impl NetworkInterfaceController {
+    #[cfg(test)]
+    pub(crate) fn with_test_interfaces(
+        db: TypedPatchDb<Database>,
+        interfaces: Watch<OrdMap<GatewayId, NetworkInterfaceInfo>>,
+    ) -> Self {
+        Self {
+            db,
+            watcher: NetworkInterfaceWatcher {
+                activated: Watch::new(BTreeMap::new()),
+                ip_info: interfaces,
+                _watcher: tokio::spawn(async {}).into(),
+            },
+            synced: Watch::new(OrdMap::new()),
+            _sync: tokio::spawn(async {}).into(),
+        }
+    }
+
+    /// Returns once the database lists every connection NetworkManager activated at startup.
+    pub async fn settle(&self) {
+        match tokio::time::timeout(SETTLE_TIMEOUT, self.settled()).await {
+            Ok(res) => {
+                res.log_err();
+            }
+            Err(_) => tracing::warn!("{}", t!("net.gateway.network-settle-timeout")),
+        }
+    }
+
+    async fn settled(&self) -> Result<(), Error> {
+        let connection = Connection::system().await?;
+        let netman_proxy = NetworkManagerProxy::new(&connection).await?;
+        let mut startup_changed = netman_proxy.receive_startup_changed().await;
+        while netman_proxy.startup().await? {
+            startup_changed.next().await;
+        }
+
+        let mut connected = BTreeSet::new();
+        for device in netman_proxy.all_devices().await? {
+            let device_proxy = DeviceProxy::new(&connection, device).await?;
+            let iface = device_proxy.ip_interface().await?;
+            if !iface.is_empty()
+                && device_proxy.managed().await?
+                && &*device_proxy.active_connection().await? != "/"
+            {
+                connected.insert(GatewayId::from(InternedString::intern(iface)));
+            }
+        }
+
+        self.synced
+            .clone()
+            .wait_for(|synced| {
+                connected
+                    .iter()
+                    .all(|iface| synced.get(iface).is_some_and(|i| i.ip_info.is_some()))
+            })
+            .await;
+        Ok(())
+    }
+
+    async fn sync(
+        db: &TypedPatchDb<Database>,
+        info: &OrdMap<GatewayId, NetworkInterfaceInfo>,
+    ) -> Result<(), Error> {
+        crate::dev_log!(debug, "syncronizing {info:?} to db");
+
+        let wifi_iface = find_wifi_iface()
+            .await
+            .ok()
+            .and_then(|a| a)
+            .map(InternedString::from)
+            .map(GatewayId::from);
+
+        db.mutate(|db| {
+            let network = db.as_public_mut().as_server_info_mut().as_network_mut();
+            network.as_gateways_mut().ser(info)?;
+            network.as_wifi_mut().as_interface_mut().ser(&wifi_iface)?;
+            let hostname = crate::hostname::ServerHostname::load(db.as_public().as_server_info())?;
+            let ports = db.as_private().as_available_ports().de()?;
+            for host in all_hosts(db) {
+                host?.update_addresses(&hostname, info, &ports)?;
+            }
+            Ok(())
+        })
+        .await
+        .result?;
+
+        let ntp: BTreeSet<_> = info
+            .values()
+            .filter_map(|i| i.ip_info.as_ref())
+            .flat_map(|i| &i.ntp_servers)
+            .cloned()
+            .collect();
+        let prev_ntp = tokio_stream::wrappers::LinesStream::new(
+            BufReader::new(open_file("/etc/systemd/timesyncd.conf").await?).lines(),
+        )
+        .try_filter_map(|l| async move {
+            Ok(l.strip_prefix("NTP=").map(|s| {
+                s.split_whitespace()
+                    .map(InternedString::intern)
+                    .collect::<BTreeSet<_>>()
+            }))
+        })
+        .boxed()
+        .try_next()
+        .await?
+        .unwrap_or_default();
+        if ntp != prev_ntp {
+            // sed -i '/\(^\|#\)NTP=/c\NTP='"${servers}" /etc/systemd/timesyncd.conf
+            Command::new("sed")
+                .arg("-i")
+                .arg(
+                    [r#"/\(^\|#\)NTP=/c\NTP="#]
+                        .into_iter()
+                        .chain(Itertools::intersperse(
+                            {
+                                fn to_str(ntp: &InternedString) -> &str {
+                                    &*ntp
+                                }
+                                ntp.iter().map(to_str)
+                            },
+                            " ",
+                        ))
+                        .join(""),
+                )
+                .arg("/etc/systemd/timesyncd.conf")
+                .invoke(ErrorKind::Filesystem)
+                .await?;
+            Command::new("systemctl")
+                .arg("restart")
+                .arg("systemd-timesyncd")
+                .invoke(ErrorKind::Systemd)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn apply_default_outbound(
+        default_outbound: &Option<GatewayId>,
+        ip_info: &OrdMap<GatewayId, NetworkInterfaceInfo>,
+    ) {
+        let existing = snapshot_outbound_rules(false).await;
+        let existing_v6 = snapshot_outbound_rules(true).await;
+        let mut desired = OutboundRules::default();
+
+        if let Some(gw_id) = default_outbound {
+            desired.reject = true;
+            match ip_info.get(gw_id) {
+                Some(info) if info.ip_info.is_some() => {}
+                Some(_) => tracing::warn!("default outbound gateway {gw_id} is not connected"),
+                None => tracing::warn!("default outbound gateway {gw_id} not found in ip_info"),
+            }
+
+            match if_nametoindex(gw_id.as_str()) {
+                Ok(idx) => {
+                    desired.gateway_tables.insert(gateway_table_id(idx));
+                }
+                Err(e) => {
+                    tracing::error!("failed to get ifindex for {gw_id}: {e}");
+                }
+            }
+
+            // WireGuard transport packets must reach `main` to restore a tunnel.
+            for (iface_id, iface_info) in ip_info {
+                let Some(ref ip) = iface_info.ip_info else {
+                    continue;
+                };
+                if ip.device_type != Some(NetworkInterfaceType::Wireguard) {
+                    continue;
+                }
+                match Command::new("wg")
+                    .arg("show")
+                    .arg(iface_id.as_str())
+                    .arg("fwmark")
+                    .invoke(ErrorKind::Network)
+                    .await
+                {
+                    Ok(output) => {
+                        let fwmark_hex = String::from_utf8_lossy(&output).trim().to_owned();
+                        if fwmark_hex.is_empty() || fwmark_hex == "off" {
+                            continue;
+                        }
+                        match u32::from_str_radix(
+                            fwmark_hex.strip_prefix("0x").unwrap_or(&fwmark_hex),
+                            16,
+                        ) {
+                            Ok(fwmark) => {
+                                desired.wireguard_fwmarks.insert(fwmark);
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    "failed to parse WireGuard fwmark '{fwmark_hex}' for {iface_id}: {e}"
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("failed to read WireGuard fwmark for {iface_id}: {e}");
+                    }
+                }
+            }
+        }
+
+        // Marking starts before the selection's rules exist and stops after they are gone.
+        let selected = default_outbound.is_some();
+        if selected {
+            reconcile_local_outbound_mark(true).await.log_err();
+        }
+        reconcile_outbound_rules(false, &existing, &desired).await;
+        reconcile_outbound_rules(true, &existing_v6, &desired).await;
+        if !selected {
+            reconcile_local_outbound_mark(false).await.log_err();
+        }
+    }
+
+    pub fn new(db: TypedPatchDb<Database>) -> Self {
+        let (seeded_send, seeded) = oneshot::channel();
+        let watcher = NetworkInterfaceWatcher::new(
+            {
+                let db = db.clone();
+                async move {
+                    let info = match db
+                        .peek()
+                        .await
+                        .as_public()
+                        .as_server_info()
+                        .as_network()
+                        .as_gateways()
+                        .de()
+                    {
+                        Ok(mut info) => {
+                            for (_, info) in OrdMapIterMut::from(&mut info) {
+                                info.ip_info = None;
+                                info.dns.refresh(None);
+                            }
+                            info
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "{}",
+                                t!(
+                                    "net.gateway.error-loading-interface-info",
+                                    error = e.to_string()
+                                )
+                            );
+                            tracing::debug!("{e:?}");
+                            OrdMap::new()
+                        }
+                    };
+                    let _ = seeded_send.send(info.clone());
+                    info
+                }
+            },
+            [InternedString::from_static(START9_BRIDGE_IFACE).into()],
+            db.clone(),
+        );
+        let mut ip_info_watch = watcher.subscribe();
+        ip_info_watch.mark_seen();
+        let synced = Watch::new(OrdMap::new());
+        Self {
+            db: db.clone(),
+            watcher,
+            synced: synced.clone(),
+            _sync: tokio::spawn(async move {
+                let res: Result<(), Error> = async {
+                    let mut ip_info = seeded.await.ok();
+                    let mut outbound_sub = db
+                        .subscribe(
+                            "/public/serverInfo/network/defaultOutbound"
+                                .parse::<JsonPointer<_, _>>()
+                                .unwrap(),
+                        )
+                        .await;
+                    loop {
+                        if let Err(e) = async {
+                            if let Some(ref ip_info) = ip_info {
+                                Self::sync(&db, ip_info).boxed().await?;
+                                synced.send(ip_info.clone());
+                            }
+                            if let Some(ref ip_info) = ip_info {
+                                let default_outbound: Option<GatewayId> = db
+                                    .peek()
+                                    .await
+                                    .as_public()
+                                    .as_server_info()
+                                    .as_network()
+                                    .as_default_outbound()
+                                    .de()?;
+                                Self::apply_default_outbound(&default_outbound, ip_info).await;
+                            }
+
+                            Ok::<_, Error>(())
+                        }
+                        .await
+                        {
+                            tracing::error!(
+                                "{}",
+                                t!("net.gateway.error-syncing-ip-info", error = e.to_string())
+                            );
+                            tracing::debug!("{e:?}");
+                        }
+
+                        tokio::select! {
+                            _ = ip_info_watch.changed() => {
+                                ip_info = Some(ip_info_watch.read());
+                            }
+                            _ = outbound_sub.recv() => {}
+                        }
+                    }
+                }
+                .await;
+                if let Err(e) = res {
+                    tracing::error!(
+                        "{}",
+                        t!("net.gateway.error-syncing-ip-info", error = e.to_string())
+                    );
+                    tracing::debug!("{e:?}");
+                }
+            })
+            .into(),
+        }
+    }
+
+    pub async fn forget(&self, interface: &GatewayId) -> Result<(), Error> {
+        let mut gateways = self
+            .db
+            .watch(
+                "/public/serverInfo/network/gateways"
+                    .parse::<JsonPointer>()
+                    .with_kind(ErrorKind::Database)?,
+            )
+            .await
+            .typed::<OrdMap<GatewayId, NetworkInterfaceInfo>>();
+        let mut err = None;
+        let changed = self.watcher.ip_info.send_if_modified(|ip_info| {
+            if ip_info
+                .get(interface)
+                .map_or(false, |i| i.ip_info.is_some())
+            {
+                err = Some(Error::new(
+                    eyre!("{}", t!("net.gateway.cannot-forget-connected-interface")),
+                    ErrorKind::InvalidRequest,
+                ));
+                return false;
+            }
+            ip_info.remove(interface).is_some()
+        });
+        if let Some(e) = err {
+            return Err(e);
+        }
+        if changed {
+            gateways
+                .wait_for(|gateways| !gateways.contains_key(interface))
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn delete_iface(&self, interface: &GatewayId) -> Result<(), Error> {
+        let Some(has_ip_info) = self
+            .watcher
+            .ip_info
+            .peek(|ifaces| ifaces.get(interface).map(|i| i.ip_info.is_some()))
+        else {
+            return self.forget(interface).await;
+        };
+
+        if has_ip_info {
+            let mut ip_info = self.watcher.ip_info.clone_unseen();
+
+            let connection = Connection::system().await?;
+
+            let netman_proxy = NetworkManagerProxy::new(&connection).await?;
+
+            let device = Some(
+                netman_proxy
+                    .get_device_by_ip_iface(interface.as_str())
+                    .await?,
+            )
+            .filter(|o| &**o != "/")
+            .or_not_found(lazy_format!("{interface} in NetworkManager"))?;
+
+            let device_proxy = DeviceProxy::new(&connection, device).await?;
+
+            let ac = device_proxy.active_connection().await?;
+
+            if &*ac == "/" {
+                return Err(Error::new(
+                    eyre!("{}", t!("net.gateway.cannot-delete-without-connection")),
+                    ErrorKind::InvalidRequest,
+                ));
+            }
+
+            let ac_proxy = active_connection::ActiveConnectionProxy::new(&connection, ac).await?;
+
+            let settings =
+                ConnectionSettingsProxy::new(&connection, ac_proxy.connection().await?).await?;
+
+            settings.delete().await?;
+
+            ip_info
+                .wait_for(|ifaces| ifaces.get(interface).map_or(true, |i| i.ip_info.is_none()))
+                .await;
+        }
+
+        self.forget(interface).await?;
+
+        Ok(())
+    }
+
+    pub async fn set_dns(
+        &self,
+        interface: &GatewayId,
+        servers: Option<std::collections::VecDeque<SocketAddr>>,
+    ) -> Result<(), Error> {
+        self.update_intent(interface, None, Some(servers)).await
+    }
+
+    pub async fn set_name(&self, interface: &GatewayId, name: InternedString) -> Result<(), Error> {
+        self.update_intent(interface, Some(name), None).await
+    }
+
+    async fn edit(&self, params: EditGatewayParams) -> Result<(), Error> {
+        let dns = validate_dns_update(params.dns, &self.watcher.ip_info())?;
+        self.update_intent(&params.id, params.name, dns).await
+    }
+
+    async fn update_intent(
+        &self,
+        interface: &GatewayId,
+        name: Option<InternedString>,
+        dns: Option<Option<std::collections::VecDeque<SocketAddr>>>,
+    ) -> Result<(), Error> {
+        let mut watch = self
+            .db
+            .watch(
+                "/public/serverInfo/network/gateways"
+                    .parse::<JsonPointer>()
+                    .unwrap()
+                    .join_end(interface.as_str()),
+            )
+            .await
+            .typed::<Option<NetworkInterfaceInfo>>();
+        let mut expected = None;
+        self.watcher.ip_info.send_if_modified(|interfaces| {
+            let Some(info) = interfaces.get_mut(interface) else {
+                return false;
+            };
+            if let Some(name) = &name {
+                info.name = Some(name.clone());
+            }
+            if let Some(dns) = &dns {
+                info.dns.static_servers = dns.clone();
+                info.dns.refresh(info.ip_info.as_deref());
+            }
+            expected = Some((name, dns));
+            true
+        });
+        let (name, dns) = expected.or_not_found(lazy_format!("gateway {interface}"))?;
+        watch
+            .wait_for(|info| {
+                info.as_ref().is_some_and(|info| {
+                    name.as_ref()
+                        .is_none_or(|name| info.name.as_ref() == Some(name))
+                        && dns
+                            .as_ref()
+                            .is_none_or(|dns| &info.dns.static_servers == dns)
+                })
+            })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_secure(
+        &self,
+        interface: &GatewayId,
+        secure: Option<bool>,
+    ) -> Result<(), Error> {
+        let mut watch = self
+            .db
+            .watch(
+                "/public/serverInfo/network/gateways"
+                    .parse::<JsonPointer>()
+                    .with_kind(ErrorKind::Database)?
+                    .join_end(interface.as_str())
+                    .join_end("secure"),
+            )
+            .await
+            .typed::<Option<bool>>();
+        let mut err = None;
+        self.watcher.ip_info.send_if_modified(|ip_info| {
+            let info = match ip_info.get_mut(interface).or_not_found(interface) {
+                Ok(info) => info,
+                Err(e) => {
+                    err = Some(e);
+                    return false;
+                }
+            };
+            if secure == Some(false) {
+                // `ip_info` is cleared on every boot and whenever NetworkManager
+                // drops the device, so an unknown device type has to fail closed
+                // or lxcbr0 can be marked insecure through a restart window.
+                if info.ip_info.is_none() {
+                    err = Some(Error::new(
+                        eyre!("{}", t!("net.gateway.cannot-mark-disconnected-insecure")),
+                        ErrorKind::InvalidRequest,
+                    ));
+                    return false;
+                }
+                if info.is_intrinsically_secure() {
+                    err = Some(Error::new(
+                        eyre!("{}", t!("net.gateway.cannot-mark-internal-insecure")),
+                        ErrorKind::InvalidRequest,
+                    ));
+                    return false;
+                }
+            }
+            std::mem::replace(&mut info.secure, secure) != secure
+        });
+        if let Some(e) = err {
+            return Err(e);
+        }
+        watch.wait_for(|persisted| *persisted == secure).await?;
+
+        Ok(())
+    }
+}
+
+pub fn lookup_info_by_addr(
+    ip_info: &OrdMap<GatewayId, NetworkInterfaceInfo>,
+    addr: SocketAddr,
+) -> Option<(&GatewayId, &NetworkInterfaceInfo)> {
+    // IPv4 clients arrive mapped through the dual-stack listener.
+    let ip = addr.ip().to_canonical();
+    ip_info.iter().find(|(_, i)| {
+        i.ip_info
+            .as_ref()
+            .map_or(false, |i| i.subnets.iter().any(|i| i.addr() == ip))
+    })
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, VisitFields)]
+#[visit(ts(rename = "NetworkGatewayInfo"))]
+pub struct GatewayInfo {
+    pub id: GatewayId,
+    pub info: NetworkInterfaceInfo,
+}
+
+rpc_toolkit::reflect_ts!(GatewayInfo);
+
+impl<V: MetadataVisitor> Visit<V> for GatewayInfo {
+    fn visit(&self, visitor: &mut V) -> <V as visit_rs::Visitor>::Result {
+        visitor.visit(self)
+    }
+}
+
+/// Metadata for connections accepted by WildcardListener or VHostBindListener.
+#[derive(Clone, Debug, VisitFields)]
+pub struct NetworkInterfaceListenerAcceptMetadata {
+    pub inner: TcpMetadata,
+    pub info: GatewayInfo,
+}
+impl<V: MetadataVisitor> Visit<V> for NetworkInterfaceListenerAcceptMetadata {
+    fn visit(&self, visitor: &mut V) -> V::Result {
+        self.visit_fields(visitor).collect()
+    }
+}
+
+/// Accepts wildcard TCP connections with their matching `GatewayInfo`.
+pub struct WildcardListener {
+    listener: TcpListener,
+    ip_info: Watch<OrdMap<GatewayId, NetworkInterfaceInfo>>,
+    /// Handle to the self-contained watcher task started in `new()`.
+    /// Dropped (and thus aborted) when `set_ip_info` replaces the ip_info source.
+    _watcher: Option<NonDetachingJoinHandle<()>>,
+}
+impl WildcardListener {
+    pub fn new(port: u16) -> Result<Self, Error> {
+        let listener = TcpListener::from_std(
+            bind_mio_listener(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port))
+                .with_kind(ErrorKind::Network)?
+                .into(),
+        )
+        .with_kind(ErrorKind::Network)?;
+        let ip_info = Watch::new(OrdMap::new());
+        let watcher_handle =
+            tokio::spawn(watcher(ip_info.clone(), Watch::new(BTreeMap::new()), None)).into();
+        Ok(Self {
+            listener,
+            ip_info,
+            _watcher: Some(watcher_handle),
+        })
+    }
+
+    pub(crate) fn subscribe(&self) -> Watch<OrdMap<GatewayId, NetworkInterfaceInfo>> {
+        self.ip_info.clone_unseen()
+    }
+
+    /// Replace the ip_info source with the one from the NetworkInterfaceController.
+    /// Aborts the self-contained watcher task.
+    pub fn set_ip_info(&mut self, ip_info: Watch<OrdMap<GatewayId, NetworkInterfaceInfo>>) {
+        self.ip_info = ip_info;
+        self._watcher = None;
+    }
+}
+impl Accept for WildcardListener {
+    type Metadata = NetworkInterfaceListenerAcceptMetadata;
+    fn poll_accept(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<(Self::Metadata, AcceptStream), Error>> {
+        if let Poll::Ready((stream, peer_addr)) = TcpListener::poll_accept(&self.listener, cx)? {
+            if let Err(e) = socket2::SockRef::from(&stream)
+                .set_tcp_keepalive(&crate::net::utils::default_keepalive())
+            {
+                tracing::error!("Failed to set tcp keepalive: {e}");
+                tracing::debug!("{e:?}");
+            }
+            let local_addr = stream.local_addr()?;
+            let info = self
+                .ip_info
+                .peek(|ip_info| {
+                    lookup_info_by_addr(ip_info, local_addr).map(|(id, info)| GatewayInfo {
+                        id: id.clone(),
+                        info: info.clone(),
+                    })
+                })
+                .unwrap_or_else(|| GatewayInfo {
+                    id: InternedString::from_static("").into(),
+                    info: NetworkInterfaceInfo::default(),
+                });
+            return Poll::Ready(Ok((
+                NetworkInterfaceListenerAcceptMetadata {
+                    inner: TcpMetadata {
+                        local_addr,
+                        peer_addr,
+                    },
+                    info,
+                },
+                Box::pin(stream),
+            )));
+        }
+        Poll::Pending
+    }
+}
+
+#[cfg(test)]
+mod policy_rule_tests {
+    use super::*;
+
+    #[test]
+    fn main_suppress_rule_requires_the_unrestricted_rule() {
+        assert!(main_suppress_rule(
+            "50: from all lookup main suppress_prefixlength 0"
+        ));
+        assert!(!main_suppress_rule(
+            "50: from 192.0.2.1 lookup main suppress_prefixlength 0"
+        ));
+        assert!(!main_suppress_rule(
+            "50: from all fwmark 0x3e9 lookup main suppress_prefixlength 0"
+        ));
+    }
+
+    #[test]
+    fn outbound_snapshot_includes_the_fail_closed_rule() {
+        let rules = parse_outbound_rules(
+            "74: from all fwmark 0xca6c lookup main\n\
+             75: from all lookup 1004\n\
+             76: from all unreachable\n\
+             32766: from all lookup main\n",
+        );
+        assert_eq!(rules.wireguard_fwmarks, [0xca6c].into_iter().collect());
+        assert_eq!(rules.gateway_tables, [1004].into_iter().collect());
+        assert!(rules.reject);
+        assert!(!parse_outbound_rules("76: from 10.0.3.5 unreachable\n").reject);
+    }
+
+    #[test]
+    fn outranking_reply_rule_requires_the_global_destination() {
+        assert!(outranking_reply_rule(
+            "48:\tfrom all to 2000::/3 fwmark 0x3eb lookup 1003",
+            1003
+        ));
+        assert!(!outranking_reply_rule(
+            "48:\tfrom all fwmark 0x3eb lookup 1003",
+            1003
+        ));
+        assert!(!outranking_reply_rule(
+            "51:\tfrom all to 2000::/3 fwmark 0x3eb lookup 1003",
+            1003
+        ));
+        assert!(!outranking_reply_rule(
+            "48:\tfrom all to 2000::/3 fwmark 0x3ec lookup 1004",
+            1003
+        ));
+    }
+}
+
+#[cfg(test)]
+mod lookup_tests {
+    use super::*;
+
+    fn gateway_holding(addr: &str) -> OrdMap<GatewayId, NetworkInterfaceInfo> {
+        let mut ip_info = crate::db::model::public::IpInfo::default();
+        ip_info.subnets.insert(addr.parse().unwrap());
+        [(
+            GatewayId::from(InternedString::from_static("eth0")),
+            NetworkInterfaceInfo {
+                ip_info: Some(std::sync::Arc::new(ip_info)),
+                ..Default::default()
+            },
+        )]
+        .into_iter()
+        .collect()
+    }
+
+    #[test]
+    fn an_ipv4_mapped_local_address_finds_its_gateway() {
+        let ip_info = gateway_holding("192.168.1.5/24");
+        let mapped: SocketAddr = "[::ffff:192.168.1.5]:80".parse().unwrap();
+        assert_eq!(
+            lookup_info_by_addr(&ip_info, mapped).map(|(id, _)| id.as_str()),
+            Some("eth0")
+        );
+    }
+
+    #[test]
+    fn another_address_in_the_same_subnet_finds_nothing() {
+        let ip_info = gateway_holding("192.168.1.5/24");
+        let neighbour: SocketAddr = "192.168.1.99:80".parse().unwrap();
+        assert!(lookup_info_by_addr(&ip_info, neighbour).is_none());
+    }
+
+    #[test]
+    fn a_native_ipv6_address_finds_its_gateway() {
+        let ip_info = gateway_holding("fd00::1/64");
+        let native: SocketAddr = "[fd00::1]:80".parse().unwrap();
+        assert_eq!(
+            lookup_info_by_addr(&ip_info, native).map(|(id, _)| id.as_str()),
+            Some("eth0")
+        );
+    }
+
+    #[test]
+    fn an_ipv4_compatible_address_is_left_alone() {
+        let ip_info = gateway_holding("192.168.1.5/24");
+        let compatible: SocketAddr = "[::192.168.1.5]:80".parse().unwrap();
+        assert!(lookup_info_by_addr(&ip_info, compatible).is_none());
+    }
+}
+
+#[cfg(test)]
+mod echoip_http_tests {
+    use std::future::{Ready, ready};
+    use std::task::{Context, Poll};
+
+    use hyper_util::client::legacy::Client;
+    use hyper_util::client::legacy::connect::HttpConnector;
+    use hyper_util::client::legacy::connect::dns::Name;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tower_service::Service;
+
+    use super::*;
+
+    async fn echoip_server(responses: Vec<(String, String)>) -> (Url, NonDetachingJoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let url = Url::parse(&format!("http://{}/ip", listener.local_addr().unwrap())).unwrap();
+        let server = tokio::spawn(async move {
+            for (path, response) in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(stream.read_u8().await.unwrap());
+                }
+                assert!(
+                    String::from_utf8(request)
+                        .unwrap()
+                        .starts_with(&format!("GET {path} HTTP/1.1\r\n"))
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        (url, server.into())
+    }
+
+    #[tokio::test]
+    async fn follows_echoip_redirects() {
+        let mut responses = Vec::new();
+        let mut path = "/ip".to_owned();
+        for status in [301, 302, 303, 307, 308] {
+            let next = format!("/redirected?status={status}");
+            responses.push((
+                path,
+                format!("HTTP/1.1 {status} Redirect\r\nLocation: {next}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
+            ));
+            path = next;
+        }
+        responses.push((
+            path,
+            "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\n8.8.8.8\n".into(),
+        ));
+        let (url, server) = echoip_server(responses).await;
+        let client = Client::builder(hyper_util::rt::TokioExecutor::new()).build_http();
+        let text = tokio::time::timeout(Duration::from_secs(5), get_echoip_response(&client, &url))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(text, "8.8.8.8\n");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bounds_echoip_redirects_and_rejects_http_errors() {
+        let (url, server) = echoip_server(vec![(
+            "/ip".into(),
+            "HTTP/1.1 302 Found\r\nLocation: /ip\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+        ); 11]).await;
+        let client = Client::builder(hyper_util::rt::TokioExecutor::new()).build_http();
+        let error =
+            tokio::time::timeout(Duration::from_secs(5), get_echoip_response(&client, &url))
+                .await
+                .unwrap()
+                .unwrap_err();
+        assert!(error.to_string().contains("too many echoip redirects"));
+        server.await.unwrap();
+
+        let (url, server) = echoip_server(vec![(
+            "/ip".into(),
+            "HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+        )])
+        .await;
+        let error = get_echoip_response(&client, &url).await.unwrap_err();
+        assert!(error.to_string().contains("503"));
+        server.await.unwrap();
+    }
+
+    #[derive(Clone)]
+    struct MultipleAddresses;
+
+    impl Service<Name> for MultipleAddresses {
+        type Response = std::vec::IntoIter<SocketAddr>;
+        type Error = std::io::Error;
+        type Future = Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _: Name) -> Self::Future {
+            ready(Ok(vec![
+                "127.0.0.2:0".parse().unwrap(),
+                "127.0.0.1:0".parse().unwrap(),
+            ]
+            .into_iter()))
+        }
+    }
+
+    #[tokio::test]
+    async fn retries_echoip_dns_addresses() {
+        let (mut url, server) = echoip_server(vec![(
+            "/ip".into(),
+            "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\n8.8.8.8\n".into(),
+        )])
+        .await;
+        url.set_host(Some("echoip.test")).unwrap();
+        let mut connector = HttpConnector::new_with_resolver(MultipleAddresses);
+        connector.set_local_address(Some(Ipv4Addr::LOCALHOST.into()));
+        let client = Client::builder(hyper_util::rt::TokioExecutor::new()).build(connector);
+        let text = tokio::time::timeout(Duration::from_secs(5), get_echoip_response(&client, &url))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(text, "8.8.8.8\n");
+        server.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod parse_echoip_tests {
+    use super::*;
+
+    #[test]
+    fn an_unroutable_echoip_answer_is_no_wan_address() {
+        for text in [
+            "0.0.0.0",
+            "255.255.255.255",
+            "100.100.1.5",
+            "192.0.2.1",
+            "192.168.1.10",
+        ] {
+            assert_eq!(parse_echoip(text).unwrap(), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_routable_echoip_answer_is_the_wan_address() {
+        assert_eq!(
+            parse_echoip(" 8.8.8.8\n").unwrap(),
+            Some(Ipv4Addr::new(8, 8, 8, 8))
+        );
+    }
+
+    #[test]
+    fn an_empty_echoip_answer_is_no_wan_address() {
+        assert_eq!(parse_echoip("\n").unwrap(), None);
+    }
+
+    #[test]
+    fn a_malformed_echoip_answer_is_an_error() {
+        assert!(parse_echoip("<html>oops</html>").is_err());
+    }
+}
+
+#[cfg(test)]
+mod carries_v6_tests {
+    use super::*;
+
+    fn v6(s: &str) -> Ipv6Addr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn a_router_without_an_address_of_our_own_carries_nothing() {
+        assert!(!carries_v6(Some(v6("fe80::1")), [v6("fe80::2")]));
+    }
+
+    #[test]
+    fn a_router_with_a_ula_address_carries_v6() {
+        assert!(carries_v6(
+            Some(v6("fe80::1")),
+            [v6("fe80::2"), v6("fd00:0:104:1::5")]
+        ));
+    }
+
+    #[test]
+    fn a_global_address_without_a_router_carries_v6() {
+        assert!(carries_v6(None, [v6("2001:db8::5")]));
+    }
+
+    #[test]
+    fn a_ula_address_without_a_router_carries_nothing() {
+        assert!(!carries_v6(None, [v6("fd00::5")]));
+    }
+}
+
+#[cfg(test)]
+mod dns_config_tests {
+    use super::*;
+
+    async fn policy_fixture() -> (
+        tempfile::TempDir,
+        TypedPatchDb<Database>,
+        OrdMap<GatewayId, NetworkInterfaceInfo>,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let db = TypedPatchDb::<Database>::load_unchecked(
+            patch_db::PatchDb::open(temp.path().join("db"))
+                .await
+                .unwrap(),
+        );
+        db.put(&patch_db::json_ptr::ROOT, &imbl_value::json!({"public": {
+            "serverInfo": {"network": {"defaultOutbound": "eth0", "outboundDns": ["192.0.2.53:53"]}},
+            "packageData": {"pkg": {"outboundGateway": "eth0", "outboundDns": ["192.0.2.53:53"]}}
+        }})).await.unwrap();
+        let interfaces = ["eth0", "wg0"]
+            .into_iter()
+            .map(|id| {
+                (
+                    id.parse::<GatewayId>().unwrap(),
+                    NetworkInterfaceInfo {
+                        ip_info: Some(Arc::new(IpInfo {
+                            subnets: [
+                                "192.0.2.10/24".parse::<IpNet>().unwrap(),
+                                "2001:db8::10/64".parse::<IpNet>().unwrap(),
+                            ]
+                            .into_iter()
+                            .collect(),
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        (temp, db, interfaces)
+    }
+
+    async fn save_both(
+        db: &TypedPatchDb<Database>,
+        interfaces: &OrdMap<GatewayId, NetworkInterfaceInfo>,
+        params: Value,
+    ) {
+        from_value::<SetDefaultOutboundParams>(params.clone())
+            .unwrap()
+            .save(db, interfaces)
+            .await
+            .unwrap();
+        from_value::<SetOutboundGatewayParams>(params)
+            .unwrap()
+            .save(db, interfaces)
+            .await
+            .unwrap();
+    }
+
+    async fn assert_policy_dns(db: &TypedPatchDb<Database>, expected: Value) {
+        let db = db.peek().await;
+        let public = db.as_public();
+        assert_eq!(
+            to_value(
+                &public
+                    .as_server_info()
+                    .as_network()
+                    .as_outbound_dns()
+                    .de()
+                    .unwrap()
+            )
+            .unwrap(),
+            expected
+        );
+        assert_eq!(
+            to_value(
+                &public
+                    .as_package_data()
+                    .as_idx(&"pkg".parse().unwrap())
+                    .unwrap()
+                    .as_outbound_dns()
+                    .de()
+                    .unwrap()
+            )
+            .unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn requester_dns_keeps_existing_cli_grammar() {
+        let host =
+            SetDefaultOutboundParams::try_parse_from(["set-default-outbound", "eth0"]).unwrap();
+        assert!(host.dns.is_none());
+        assert!(
+            SetDefaultOutboundParams::try_parse_from(["set-default-outbound"])
+                .unwrap()
+                .gateway
+                .is_none()
+        );
+        let package =
+            SetOutboundGatewayParams::try_parse_from(["set-outbound-gateway", "pkg", "eth0"])
+                .unwrap();
+        assert!(package.dns.is_none());
+        assert!(
+            SetOutboundGatewayParams::try_parse_from(["set-outbound-gateway", "pkg"])
+                .unwrap()
+                .gateway
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn requester_dns_updates_preserve_clear_and_normalize_atomically() {
+        let (_temp, db, interfaces) = policy_fixture().await;
+        for params in [
+            imbl_value::json!({"package": "pkg", "gateway": "wg0"}),
+            imbl_value::json!({"package": "pkg", "gateway": null, "dns": null}),
+        ] {
+            save_both(&db, &interfaces, params).await;
+            assert_policy_dns(&db, imbl_value::json!(["192.0.2.53:53"])).await;
+        }
+        save_both(
+            &db,
+            &interfaces,
+            imbl_value::json!({"package": "pkg", "gateway": "wg0", "dns": {"servers": null}}),
+        )
+        .await;
+        assert_policy_dns(&db, Value::Null).await;
+        save_both(&db, &interfaces, imbl_value::json!({"package": "pkg", "gateway": "eth0", "dns": {"servers": ["192.0.2.54", "[2001:db8::54]:5353"]}})).await;
+        assert_policy_dns(
+            &db,
+            imbl_value::json!(["192.0.2.54:53", "[2001:db8::54]:5353"]),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn invalid_requester_dns_never_changes_gateway_or_dns() {
+        let (_temp, db, interfaces) = policy_fixture().await;
+        let before: Value = db.peek().await.clone().into();
+        for servers in [
+            imbl_value::json!([]),
+            imbl_value::json!(["bad"]),
+            imbl_value::json!(["127.0.0.1"]),
+            imbl_value::json!(["192.0.2.10"]),
+            imbl_value::json!(["2001:db8::10"]),
+            imbl_value::json!(["192.0.2.53:0"]),
+        ] {
+            let params = imbl_value::json!({"package": "pkg", "gateway": "wg0", "dns": {"servers": servers}});
+            assert!(
+                from_value::<SetDefaultOutboundParams>(params.clone())
+                    .unwrap()
+                    .save(&db, &interfaces)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                from_value::<SetOutboundGatewayParams>(params)
+                    .unwrap()
+                    .save(&db, &interfaces)
+                    .await
+                    .is_err()
+            );
+            let after: Value = db.peek().await.clone().into();
+            assert_eq!(before, after);
+        }
+    }
+
+    #[tokio::test]
+    async fn requester_dns_can_edit_retained_unavailable_selections_but_cannot_select_them() {
+        let (_temp, db, mut interfaces) = policy_fixture().await;
+        for removed in [false, true] {
+            if removed {
+                interfaces.remove(&"eth0".parse::<GatewayId>().unwrap());
+            } else {
+                interfaces
+                    .get_mut(&"eth0".parse::<GatewayId>().unwrap())
+                    .unwrap()
+                    .ip_info = None;
+            }
+            save_both(&db, &interfaces, imbl_value::json!({"package": "pkg", "gateway": "eth0", "dns": {"servers": ["192.0.2.54"]}})).await;
+            assert_policy_dns(&db, imbl_value::json!(["192.0.2.54:53"])).await;
+        }
+        save_both(
+            &db,
+            &interfaces,
+            imbl_value::json!({"package": "pkg", "gateway": "wg0"}),
+        )
+        .await;
+        let before: Value = db.peek().await.clone().into();
+        for gateway in ["eth0", "missing"] {
+            let params =
+                imbl_value::json!({"package": "pkg", "gateway": gateway, "dns": {"servers": null}});
+            assert!(
+                from_value::<SetDefaultOutboundParams>(params.clone())
+                    .unwrap()
+                    .save(&db, &interfaces)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                from_value::<SetOutboundGatewayParams>(params)
+                    .unwrap()
+                    .save(&db, &interfaces)
+                    .await
+                    .is_err()
+            );
+            let after: Value = db.peek().await.clone().into();
+            assert_eq!(before, after);
+        }
+    }
+
+    #[tokio::test]
+    async fn gateway_edit_rejects_invalid_dns_and_missing_gateway_without_watcher_changes() {
+        let (_temp, db, interfaces) = policy_fixture().await;
+        let interfaces = Watch::new(interfaces);
+        let controller = NetworkInterfaceController::with_test_interfaces(db, interfaces.clone());
+        let before = interfaces.read();
+        let mut changed = interfaces.clone();
+        changed.mark_seen();
+        for params in [
+            imbl_value::json!({"id": "eth0", "name": "Renamed", "dns": {"servers": []}}),
+            imbl_value::json!({"id": "eth0", "name": "Renamed", "dns": {"servers": ["192.0.2.10"]}}),
+            imbl_value::json!({"id": "missing", "name": "Renamed", "dns": {"servers": ["192.0.2.53"]}}),
+        ] {
+            assert!(controller.edit(from_value(params).unwrap()).await.is_err());
+            assert_eq!(
+                to_value(&interfaces.read()).unwrap(),
+                to_value(&before).unwrap()
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), changed.changed())
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(
+            controller
+                .set_name(&"missing".parse().unwrap(), "Renamed".into())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_edit_publishes_name_and_dns_together_and_preserves_omitted_intent() {
+        let (_temp, db, interfaces) = policy_fixture().await;
+        let gateway: GatewayId = "eth0".parse().unwrap();
+        let interfaces = Watch::new(interfaces);
+        let controller =
+            NetworkInterfaceController::with_test_interfaces(db.clone(), interfaces.clone());
+        for (params, name, servers) in [
+            (
+                imbl_value::json!({"id": "eth0", "name": "Alias", "dns": {"servers": ["192.0.2.54"]}}),
+                Some("Alias"),
+                Some(vec!["192.0.2.54:53".parse::<SocketAddr>().unwrap()]),
+            ),
+            (
+                imbl_value::json!({"id": "eth0", "name": null, "dns": {"servers": null}}),
+                Some("Alias"),
+                None,
+            ),
+            (
+                imbl_value::json!({"id": "eth0", "name": "Renamed", "dns": null}),
+                Some("Renamed"),
+                None,
+            ),
+            (imbl_value::json!({"id": "eth0"}), Some("Renamed"), None),
+        ] {
+            let mut changed = interfaces.clone();
+            changed.mark_seen();
+            let publish_db = db.clone();
+            let id = gateway.clone();
+            let publish = tokio::spawn(async move {
+                changed.changed().await;
+                let snapshot = changed.read();
+                let info = snapshot.get(&id).unwrap();
+                assert_eq!(info.name.as_deref(), name);
+                assert_eq!(
+                    info.dns
+                        .static_servers
+                        .as_ref()
+                        .map(|s| s.iter().cloned().collect::<Vec<_>>()),
+                    servers
+                );
+                publish_db
+                    .mutate(|db| {
+                        db.as_public_mut()
+                            .as_server_info_mut()
+                            .as_network_mut()
+                            .as_gateways_mut()
+                            .ser(&snapshot)
+                    })
+                    .await
+                    .result
+                    .unwrap();
+            });
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                controller.edit(from_value(params).unwrap()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            publish.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn independent_gateway_edits_acknowledge_a_coalesced_persisted_snapshot() {
+        let (_temp, db, interfaces) = policy_fixture().await;
+        let gateway: GatewayId = "eth0".parse().unwrap();
+        let interfaces = Watch::new(interfaces);
+        let controller =
+            NetworkInterfaceController::with_test_interfaces(db.clone(), interfaces.clone());
+        let servers: std::collections::VecDeque<SocketAddr> =
+            ["192.0.2.54:53".parse().unwrap()].into();
+        let mut changed = interfaces.clone();
+        let publish = async {
+            changed
+                .wait_for(|interfaces| {
+                    let info = interfaces.get(&gateway).unwrap();
+                    info.name.as_deref() == Some("Alias")
+                        && info.dns.static_servers.as_ref() == Some(&servers)
+                })
+                .await;
+            db.mutate(|db| {
+                db.as_public_mut()
+                    .as_server_info_mut()
+                    .as_network_mut()
+                    .as_gateways_mut()
+                    .ser(&changed.read())
+            })
+            .await
+            .result
+            .unwrap();
+        };
+        let (dns, name, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(
+                controller.set_dns(&gateway, Some(servers.clone())),
+                controller.set_name(&gateway, "Alias".into()),
+                publish
+            )
+        })
+        .await
+        .unwrap();
+        dns.unwrap();
+        name.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dns_override_acknowledges_intent_despite_link_dns_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = TypedPatchDb::<Database>::load_unchecked(
+            patch_db::PatchDb::open(temp.path().join("db"))
+                .await
+                .unwrap(),
+        );
+        let gateway: GatewayId = "eth0".parse().unwrap();
+        let mut info = NetworkInterfaceInfo {
+            ip_info: Some(Arc::new(IpInfo {
+                dns_servers: ["192.0.2.1".parse::<IpAddr>().unwrap()]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        info.dns.static_servers = Some(["192.0.2.53:53".parse().unwrap()].into());
+        info.dns.refresh(info.ip_info.as_deref());
+        let interfaces = Watch::new(
+            [(gateway.clone(), info)]
+                .into_iter()
+                .collect::<OrdMap<_, _>>(),
+        );
+        db.put(
+            &patch_db::json_ptr::ROOT,
+            &imbl_value::json!({ "public": { "serverInfo": { "network": { "gateways": {} } } } }),
+        )
+        .await
+        .unwrap();
+        db.mutate(|db| {
+            db.as_public_mut()
+                .as_server_info_mut()
+                .as_network_mut()
+                .as_gateways_mut()
+                .ser(&interfaces.read())
+        })
+        .await
+        .result
+        .unwrap();
+        let controller =
+            NetworkInterfaceController::with_test_interfaces(db.clone(), interfaces.clone());
+        let mut changed = interfaces.clone();
+        changed.mark_seen();
+        let publish = tokio::spawn(async move {
+            changed.changed().await;
+            changed.send_if_modified(|interfaces| {
+                let info = interfaces
+                    .get_mut(&"eth0".parse::<GatewayId>().unwrap())
+                    .unwrap();
+                Arc::make_mut(info.ip_info.as_mut().unwrap()).dns_servers =
+                    ["192.0.2.2".parse::<IpAddr>().unwrap()]
+                        .into_iter()
+                        .collect();
+                info.dns.refresh(info.ip_info.as_deref());
+                true
+            });
+            db.mutate(|db| {
+                db.as_public_mut()
+                    .as_server_info_mut()
+                    .as_network_mut()
+                    .as_gateways_mut()
+                    .ser(&changed.read())
+            })
+            .await
+            .result
+            .unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(1), controller.set_dns(&gateway, None))
+            .await
+            .unwrap()
+            .unwrap();
+        publish.await.unwrap();
+        assert_eq!(
+            interfaces.read().get(&gateway).unwrap().dns.servers,
+            ["192.0.2.2:53".parse().unwrap()]
+        );
+    }
+}
+
+#[cfg(test)]
+mod wg_config_tests {
+    use super::*;
+
+    fn as_str(v: &OwnedValue) -> String {
+        v.downcast_ref::<zbus::zvariant::Str>().unwrap().to_string()
+    }
+
+    #[test]
+    fn endpoint_bootstrap_domains_come_from_configured_peers() {
+        let config = "[Interface]\nPrivateKey = key\n[Peer]\nPublicKey = peer\nEndpoint = VPN.Example.:51820\n[Peer]\nPublicKey = peer2\nEndpoint = 192.0.2.1:51820\n[Peer]\nPublicKey = peer3\nEndpoint = [2001:db8::1]:51820\n";
+        let expected: OrdSet<InternedString> = [InternedString::from_static("vpn.example")]
+            .into_iter()
+            .collect();
+        assert_eq!(wireguard_config_domains(config).unwrap(), expected);
+        let settings = WgConfig::parse(config)
+            .unwrap()
+            .to_nm_settings("wg0", None)
+            .unwrap();
+        assert_eq!(settings_endpoint_domains(&settings).unwrap(), expected);
+        assert!(
+            settings_endpoint_domains(&HashMap::new())
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(endpoint_domain("vpn.example:not-a-port"), None);
+    }
+
+    #[test]
+    fn parses_interface_and_peer() {
+        let config = "[Interface]\n\
+            PrivateKey = aPrivateKey=\n\
+            Address = 10.59.0.2/24, fd00::2/64\n\
+            DNS = 10.59.0.1\n\
+            ListenPort = 51820\n\
+            \n\
+            [Peer]   # the tunnel server\n\
+            PublicKey = aPublicKey=\n\
+            PresharedKey = aPSK=\n\
+            Endpoint = 1.2.3.4:51820\n\
+            AllowedIPs = 10.0.0.0/8\n\
+            PersistentKeepalive = 25\n";
+        let p = WgConfig::parse(config).unwrap();
+        assert_eq!(p.private_key, "aPrivateKey=");
+        assert_eq!(
+            p.addresses,
+            vec![
+                (IpAddr::V4(Ipv4Addr::new(10, 59, 0, 2)), 24),
+                (IpAddr::V6("fd00::2".parse().unwrap()), 64),
+            ]
+        );
+        assert_eq!(p.dns, vec![IpAddr::V4(Ipv4Addr::new(10, 59, 0, 1))]);
+        assert_eq!(p.listen_port, Some(51820));
+        assert_eq!(p.peers.len(), 1);
+        assert_eq!(p.peers[0].public_key, "aPublicKey=");
+        assert_eq!(p.peers[0].preshared_key.as_deref(), Some("aPSK="));
+        assert_eq!(p.peers[0].endpoint.as_deref(), Some("1.2.3.4:51820"));
+        assert_eq!(p.peers[0].persistent_keepalive, Some(25));
+    }
+
+    // ipv4.dns is `au` with each address as little-endian octets — the format we
+    // captured from a real NM 1.52 import (10.x -> from_le_bytes). A regression
+    // here would silently point the gateway at the wrong DNS server.
+    #[test]
+    fn builds_nm_settings_matching_import() {
+        let config = "[Interface]\n\
+            PrivateKey = aPrivateKey=\n\
+            Address = 10.59.0.2/24\n\
+            DNS = 10.59.0.1\n\
+            [Peer]\n\
+            PublicKey = aPublicKey=\n\
+            Endpoint = 1.2.3.4:51820\n\
+            AllowedIPs = 10.0.0.0/8\n";
+        let s = WgConfig::parse(config)
+            .unwrap()
+            .to_nm_settings("wg0", Some("the-uuid"))
+            .unwrap();
+
+        assert_eq!(as_str(&s["connection"]["uuid"]), "the-uuid");
+        assert_eq!(as_str(&s["connection"]["type"]), "wireguard");
+        assert_eq!(as_str(&s["connection"]["interface-name"]), "wg0");
+        assert_eq!(as_str(&s["wireguard"]["private-key"]), "aPrivateKey=");
+
+        let ipv4 = &s["ipv4"];
+        assert_eq!(as_str(&ipv4["method"]), "manual");
+        let dns = Vec::<u32>::try_from(ipv4["dns"].try_clone().unwrap()).unwrap();
+        assert_eq!(dns, vec![u32::from_le_bytes([10, 59, 0, 1])]);
+        let priority = i32::try_from(ipv4["dns-priority"].try_clone().unwrap()).unwrap();
+        assert_eq!(priority, WG_DNS_PRIORITY);
+
+        // No ipv6 address in this config, so ipv6 is disabled (matches import).
+        assert_eq!(as_str(&s["ipv6"]["method"]), "disabled");
+
+        // Peer's allowed-ips is forced to full-tunnel regardless of the config.
+        let peers = Vec::<HashMap<String, OwnedValue>>::try_from(
+            s["wireguard"]["peers"].try_clone().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(as_str(&peers[0]["public-key"]), "aPublicKey=");
+        let allowed =
+            Vec::<String>::try_from(peers[0]["allowed-ips"].try_clone().unwrap()).unwrap();
+        assert_eq!(allowed, vec!["0.0.0.0/0".to_string(), "::/0".to_string()]);
+    }
+
+    #[test]
+    fn rejects_out_of_range_prefix() {
+        assert!(WgConfig::parse("[Interface]\nPrivateKey = k=\nAddress = 10.0.0.2/40\n").is_err());
+        assert!(WgConfig::parse("[Interface]\nPrivateKey = k=\nAddress = fd00::2/200\n").is_err());
+    }
+
+    // add() lets NM generate the uuid; update() preserves the existing one so the
+    // same profile is replaced in place rather than redefined.
+    #[test]
+    fn uuid_present_only_on_update() {
+        let parsed =
+            WgConfig::parse("[Interface]\nPrivateKey = k=\nAddress = 10.0.0.2/24\n").unwrap();
+        assert!(!parsed.to_nm_settings("wg0", None).unwrap()["connection"].contains_key("uuid"));
+        let updated = parsed.to_nm_settings("wg0", Some("uuid-x")).unwrap();
+        assert_eq!(as_str(&updated["connection"]["uuid"]), "uuid-x");
+    }
+}

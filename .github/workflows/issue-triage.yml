@@ -1,0 +1,79 @@
+name: Issue triage
+
+on:
+  issues:
+    types: [opened, edited, labeled, unlabeled, typed, untyped]
+
+permissions:
+  issues: write
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v9
+        with:
+          script: |
+            // Keys mirror the Project dropdown in .github/ISSUE_TEMPLATE/9-feature-request.yml
+            // and 10-task.yml, and the static `labels:` on each bug form.
+            const OWNERS = {
+              StartOS: 'dr-bonez',
+              'start-cli': 'dr-bonez',
+              StartSDK: 'dr-bonez',
+              'start-registry': 'dr-bonez',
+              StartTunnel: 'dr-bonez',
+              StartWRT: 'dominion5254',
+              brochure: 'MattDHill',
+              'start-docs': 'MattDHill',
+              repo: 'dr-bonez',
+            }
+            const FEATURE_OWNER = 'MattDHill'
+            const TRIAGE_OWNER = 'MattDHill'
+            const GATE = 'needs-triage'
+
+            const issue = context.payload.issue
+            const api = { owner: context.repo.owner, repo: context.repo.repo, issue_number: issue.number }
+            const labels = new Set(issue.labels.map((l) => l.name))
+
+            const picked = (issue.body || '')
+              .split(/^###[ \t]+/m)
+              .find((s) => s.split('\n')[0].trim() === 'Project')
+              ?.split('\n')
+              .slice(1)
+              .map((line) => line.trim())
+              .find((line) => line.length > 0)
+
+            if (picked && picked in OWNERS && !labels.has(picked)) {
+              await github.rest.issues.addLabels({ ...api, labels: [picked] })
+              labels.add(picked)
+              core.info(`Labelled ${picked}`)
+            }
+
+            const project = [...labels].find((l) => l in OWNERS)
+            const type = issue.type?.name
+            const assignees = issue.assignees.map((a) => a.login)
+
+            if (!type || !project) {
+              const missing = [!type && 'an issue type', !project && 'a project label'].filter(Boolean).join(' and ')
+              if (!labels.has(GATE)) {
+                await github.rest.issues.addLabels({ ...api, labels: [GATE] })
+              }
+              if (!assignees.length) {
+                await github.rest.issues.addAssignees({ ...api, assignees: [TRIAGE_OWNER] })
+                core.info(`Missing ${missing}; assigned ${TRIAGE_OWNER} for triage`)
+              }
+              return
+            }
+
+            const owner = type === 'Feature' ? FEATURE_OWNER : OWNERS[project]
+            if (labels.has(GATE)) {
+              await github.rest.issues.removeLabel({ ...api, name: GATE })
+              if (assignees.length === 1 && assignees[0] === TRIAGE_OWNER && owner !== TRIAGE_OWNER) {
+                await github.rest.issues.removeAssignees({ ...api, assignees: [TRIAGE_OWNER] })
+                assignees.length = 0
+              }
+            }
+            if (assignees.length) return
+
+            await github.rest.issues.addAssignees({ ...api, assignees: [owner] })
+            core.info(`Assigned ${owner}`)

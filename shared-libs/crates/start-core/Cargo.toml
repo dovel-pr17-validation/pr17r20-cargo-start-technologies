@@ -1,0 +1,264 @@
+[package]
+authors = ["Aiden McClelland <me@drbonez.dev>"]
+build = "build.rs"
+description = "The core of StartOS"
+documentation = "https://docs.rs/start-os"
+edition = "2024"
+keywords = [
+  "bitcoin",
+  "full-node",
+  "lightning",
+  "privacy",
+  "raspberry-pi",
+  "self-hosted",
+]
+license = "MIT"
+name = "start-core"
+readme = "README.md"
+repository = "https://github.com/Start9Labs/start-technologies"
+version = "0.4.0" # VERSION_BUMP
+
+[lib]
+name = "start_core"
+path = "src/lib.rs"
+
+[features]
+beta = []
+console = ["console-subscriber", "tokio/tracing"]
+default = []
+dev = []
+test = []
+ts = [
+  "rpc-toolkit/ts",
+  "rpc-toolkit/chrono",
+  "rpc-toolkit/ipnet",
+  "rpc-toolkit/isocountry",
+  "rpc-toolkit/josekit",
+  "rpc-toolkit/url",
+  "rpc-toolkit/yajrc",
+  "rpc-toolkit/exver",
+  "rpc-toolkit/patch-db",
+]
+unstable = ["backtrace-on-stack-overflow"]
+
+[dependencies]
+aes = "0.9.1"
+async-compression = { version = "0.4.32", features = [
+  "brotli",
+  "gzip",
+  "tokio",
+  "zstd",
+] }
+async-stream = "0.3.5"
+async-trait = "0.1.74"
+axum = { version = "0.8.4", features = ["http2", "ws"] }
+backtrace-on-stack-overflow = { version = "0.3.0", optional = true }
+base32 = "0.5.0"
+base64 = "0.22.1"
+base64ct = "1.6.0"
+blake3 = { version = "1.5.0", features = ["mmap", "rayon"] }
+bytes = "1"
+chrono = { version = "0.4.31", features = ["serde"] }
+clap = { version = "4.4.12", features = ["string"] }
+clap_complete = "4.6"
+color-eyre = "0.6.2"
+console = "0.16.2"
+console-subscriber = { version = "0.5.0", optional = true }
+const_format = "0.2.34"
+crab_nat = { git = "https://github.com/Start9Labs/crab_nat.git", branch = "feat/custom-pcp-options" }
+ctr = "0.10.1"
+der = { version = "0.8.0", features = ["derive", "pem"] }
+digest = "0.11.0"
+divrem = "1.0.0"
+dns-lookup = "3.0.1"
+ed25519 = { version = "3.0.0", features = ["alloc", "pem", "pkcs8"] }
+ed25519-dalek = { version = "3.0.0-rc.1", features = [
+  "alloc",
+  "digest",
+  "hazmat",
+  "pem",
+  "pkcs8",
+  "rand_core",
+  "serde",
+  "zeroize",
+] }
+ed25519-dalek-v1 = { package = "ed25519-dalek", version = "1" }
+exver = { path = "../exver", features = ["serde"] }
+fast-socks5 = "1.0.0"
+fd-lock-rs = "0.1.4"
+foreign-types = "0.3.2"
+form_urlencoded = "1.2.1"
+futures = "0.3.28"
+gpt = "4.1.0"
+hashing-serializer = "0.2.0"
+hex = "0.4.3"
+hickory-server = { version = "0.26.1", features = ["resolver", "dnssec-ring"] }
+hkdf = "0.13"
+hmac = "0.13.0"
+http = "1.0.0"
+http-body-util = "0.1"
+hyper = { version = "1.5", features = ["http1", "http2", "server"] }
+hyper-tls = "0.6.0"
+hyper-util = { version = "0.1.21", features = [
+  "client-legacy",
+  "http1",
+  "http2",
+  "server",
+  "server-auto",
+  "server-graceful",
+  "service",
+  "tokio",
+] }
+id-pool = { version = "0.2.2", default-features = false, features = [
+  "serde",
+  "u16",
+] }
+iddqd = "0.3.14"
+igd-next = { version = "0.17.1", default-features = false, features = [
+  "aio_tokio",
+] }
+imbl = { version = "7", features = ["serde", "small-chunks"] }
+imbl-value = { path = "../imbl-value" }
+include_dir = { version = "0.7.3", features = ["metadata"] }
+indexmap = { version = "2.0.2", features = ["serde"] }
+indicatif = { version = "0.18.3", features = ["tokio"] }
+instant-acme = { git = "https://github.com/Start9Labs/instant-acme.git", rev = "f5fea9642366ba3b495ee9be2cf653b9812368d7", default-features = false, features = [
+  "ring",
+] }
+integer-encoding = { version = "4.0.0", features = ["tokio_async"] }
+ipnet = { version = "2.8.0", features = ["serde"] }
+isocountry = "0.3.2"
+itertools = "0.14.0"
+jaq-core = "0.10.1"
+jaq-std = "0.10.0"
+josekit = "0.10.3"
+jsonpath_lib = { path = "../jsonpath" }
+lazy_async_pool = "0.3.3"
+lazy_format = "2.0"
+lazy_static = "1.4.0"
+lettre = { version = "0.11.18", default-features = false, features = [
+  "aws-lc-rs",
+  "builder",
+  "hostname",
+  "pool",
+  "rustls-platform-verifier",
+  "smtp-transport",
+  "tokio1-rustls",
+] }
+libc = "0.2.149"
+log = "0.4.20"
+mbrman = "0.6.0"
+miette = { version = "7.6.0", features = ["fancy"] }
+mio = "1"
+native-tls = "0.2.11"
+new_mime_guess = "4"
+nix = { version = "0.30.1", features = [
+  "fs",
+  "hostname",
+  "mount",
+  "net",
+  "process",
+  "sched",
+  "signal",
+  "user",
+] }
+nom = "8.0.0"
+num = "0.4.1"
+num_cpus = "1.16.0"
+num_enum = "0.7.0"
+oci-spec = { version = "0.10.0", default-features = false, features = [
+  "distribution",
+  "image",
+] }
+once_cell = "1.19.0"
+openssh-keys = "0.6.2"
+openssl = { version = "0.10.57", features = ["vendored"] }
+openssl-sys = "0.9.116"
+p256 = { version = "0.14.0-rc.15", features = ["pem"] }
+patch-db = { path = "../patch-db/core", features = ["trace"] }
+pbkdf2 = "0.13.0"
+pin-project = "1.1.3"
+pkcs8 = { version = "0.11.0", features = ["pem", "std"] }
+prettytable-rs = "0.10.0"
+proptest = "1.3.1"
+proptest-derive = "0.7.0"
+qrcode = "0.14.1"
+r3bl_tui = "0.7.6"
+rand = "0.10.1"
+rcgen = { version = "0.14", default-features = false, features = [
+  "pem",
+  "ring",
+] }
+regex = "1.10.2"
+reqwest = { version = "0.12.25", features = [
+  "http2",
+  "json",
+  "native-tls",
+  "socks",
+  "stream",
+] }
+rpassword = "7.2.0"
+rpc-toolkit = { path = "../rpc-toolkit", features = ["cbor"] }
+rusqlite = { version = "0.34", features = ["bundled"] }
+rust-argon2 = "3.0.0"
+rust-i18n = "3.1.5"
+semver = { version = "1.0.20", features = ["serde"] }
+serde = { version = "1.0", features = ["derive", "rc"] }
+serde_cbor = { package = "ciborium", version = "0.2.1" }
+serde_json = "1.0"
+serde_toml = { package = "toml", version = "0.9.9+spec-1.0.0" }
+serde_yaml = { package = "yaml_serde", version = "0.10.7" }
+sha-crypt = "0.5.0"
+sha2 = "0.11.0"
+sha3 = "0.12.0"
+signal-hook = "0.3.17"
+socket2 = { version = "0.6.0", features = ["all"] }
+sqlx = { version = "0.8.6", features = [
+  "postgres",
+  "runtime-tokio-rustls",
+], default-features = false }
+sscanf = "0.4.1"
+ssh-key = { version = "0.7.0-rc.11", features = ["ed25519"] }
+tar = "0.4.40"
+termion = "4.0.5"
+textwrap = "0.16.1"
+thiserror = "2.0.12"
+tokio = { version = "1.38.1", features = ["full"] }
+tokio-rustls = "0.26.4"
+tokio-stream = { version = "0.1.14", features = ["io-util", "net", "sync"] }
+tokio-tar = { package = "astral-tokio-tar", version = "0.6" }
+tokio-tungstenite = { version = "0.26.2", features = ["native-tls", "url"] }
+tokio-util = { version = "0.7.9", features = ["io", "rt"] }
+tower-service = "0.3.3"
+tracing = "0.1.39"
+tracing-appender = "0.2.3"
+tracing-error = "0.2.0"
+tracing-journald = "0.3.0"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+typed-builder = "0.23.2"
+url = { version = "2.4.1", features = ["serde"] }
+uuid = { version = "1.4.1", features = ["v4"] }
+visit-rs = { path = "../visit-rs" }
+x25519-dalek = { version = "3.0.0-rc.1", features = ["static_secrets"] }
+xattr = "1.6.1"
+xmltree = "0.10"
+zbus = "5.1.1"
+zstd = "0.13.3"
+
+[[example]]
+name = "generate_bindings"
+required-features = ["ts"]
+
+[build-dependencies]
+serde_json = "1.0"
+serde_toml = { package = "toml", version = "0.9" }
+
+[dev-dependencies]
+clap_mangen = "0.2.33"
+tempfile = "3.14.0"
+tokio = { version = "1.38.1", features = ["test-util"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+inotify = "0.11.0"
+procfs = "0.18.0"
+pty-process = "0.5.1"

@@ -1,0 +1,21 @@
+# AI Agent TODOs
+
+Pending tasks for AI agents. Remove items when completed.
+
+## Features
+
+- [ ] Auto-configure port forwards via UPnP/NAT-PMP/PCP - @dr-bonez
+
+  **Goal**: When a binding is marked public, automatically configure port forwards on the user's router
+  using UPnP, NAT-PMP, or PCP, instead of requiring manual router configuration. Fall back to
+  displaying manual instructions (the port forward mapping from patch-db) when auto-configuration is
+  unavailable or fails.
+
+- [ ] Use TLS-ALPN challenges for check-port when addSsl - @dr-bonez
+
+  **Problem**: The `check_port` RPC in `core/src/net/gateway.rs` currently uses an external HTTP
+  service (`ifconfig_url`) to verify port reachability. This doesn't check whether the port is forwarded to the right place, just that it's open. there's nothing we can do about this if it's a raw forward, but if it goes through the ssl proxy we can do a better verification.
+
+  **Goal**: When a binding has `addSsl` enabled, use TLS-ALPN-01 challenges to verify port
+  reachability instead of (or in addition to) the plain TCP check. This more accurately validates
+  that the SSL port is properly configured and reachable.

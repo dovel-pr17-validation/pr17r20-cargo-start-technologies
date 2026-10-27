@@ -1,0 +1,312 @@
+#!/bin/sh
+set -e
+
+SYSTEMCTL=systemctl
+if [ -n "$DPKG_MAINTSCRIPT_PACKAGE" ]; then
+	SYSTEMCTL=deb-systemd-helper
+fi
+
+# Set `KEY=VALUE` in a config file: replace the entry in place if it already
+# exists (bare or commented, any indentation) — preserving its position, which
+# matters for section-scoped configs — or append it if not. VALUE is written
+# verbatim, so the caller supplies any quoting. Usage: set_config FILE KEY VALUE
+set_config() {
+	if grep -qE "^[[:space:]]*#?[[:space:]]*$2[[:space:]]*=" "$1"; then
+		sed -i "/^[[:space:]]*#\\?[[:space:]]*$2[[:space:]]*=/c\\$2=$3" "$1"
+	else
+		printf '%s=%s\n' "$2" "$3" >> "$1"
+	fi
+}
+
+if [ -f /usr/sbin/grub-probe ] && ! [ -L /usr/sbin/grub-probe ]; then
+	mv /usr/sbin/grub-probe /usr/sbin/grub-probe-default
+	ln -s /usr/lib/startos/scripts/grub-probe-eos /usr/sbin/grub-probe
+fi
+
+cp /usr/lib/startos/scripts/startos-initramfs-module /etc/initramfs-tools/scripts/startos
+
+if ! grep overlay /etc/initramfs-tools/modules > /dev/null; then
+	echo overlay >> /etc/initramfs-tools/modules
+fi
+
+update-initramfs -u -k all
+
+if [ -f /etc/default/grub ]; then
+	# GRUB values are always double-quoted; delegate the replace-or-append.
+	grub_set() {
+		set_config /etc/default/grub "$1" "\"$2\""
+	}
+	CMDLINE='boot=startos console=ttyS0,115200n8 console=tty0'
+	# tegra234-cbb ACPI-matches NVDA1070 and reads a firewalled fabric register
+	# before masking SError, which hangs a GB10 (DGX Spark) during ACPI scan —
+	# before any console exists. NVIDIA blacklists this same initcall on Spark.
+	if [ "$(cat /usr/lib/startos/PLATFORM.txt 2>/dev/null)" = aarch64-nvidia ]; then
+		CMDLINE="$CMDLINE initcall_blacklist=tegra234_cbb_init"
+	fi
+	grub_set GRUB_CMDLINE_LINUX "$CMDLINE"
+	grub_set GRUB_CMDLINE_LINUX_DEFAULT ''
+	grub_set GRUB_DISTRIBUTOR "StartOS v$(cat /usr/lib/startos/VERSION.txt)"
+	grub_set GRUB_TOP_LEVEL "$(ls -1 /boot/vmlinuz-* | sort -V | tail -n1)"
+	# Graphical terminal (serial added conditionally via /etc/grub.d/01_serial)
+	grub_set GRUB_TERMINAL_INPUT 'console'
+	grub_set GRUB_TERMINAL_OUTPUT 'gfxterm'
+	# Remove GRUB_TERMINAL and GRUB_SERIAL_COMMAND if present
+	sed -i '/^\(#\|\)GRUB_TERMINAL=/d' /etc/default/grub
+	sed -i '/^\(#\|\)GRUB_SERIAL_COMMAND=/d' /etc/default/grub
+	# Graphics mode and splash background
+	grub_set GRUB_GFXMODE 800x600
+	grub_set GRUB_GFXPAYLOAD_LINUX keep
+	grub_set GRUB_BACKGROUND '/boot/grub/splash.png'
+	grub_set GRUB_THEME '/boot/grub/startos-theme/theme.txt'
+	# Copy splash image and theme to boot partition
+	if [ -f /usr/lib/startos/splash.png ]; then
+		mkdir -p /boot/grub
+		cp /usr/lib/startos/splash.png /boot/grub/splash.png
+	fi
+	if [ -d /usr/lib/startos/grub-theme ]; then
+		mkdir -p /boot/grub/startos-theme
+		cp -r /usr/lib/startos/grub-theme/* /boot/grub/startos-theme/
+	fi
+	# Copy font to boot partition so GRUB can load it without accessing rootfs
+	if [ -f /usr/share/grub/unicode.pf2 ]; then
+		mkdir -p /boot/grub/fonts
+		cp /usr/share/grub/unicode.pf2 /boot/grub/fonts/unicode.pf2
+	fi
+	# Install conditional serial console script for GRUB
+	cat > /etc/grub.d/01_serial <<-'GRUBEOF'
+	#!/bin/sh
+	cat << 'EOF'
+	# Conditionally enable serial console (avoids breaking gfxterm on EFI
+	# systems where the serial port is unavailable)
+	if serial --unit=0 --speed=115200 --word=8 --parity=no --stop=1; then
+	  terminal_input console serial
+	  terminal_output gfxterm serial
+	fi
+	EOF
+	GRUBEOF
+	chmod +x /etc/grub.d/01_serial
+	# Install GRUB script to boot from StartOS installer USB when present.
+	# At boot, GRUB searches for the .startos-installer marker and,
+	# if found, loads the USB's own grub.cfg as the default boot entry.
+	cat > /etc/grub.d/07_startos_installer <<-'GRUBEOF'
+	#!/bin/sh
+	cat << 'EOF'
+	search --no-floppy --file --set=installer_dev /.startos-installer
+	if [ -n "$installer_dev" ]; then
+	    menuentry "StartOS Installer" --id startos-installer {
+	        set root=$installer_dev
+	        configfile /boot/grub/grub.cfg
+	    }
+	    set default=startos-installer
+	    set timeout=5
+	fi
+	EOF
+	GRUBEOF
+	chmod +x /etc/grub.d/07_startos_installer
+fi
+
+VERSION="$(cat /usr/lib/startos/VERSION.txt)"
+ENVIRONMENT=$(cat /usr/lib/startos/ENVIRONMENT.txt)
+VERSION_ENV="${VERSION}"
+if [ -n "${ENVIRONMENT}" ]; then
+	VERSION_ENV="${VERSION} (${ENVIRONMENT})"
+fi
+
+# set /etc/os-release
+cat << EOF > /etc/os-release
+NAME=StartOS
+VERSION="${VERSION_ENV}"
+ID=start-os
+VERSION_ID="${VERSION}"
+PRETTY_NAME="StartOS v${VERSION_ENV}"
+HOME_URL="https://start9.com/"
+SUPPORT_URL="https://docs.start9.com/0.3.5.x/support"
+BUG_REPORT_URL="https://github.com/Start9Labs/start-technologies/issues"
+VARIANT="${ENVIRONMENT}"
+VARIANT_ID="${ENVIRONMENT}"
+EOF
+
+# set local and remote login prompt
+cat << EOF > /etc/issue
+StartOS v${VERSION} [\\m] on \\n.local (\\l)
+EOF
+cat << EOF > /etc/issue.net
+StartOS v${VERSION}
+EOF
+
+ln -sf /usr/share/zoneinfo/Etc/UTC /etc/localtime
+
+resolv_conf=/etc/resolv.conf
+# live-build restores the saved resolver after chroot customization.
+if [ "$(cat /etc/debian_chroot 2>/dev/null)" = live ]; then
+	resolv_conf=/etc/resolv.conf.orig
+fi
+rm -f "$resolv_conf"
+echo "nameserver 127.0.0.1" > "$resolv_conf"
+
+echo "#" > /etc/network/interfaces
+cat << EOF > /etc/NetworkManager/NetworkManager.conf
+[main]
+plugins=ifupdown,keyfile
+dns=none
+
+[ifupdown]
+managed=true
+
+[connection]
+ipv6.addr-gen-mode=eui64
+ipv6.ip6-privacy=0
+EOF
+$SYSTEMCTL enable startd.service
+$SYSTEMCTL enable startos-shutdown.service
+$SYSTEMCTL enable startos-restart.service
+$SYSTEMCTL enable systemd-resolved.service
+$SYSTEMCTL enable ssh.service
+$SYSTEMCTL enable systemd-oomd.service
+$SYSTEMCTL disable wpa_supplicant.service
+$SYSTEMCTL mask systemd-networkd-wait-online.service # currently use `NetworkManager-wait-online.service`
+
+$SYSTEMCTL disable postgresql.service
+$SYSTEMCTL disable tor.service
+$SYSTEMCTL disable bluetooth.service
+$SYSTEMCTL disable hciuart.service
+$SYSTEMCTL disable triggerhappy.service
+
+$SYSTEMCTL mask sleep.target
+$SYSTEMCTL mask suspend.target
+$SYSTEMCTL mask hibernate.target
+$SYSTEMCTL mask hybrid-sleep.target
+
+$SYSTEMCTL mask rpcbind.service
+$SYSTEMCTL mask rpcbind.socket
+
+if which gsettings > /dev/null; then
+	gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-timeout '0'
+	gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-battery-timeout '0'
+fi
+
+sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/g' /etc/ssh/sshd_config
+sed -i 's/Restart=on-failure/Restart=always/g' /lib/systemd/system/tor@default.service
+set_config /etc/avahi/avahi-daemon.conf entries-per-entry-group-max 128
+set_config /etc/systemd/journald.conf Storage persistent
+set_config /etc/systemd/journald.conf Compress yes
+set_config /etc/systemd/journald.conf SystemMaxUse 1G
+set_config /etc/systemd/journald.conf ForwardToSyslog no
+set_config /etc/lvm/lvm.conf issue_discards 1
+set_config /etc/containers/registries.conf unqualified-search-registries '["docker.io"]'
+sed -i 's/\(#\|\^\)\s*\([^=]\+\)=\(suspend\|hibernate\)\s*$/\2=ignore/g' /etc/systemd/logind.conf
+cp /usr/lib/startos/resolved.conf /etc/systemd/resolved.conf
+set_config /etc/default/lxc-net LXC_DHCP_CONFILE /etc/dnsmasq.conf
+# Dual-stack lxcbr0: a ULA (fd00:3::/64) + SLAAC RA, so containers get a v6.
+set_config /etc/default/lxc-net LXC_IPV6_ADDR '"fd00:3::1"'
+set_config /etc/default/lxc-net LXC_IPV6_MASK '"64"'
+set_config /etc/default/lxc-net LXC_IPV6_NETWORK '"fd00:3::/64"'
+set_config /etc/default/lxc-net LXC_IPV6_NAT '"true"'
+echo 'port=0' > /etc/dnsmasq.conf
+sed -i 's/\[Service\]/[Service]\nEnvironment=SYSTEMD_LOG_LEVEL=debug/' /lib/systemd/system/systemd-timesyncd.service
+sed -i "s/\.debian\./\./g;s/#FallbackNTP=/FallbackNTP=/"  /etc/systemd/timesyncd.conf
+set_config /etc/systemd/timesyncd.conf RootDistanceMaxSec 10
+
+# Reserve memory for the host management plane so a burst of resource-hungry
+# service containers can never starve startd / sshd / journald and wedge the
+# box (the lxc service containers live under the `startos.payload` cgroup, which
+# startd caps separately at init — see core system::limit_container_memory).
+# MemoryMin is a hard protection: under memory pressure the kernel reclaims and,
+# if needed, OOM-kills inside the container cgroups before ever touching this
+# reserved memory, so sshd stays reachable and startd keeps running.
+#
+# Sizing (constant, not a fraction of RAM — the host plane's needs don't grow
+# with box size): measured idle footprint is ~178 MiB system.slice + ~33 MiB
+# init.scope + ~58 MiB per SSH session. 768 MiB for system.slice leaves ~4x
+# headroom for startd's install-time working set + journald; 256 MiB for
+# user.slice guarantees an admin can always log in to recover.
+mkdir -p /etc/systemd/system/system.slice.d
+cat > /etc/systemd/system/system.slice.d/10-startos-memory-reserve.conf << 'EOF'
+[Slice]
+MemoryAccounting=yes
+MemoryMin=768M
+EOF
+mkdir -p /etc/systemd/system/user.slice.d
+cat > /etc/systemd/system/user.slice.d/10-startos-memory-reserve.conf << 'EOF'
+[Slice]
+MemoryAccounting=yes
+MemoryMin=256M
+EOF
+
+# systemd-oomd: how long memory PSI pressure must stay above a slice's
+# ManagedOOMMemoryPressureLimit before oomd kills its heaviest child. The
+# service-container slice (startos.slice) opts in via ManagedOOMMemoryPressure=
+# kill; 20s avoids reacting to brief install/backup spikes while still catching
+# a real runaway in seconds instead of the ~30-min swap-death it replaces. The
+# host plane is spared: startd sets ManagedOOMPreference=avoid and system.slice/
+# user.slice carry the MemoryMin reservations above.
+mkdir -p /etc/systemd/oomd.conf.d
+cat > /etc/systemd/oomd.conf.d/10-startos.conf << 'EOF'
+[OOM]
+DefaultMemoryPressureDurationSec=20s
+EOF
+
+mkdir -p /etc/systemd/system.conf.d
+cat > /etc/systemd/system.conf.d/10-startos-watchdog.conf << 'EOF'
+[Manager]
+RuntimeWatchdogSec=60s
+EOF
+
+# Start the serial console login prompt only on ports that have a UART.
+mkdir -p /etc/systemd/system/serial-getty@.service.d
+cat > /etc/systemd/system/serial-getty@.service.d/10-startos.conf << 'EOF'
+[Service]
+ExecCondition=/bin/sh -c '[ "$$(cat /sys/class/tty/%I/type 2>/dev/null)" != 0 ]'
+EOF
+
+mkdir -p /etc/nginx/ssl
+
+rm -rf /var/lib/tor/*
+ln -sf /usr/lib/startos/scripts/chroot-and-upgrade /usr/bin/chroot-and-upgrade
+ln -sf /usr/lib/startos/scripts/tor-check /usr/bin/tor-check
+ln -sf /usr/lib/startos/scripts/gather-debug-info /usr/bin/gather-debug-info
+ln -sf /usr/lib/startos/scripts/diagnose-hang /usr/bin/diagnose-hang
+ln -sf /usr/lib/startos/scripts/wireguard-vps-proxy-setup /usr/bin/wireguard-vps-proxy-setup
+
+cat > /etc/sysctl.d/97-startos.conf <<EOF
+fs.inotify.max_user_watches=1048576
+# Headroom for nested user namespaces (rootless OCI engines inside service LXCs).
+user.max_user_namespaces=28633
+kernel.unprivileged_userns_clone=1
+# Outbound source ports stay below the service ports StartOS allocates.
+net.ipv4.ip_local_port_range=32768 49151
+EOF
+
+# Ensure /dev/fuse and /dev/net/tun are available on the host so service LXCs
+# can bind-mount them (lxc/mod.rs::{USERSPACE_FILESYSTEM_PATHS,
+# VIRTUAL_NETWORKING_PATHS}). fuse backs fuse-overlayfs for services that opt
+# in via manifest.userspaceFilesystems; tun backs VPN / tun-class services
+# (and slirp4netns / pasta rootless networking) via manifest.virtualNetworking.
+cat > /etc/modules-load.d/startos-nested-runtime.conf <<EOF
+fuse
+tun
+EOF
+rm -f /etc/modules-load.d/startos-fuse.conf
+
+if ! getent group | grep '^startos:'; then
+	groupadd startos
+fi
+
+rm -f /etc/motd
+ln -sf /usr/lib/startos/motd /etc/update-motd.d/00-startos
+chmod -x /etc/update-motd.d/*
+chmod +x /etc/update-motd.d/00-startos
+
+# LXC
+cat /etc/subuid | grep -v '^root:' > /etc/subuid.tmp || true
+echo "root:100000:65536" >> /etc/subuid.tmp
+mv /etc/subuid.tmp /etc/subuid
+
+cat /etc/subgid | grep -v '^root:' > /etc/subgid.tmp || true
+echo "root:100000:65536" >> /etc/subgid.tmp
+mv /etc/subgid.tmp /etc/subgid
+
+cat /etc/lxc/default.conf | grep -v '^lxc\.idmap = [ug]' > /etc/lxc/default.conf.tmp || true
+echo "lxc.idmap = u 0 100000 65536" >> /etc/lxc/default.conf.tmp
+echo "lxc.idmap = g 0 100000 65536" >> /etc/lxc/default.conf.tmp
+mv /etc/lxc/default.conf.tmp /etc/lxc/default.conf

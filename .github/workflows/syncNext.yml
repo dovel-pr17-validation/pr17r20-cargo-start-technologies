@@ -1,0 +1,27 @@
+name: Sync next
+
+on:
+  workflow_call:
+
+concurrency:
+  group: sync-next-${{ github.repository }}-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync next
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout services repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Sync the paired next branch
+        uses: Start9Labs/start-technologies/.github/actions/sync-next@master
+        with:
+          token: ${{ github.token }}
+          base: ${{ github.ref_name }}

@@ -1,0 +1,36 @@
+[package]
+authors = [
+  "Keagan McClelland <keagan@start9.com>",
+  "Aiden McClelland <aiden@start9.com>",
+]
+description = "Semver extension with upstream and downstream versions. Designed for package distributors"
+documentation = "https://docs.rs/exver"
+edition = "2021"
+keywords = ["version", "semver", "embassy"]
+license = "MIT"
+name = "exver"
+readme = "README.md"
+repository = "https://github.com/Start9Labs/start-technologies"
+version = "0.2.1"
+
+
+[features]
+default = []
+serde = ["dep:serde", "emver/serde"]
+
+[dependencies]
+either = "1.6"
+emver = "0.1.5"
+fp-core = "0.1"
+itertools = "0.13"
+memchr = "2.7"
+pest = "2.7"
+pest_derive = "2.7"
+serde = { version = "1", optional = true }
+smallvec = "1.13"
+stacker = "0.1"
+yasi = { path = "../yasi" }
+
+[dev-dependencies]
+proptest = "1.4.0"
+serde_yaml = "0.9.14"

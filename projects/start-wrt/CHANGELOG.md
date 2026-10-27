@@ -1,0 +1,779 @@
+# Changelog
+
+All notable changes to StartWRT are documented here.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [1.3.0]
+
+### Added
+
+- **DNS record publishing (RFC 2136).** A device with the new **Allow DNS record
+  publishing** permission (off by default, on its device page) can publish DNS
+  names into the router, pointing at any address, and every device on the
+  network resolves them. A StartOS server uses it for its private domains. An
+  inbound VPN client needs the same permission, granted from its VPN's client
+  list. An update from the LAN must arrive over TCP (`nsupdate -v`). Names under
+  `.lan` are refused, and a name is served only to networks whose Security
+  Profile can reach the publishing device. The router drops a record whose
+  device loses the address it published from, and revoking the permission
+  removes the device's names immediately. A read-only table on the device page
+  shows what a device has published. DNS record publishing coexists with DNS
+  servers published on port 53, including access from the WAN and LAN.
+- **Inbound VPN clients can publish DNS records.** A client added on an earlier
+  release must be deleted and re-added before it can publish; its new
+  configuration carries the address the router expects.
+
+- **Firefox's default DNS-over-HTTPS steps aside.** Wherever the router serves
+  published names or DNS overrides, its DNS answers Firefox's DNS-over-HTTPS
+  canary domain, so Firefox's default-enabled DoH steps aside there and those
+  names and overrides resolve. DoH a user turned on explicitly is untouched.
+
+- K1 boards with four LAN ports bring up all of them, each assignable to its own Security Profile on the Ethernet page.
+
+- **DNS servers for outbound VPNs.** Adding an outbound VPN or editing one now takes DNS servers, which replace the config file's `DNS =` line, and the page warns when a VPN has none.
+
+- Wi-Fi settings have a channel width for each band: 20 or 40 MHz on 2.4 GHz, and up to 160 MHz on 5 GHz where the radio supports it. Each channel offers only the widths it can use in the selected country.
+
+### Changed
+
+- **Sign-in uses a key your browser holds.** Logging in creates a key the browser keeps but cannot export, and every request is signed with it, so no reusable credential crosses the network. This update signs everyone out once.
+- **A sign-in lasts 24 hours from when you log in**, even while you keep using it, so expect to log in again each day. It previously lasted until it went a day unused. Logging out or changing the admin password from another device ends it sooner; updates within those 24 hours do not.
+- **Changing the admin password signs out every other device.** The browser or CLI that made the change stays signed in. Before first-time setup sets a password, logging in is refused.
+- **`startwrt-cli auth login` enrolls a key** at `~/.startwrt/id.key.pem` instead of saving a cookie, and `startwrt-cli auth session list` and `auth session kill` show and revoke sign-ins. On the router itself the CLI needs no login, and `auth login` and `auth logout` say so.
+
+- **Support diagnostics include history from before the last reboot.** The
+  download now carries the router's saved system log, which spans reboots and
+  each boot from its first line and holds 32–64 MiB of history, along with
+  the activity log and a short system summary. It downloads as a `.log.gz`
+  file.
+- **System logs are kept across later updates and included in backups.** Restoring a
+  backup keeps the router's own log, preceded by any older history the
+  backup carried.
+- **`/var` persists across reboots.** The system log lives at
+  `/var/log/messages` and the activity log under `/var/lib/startwrt/`, where
+  a standard Linux system keeps them.
+
+- **Only the router hands out addresses across its ports and Wi-Fi.** DHCP, DHCPv6, and IPv6 router advertisements from another device are no longer forwarded from one of the router's ports or Wi-Fi networks to another. A modem or router plugged into a LAN port instead of the WAN port could hand its own addresses to devices on the router's Wi-Fi, which then bypassed the router entirely. A device that needs to send router advertisements, such as a Thread border router, can be allowed to with the new **Allow IPv6 router advertisements** permission on its device page.
+
+- **Higher transmit power on 5 GHz channels 36–48 in the US.** With the country
+  set to United States, these channels now allow up to 30 dBm instead of 23 dBm.
+
+### Removed
+
+- Removed "Switch to all traffic" and "Switch to LAN only" from the inbound VPN client list. To change a client's routing, delete it and add it again with the routing you want.
+
+### Fixed
+
+- `apk upgrade` on the router no longer fails because of an unavailable package repository.
+
+- **First-time setup opens at `router.lan`.** While the router waits for its
+  admin password, a website typed into the browser is sent to
+  `http://router.lan` instead of showing a certificate warning and then the
+  setup page under that website's name.
+
+- Deleting a profile, or returning one to the ISP's DNS, no longer leaves the router's name resolving to that profile's old address until the next restart.
+
+- After the router restarts or updates, devices get an address as soon as the router is back, instead of up to two minutes later on routers with several profiles.
+
+- Moving an Ethernet port to another Security Profile gives a connected Linux client an address on the new profile's subnet without reconnecting it by hand.
+
+- **Saving the Ethernet page keeps WAN IPv6 on the WAN connection.** It no
+  longer moves the IPv6 client from the WAN connection onto the bare WAN port,
+  which on a PPPoE WAN would have run it outside the PPP link.
+
+- Renaming an inbound VPN client now works. Previously every rename failed with an error and the name never changed.
+
+- The inbound VPN client config dialog's visibility toggle and File/QR selector no longer sit under its close button with a long client name or in a narrow window.
+
+- Editing an inbound VPN server no longer lets you change its Security Profile, which created a second, empty server and left the original running. To move a VPN to another profile, delete it and add a new one.
+
+- Inbound VPN clients added with their own WireGuard public key can now connect. Adding one now shows its configuration, including the preshared key, with a placeholder for the device's private key. Clients added this way before this release never connected and must be deleted and added again.
+
+- Keeping settings while flashing from a microSD card now also preserves the configuration files of installed packages outside `/etc/config` that you have edited, such as SmartDNS and dnsmasq configuration. Files still at their package defaults take the new firmware's defaults.
+
+- A profile's LAN Access setting now reads back exactly as it was saved. A profile set to All keeps access to profiles created afterwards, instead of silently becoming a Whitelist of the profiles that existed when it was saved, and a Whitelist that includes every existing profile reads back as a Whitelist instead of All.
+- A profile that was set to All before this fix and has already lost access to newer profiles must be re-saved with LAN Access set to All.
+- A profile with LAN Access set to Same profile stays isolated from profiles created afterwards, even if its Whitelist option to include new profiles had been ticked before it was switched to Same profile.
+- A Whitelist with the option to include new profiles ticked can be saved with no profiles selected, and keeps that option when the last profile in it is deleted.
+- Forwardings between profiles' firewall zones added outside StartWRT, such as through LuCI, no longer show up as LAN Access.
+
+- The LAN IPv6 page shows the prefix size your ISP actually delegated, and checks the LAN prefix length against it rather than assuming a `/48`. A `/64` LAN prefix is now accepted on a `/64` delegation, and a LAN prefix too short for the delegation is shown at the length the router actually uses.
+- LAN IPv6 prefix lengths outside `/48` to `/64`, or shorter than the delegated prefix, are now rejected from the CLI as well as the web interface.
+
+- The port-mapping server now answers NAT-PMP requests with "unsupported version" instead of ignoring them, so NAT-PMP clients fall back right away rather than retrying for about two minutes.
+
+- An outbound VPN's detail page shows its tunnel's real state — **Connected**, **Idle**, **Not responding**, or **Disabled** — with the time of its last handshake, instead of reading **Connected** whenever the VPN is enabled. **Not responding** explains that profiles using the VPN have no internet until its server answers, and how to get them back online.
+
+- PPPoE WAN connections now connect.
+
+- Saving a profile, the LAN address, or a VPN or DNS setting no longer takes DHCP and DNS offline on every network for up to a few minutes, and a network that comes up during the save no longer stays without DHCP until another setting is saved or the router restarts.
+
+- Saving published ports while a device is offline no longer removes that device's IPv6 forwards; they keep the device's last IPv6 address. Adding IPv6 to a port for a device that has no global IPv6 address is now refused with an error instead of being silently left out.
+
+- Changing Remote Access closes WAN-side SSH sessions the new setting disallows, including changes applied from the CLI or after a WAN address change, and preserves sessions it still allows.
+
+- Error messages now name the specific error instead of "General error".
+
+- The serial console offers a login again after one times out. An unused login prompt expires after 60 seconds, and the console then stayed silent until the next reboot.
+
+- **Internet access stays blocked until setup is complete.** Before an admin
+  password was set, devices using their own DNS server, Private DNS, or
+  DNS-over-HTTPS could reach the Internet.
+
+- The first-boot setup page no longer stays blank where the web interface cannot load, such as in a captive-portal window; it says to open http://router.lan in Safari, Chrome or Firefox to finish setup.
+
+- Changing a LAN Network Block or a profile subnet offers to delete the inbound VPN server it would break, instead of showing an error.
+
+- Disabling WAN IPv6 keeps its settings, which return when it is enabled again, and the `wan6` interface stays visible in LuCI and `ubus` as stopped rather than missing.
+
+- The IPv6 prefix length set on the WAN page is now saved in SLAAC and DHCPv6 modes, not only in Static mode.
+
+- The WAN IPv4 summary reads **Not connected** when nothing is plugged into the WAN port or the WAN has no IPv4 address, instead of leaving the row out.
+
+- **Wi-Fi Blackout holds for the whole window.** Saving a Wi-Fi Blackout window
+  that covers the current time turns Wi-Fi off right away, after asking you to
+  confirm, and removing the active window turns Wi-Fi back on. Saving Wi-Fi, WAN,
+  LAN, Ethernet port, or Security Profile settings during a window no longer
+  turns Wi-Fi back on before the window ends.
+
+- The Devices page shows which Wi-Fi band (2.4 GHz, 5 GHz, or 6 GHz) each wireless client is connected on, instead of just "Wi-Fi".
+
+- Choosing a Wi-Fi channel that cannot carry the radio's channel width, such as 5 GHz channel 165 in the United States, no longer leaves that band's network down. A router already saved with such a pair narrows the width when it next starts.
+
+### Security
+
+- **Update the web interface and shared dependencies with security fixes**, including Angular, DOMPurify, TLS certificate verification and handshake handling, and HTTP/2 flow control, and replace the unmaintained YAML parser.
+
+- An IPv6 published port now delivers traffic only to the device it was published for. Previously, another device on the same Security Profile could spoof IPv6 neighbor discovery to have the router send that port's Internet traffic to it.
+
+- **Update the Linux kernel to 6.18.57** with upstream stable security and bug fixes.
+
+- **Update the OpenWrt base to 25.12.6**, including the hostapd fix for security advisory 2026-1 (malformed Wi-Fi 7 multi-link frames could crash the access point) and updated OpenSSL, wolfSSL, mbed TLS, and CA certificates.
+
+- Rebooting no longer brings back the sticker Wi-Fi password or turns disabled radios back on when no Wi-Fi password is assigned to the Admin profile. Previously, after any reboot, the sticker password gave Admin access to the LAN and reset the network name to `StartWRT`.
+- A router that already picked up the sticker password shows it as a **Default** entry on the `Points of Entry > Wi-Fi > Passwords` page. Delete that entry to remove the access it granted.
+
+- A profile routed through an outbound VPN now sends its DNS queries through the tunnel in every case where it has DNS servers to use there. Previously, a profile with custom DNS servers resolved them over the WAN, so the ISP saw every name it looked up, and a VPN whose config had no `DNS =` line left its profiles on the ISP's DNS servers.
+- With custom system DNS, a profile routed through a VPN whose config has no DNS servers resolves again, through the tunnel; previously its DNS stopped working.
+- A profile routed through a VPN with no DNS servers to use through the tunnel shows **System (outside VPN)** in the DNS column, because its DNS still goes to the ISP outside the tunnel.
+
+## [1.2.1]
+
+### Fixed
+
+- **A chained VPN no longer falls back to a single hop.** If the VPN it
+  connects through went down, or had not come up yet after a reboot, a chained
+  VPN reconnected to its server directly over your WAN, showing that provider
+  your home IP while every screen still reported the chain. It now stops until
+  its target is back. Existing chains are protected on the first boot of this
+  version.
+
+- **Outbound VPNs with an IPv6 server address connect.** A config whose
+  `Endpoint` was a bracketed IPv6 address, such as `[2001:db8::1]:51820`,
+  imported without error but its tunnel never came up. Existing VPNs are
+  repaired on the first boot of this version.
+
+- **VPN chaining refuses setups it cannot route.** A VPN can connect through
+  another only when its config's `Endpoint` is an IP address, the target VPN
+  can carry that address (it has an address of the same family and its
+  `AllowedIPs` include it), and no other VPN uses the same server address.
+  Previously these were accepted and the VPN either skipped the chain or could
+  not connect. Renaming a VPN while pointing it at a VPN that connects through
+  it is also refused as a circular chain. A VPN with a hostname `Endpoint`
+  offers only Internet as its target.
+
+- **VPN chains that could not route are switched to connect over the
+  Internet.** A VPN chained with a hostname `Endpoint` connected directly over
+  your WAN while every screen still reported the chain. On the first boot of
+  this version it is set to connect over the Internet, and the change appears
+  in the activity log. To chain it again, import a config whose `Endpoint` is
+  an IP address.
+
+- **A VPN connecting through another gets a fitting MTU.** With no MTU in its
+  config, or with the field left blank, it uses its target's MTU less the
+  chained tunnel's headers instead of 1420, avoiding fragmented packets.
+
+- **Custom DNS works after an update.** On a router using custom system DNS
+  or a profile DNS override, devices could not resolve names after an update
+  until a DNS setting was saved again. DNS lookups over TCP, used for answers
+  too large for UDP, also failed under custom DNS.
+
+### Security
+
+- Hardens authentication for local clients
+- Removes a third-party root certificate (`dc.com-CA`), inherited from the
+  board vendor's base image, from the router's system certificate store.
+  Routers drop it on their next update.
+
+## [1.2.0]
+
+### Added
+
+- **Wi-Fi regulatory country.** `Points of Entry > Wi-Fi > Settings` gains a
+  Country selector. The selected country sets the channels each band may use
+  and the maximum transmit power; the channel dropdowns list only what that
+  country permits, and automatic channel selection skips radar-detection
+  (DFS) channels, which take a minute or more to come up. With no country selected the router runs on a conservative
+  worldwide subset (2.4 GHz channels 1–11, 5 GHz channels 36–48, 20 dBm), so
+  select yours after setup.
+
+- **Root CA profile for iPhone and iPad.** Downloading the Root CA in Safari
+  on iOS or iPadOS now fetches a configuration profile that installs through
+  Settings.
+
+### Changed
+
+- **Setup ends with a link to `router.lan`.** After you set the admin
+  password, the confirmation page links to `router.lan` to trust your Root
+  CA, instead of saying the window can be closed.
+
+- **The Root CA walkthrough matches StartOS.** It links to the instructions
+  for each platform and no longer asks you to bookmark the page. The Root CA
+  downloads from `/static/local-root-ca.crt`, the path StartOS uses.
+
+### Fixed
+
+- **A published domain typed without `https://` now reaches the published
+  service, not the router.** While port 443 is published to a device — by a
+  Published Port or a device's hostname routes — plain HTTP at the router's
+  public address is answered with a redirect to `https://` instead of the
+  router's web interface, from inside the network and from the Internet under
+  every Remote Access setting. A Published Port or a hostname route on 80
+  takes precedence.
+
+- **Freshly generated Root CAs carry an Authority Key Identifier conforming to RFC 5280 and the CA/Browser Forum Baseline Requirements.** Existing routers retain their trusted Root CA when updated with settings preserved.
+
+- **Publishing a port no longer names the device after its generated label,
+  which could stop the router's DHCP server.** Publishing a port to a device
+  with no reserved address reserves one; for a device without a name of its
+  own, that reservation was saved under the label shown for it, such as
+  `Android device (4c8f63)`. The router's DHCP server refuses such a name and
+  failed to start on its next reload or reboot, leaving devices on the network
+  without addresses. Reserving an address now leaves the device's name alone,
+  the device page edits only the name you assigned rather than whatever was
+  shown, and the router rejects a reservation it could not serve — a name must
+  be a valid hostname (letters, digits, and hyphens; up to 63 characters).
+  A router that already holds such a name clears it on its first boot on this
+  version and serves DHCP again, recording the cleared name in Activity. Since
+  a router in that state is hard to reach, reflashing from a microSD card and
+  choosing **Keep settings** is the way to get there without losing anything —
+  that path preserves the settings the name is stored in.
+
+- **A device can move a hostname route it holds to another of its own ports.**
+  Previously the request was refused as taken until the old lease expired.
+
+## [1.1.1]
+
+### Fixed
+
+- **Flashing to internal storage no longer depends on the microSD card's
+  partition table being untouched since the image was written.** A card whose
+  table a partition tool had rewritten to span the whole card, or whose last
+  partition had been grown to fill it, made the flash fail with
+  `rootfs_data partition not found on eMMC` and left the router unable to boot
+  from internal storage until reflashed.
+
+## [1.1.0]
+
+### Added
+
+- Automatic port forwarding (PCP + UPnP IGD). A LAN device can now open and
+  renew its own port forwards using the standard PCP and UPnP protocols —
+  StartOS servers use this to configure themselves automatically behind a
+  StartWRT router, and game consoles/torrent clients are covered too.
+  Authorization is per-device and **off by default**: enable it with the new
+  "Allow automatic port forwarding" toggle on the device's detail page. A
+  device can only ever forward ports to itself — and because PCP runs over UDP,
+  a request is honored only when it actually arrives from the network the
+  device lives on, so a device on one network can't open forwards on behalf of
+  a device on another. Requests that would take
+  over a manually published port are refused (conversely, publishing a port an
+  automatic forward holds removes the automatic forward — manual rules win).
+  Ports the router itself answers on from the internet are refused too, so an
+  automatic forward can never take over your remote access to the router, its
+  SSH, or a VPN server you've exposed.
+  Forwards are stored as tagged UCI firewall redirects (so they survive
+  reboots and never collide with manual published-port rules), renew on an
+  in-memory lease (no flash writes on renewal), and expire on the lifetime the
+  device requested when it stops renewing them — at most a week, even for a
+  device that asks to hold the port indefinitely. A forward is also removed
+  once the device no longer holds the address it points at — its DHCP lease
+  lapsed, or it returned on a different address — so a forward can never
+  quietly deliver Internet traffic to whichever device is given that address
+  next (devices with a reserved address are unaffected). Turning the toggle
+  back off — or forgetting the device — closes that device's forwards and
+  hostname routes immediately.
+  The Published Ports page gains a read-only "Automatic" section showing each
+  port use's device, kind (PCP, UPnP, or SNI), and expiry. UPnP clients see a complete gateway:
+  the router advertises the `WANCommonInterfaceConfig` service clients use to
+  recognize an Internet Gateway Device, answers the status actions they check
+  before mapping anything, and supports reading mappings back
+  (`GetSpecificPortMappingEntry`/`GetGenericPortMappingEntry`) — a device sees
+  only its own. The router identifies itself as "StartWRT" to those clients. The
+  UPnP endpoints refuse browser-shaped requests — DNS-rebinding requests and
+  blind cross-origin writes alike — so a malicious web page cannot use a LAN
+  device's browser to read the network's public IP, fingerprint the router, or
+  open that device's ports. Uses the shared `start-core` PCP/IGD server cores.
+  Devices can also register **SNI hostname routes** on a shared external port
+  (over PCP's HOSTNAME extension or the `X_START9_AddHostnameMapping` UPnP
+  vendor action): the router reads each TLS connection's requested hostname
+  and delivers it to whichever device owns it, so several devices — or several
+  services on one StartOS server with their own domains — share one port such
+  as 443. Hostname routes appear in the Automatic section with their hostname,
+  follow the same per-device permission and lease expiry as plain forwards,
+  claim their shared port whole (plain forwards on it are refused; ports the
+  router itself answers on — SSH, an inbound VPN — are refused to hostname
+  routes for the same reason), and are re-registered by the device within
+  minutes after a router restart rather than persisted. Remote access to the
+  router's own web interface is the exception, not a casualty: hostname
+  routes and remote access share port 443 — connections naming a routed
+  hostname reach its device, and everything else (such as browsing the
+  router by IP address) still reaches the router interface, accepted from
+  exactly the sources your Remote Access setting allows, so enabling one
+  feature never silently disables the other.
+  A routed hostname works from inside your own network too — a laptop on your
+  LAN can open the same public address and reach the device — with one
+  consequence worth knowing: because the device answers a local client
+  directly rather than through the router, the router puts its own address on
+  those connections, so the device cannot tell one local client from another
+  in its logs. Connections from another Security Profile, and from the
+  Internet, still carry the original address.
+- The UI now detects when the running firmware ships a newer interface than
+  the page is displaying (every RPC response and `system.info` report the
+  firmware's build stamp and the UI compares it to its own). An update
+  installed from the current tab reloads the page automatically once the
+  router is back (the "Updated to vX" confirmation follows after login); an
+  update applied any other way — CLI deploy, another device — shows a
+  "Refresh Needed" dialog with a Reload button rather than reloading out from
+  under unsaved work. Detection rides an `x-startwrt-git-hash` header on every
+  RPC response, so an open tab notices within seconds of its next request even
+  when the update restarted the daemon too quickly to drop a connection; pages
+  that make no requests while idle re-check every 30 seconds.
+- **Devices that never share a hostname are now identified by operating
+  system or hardware vendor instead of a meaningless placeholder.** Some
+  devices deliberately withhold their name from the router — Chromebooks
+  never send one, and many IoT gadgets can't — and previously showed up as an
+  opaque `device-3af2b1`. The device list now recognizes the operating system
+  from how the device requests a network address (its DHCP fingerprint), e.g.
+  `Windows device (3af2b1)`, or failing that the vendor behind its MAC
+  address, e.g. `Apple device (3af2b1)` — keeping the short suffix so
+  identical unnamed devices stay distinguishable. OS recognition works even
+  for devices using randomized Wi-Fi addresses, survives reboots, and a real
+  hostname, when one ever appears, still takes over automatically; names you
+  assign always win.
+- **6in4 tunnels can now be configured on the router.** The `6in4` protocol
+  and the SIT kernel module it needs now ship in the image, so an IPv6 tunnel
+  from a broker such as Hurricane Electric can be set up over SSH — useful for
+  reaching IPv6 on an ISP that provides none. There is no UI for this yet.
+  Previously these packages had to be built and sideloaded by hand after every
+  update, since a sysupgrade does not preserve separately installed packages.
+- **eMMC boot firmware provisioning.** The flash wizard, in-app updates, and a
+  check on every boot now converge the eMMC hardware boot partitions
+  (boot0/boot1) to the release's own `bootinfo` + FSBL (u-boot SPL, built from
+  the pinned `spacemit-com/uboot-2022.10` source). Previously only vendor
+  factory tooling ever wrote boot0, so a DIY BananaPi BPI-F3 whose factory left
+  it empty (or carrying an incompatible bootloader vintage) completed the setup
+  wizard but could not boot from eMMC once the microSD card was removed. Writes
+  are idempotent (byte-compared, skipped when already current), read-back
+  verified, and ordered for power-cut safety (boot1 mirror first, the
+  single-sector bootinfo header last); boards already carrying the current
+  firmware are not touched. The boot-time check makes provisioning effective
+  from the first boot after installing this release and self-heals damaged or
+  interrupted boot firmware thereafter. The `bootinfo_emmc.bin` blob now ships
+  in the image's bootfs partition to support this.
+- **The firmware image now ships MediaTek MT7915 Wi-Fi firmware alongside the
+  MT7916 firmware.** MT7915-based mini PCIe modules (such as the AsiaRF
+  AW7915-NP1) previously failed to initialize on DIY builds: the driver was
+  present but the firmware files were not, so no Wi-Fi radio ever appeared.
+  Note that MT7915 band-selectable cards operate one band at a time — with the
+  stock configuration the 2.4 GHz network comes up — unlike the
+  dual-band-concurrent AW7916-NPD module shipped in Start9 routers.
+- **Hardware documentation.** A new Hardware page in the user guide lists the
+  router's specifications and publishes the SpacemiT K1 reference schematic the
+  board descends from, noting where the shipped router differs from that
+  reference design and why.
+- **The StartWRT user guide is now published** at
+  [docs.start9.com/start-wrt](https://docs.start9.com/start-wrt/).
+
+### Changed
+
+- **Publishing a port the router itself answers on now asks for confirmation.**
+  Ports the router serves from the internet — remote access to its web
+  interface and SSH (80/443/22, including "When behind NAT" mode while the
+  router sits behind another router) and an inbound VPN's listen port —
+  previously could be published to a device without warning, silently cutting
+  that router service off from outside your network. Saving such a rule now
+  surfaces the conflict in a confirmation dialog; you can still publish the
+  port deliberately, and you're asked once per rule — again only if you
+  change which port that rule publishes, or its protocol. Detection follows
+  the live configuration (nothing is asked for ports no router service uses) and
+  matches transports, so e.g. a UDP-only forward on 443 doesn't warn.
+- The firmware build stamp is now identical everywhere it appears: the
+  `startwrt` binary (UI `ETag`, `system.info`, `startwrt verify`) now carries
+  the same full-hash `-modified`-suffixed stamp the Settings → General
+  **Build** field bakes in via `config.json`, instead of a separate
+  short-hash `-dirty` stamp.
+
+### Removed
+
+- **The IPv6 "Reserve" option has been removed — it never worked and never
+  could.** Devices choose their own IPv6 addresses via SLAAC, so a router
+  cannot reserve one; the toggle wrote a DHCPv6 hint that no mainstream
+  client ever requests. The device page now shows the IPv6 address read-only
+  with an explanation, publishing a port no longer claims the IPv6 address
+  "will be reserved" (the rule follows the device's current address
+  automatically), and the LAN IPv6
+  SLAAC toggle now locks while enabled published-port rules use IPv6 rather
+  than when "reserved" devices exist. The `devices.update` RPC no longer
+  accepts `ipv6_static`/`ipv6` fields. IPv4 reservations are unchanged.
+
+- **The Start9 DDNS provider option has been removed.** The Start9 DDNS
+  service has not launched yet, so selecting it saved a configuration that
+  could never update a DNS record. Configurations previously saved with the
+  Start9 provider now read back as Dynamic DNS disabled; pick one of the
+  supported providers to re-enable. The option will return when the Start9
+  service goes live.
+
+### Fixed
+
+- **The WAN IPv6 "6RD" mode now works.** Selecting it wrote a valid
+  configuration, but the image shipped without the `6rd` protocol handler or
+  the SIT kernel module it depends on, so the WAN interface simply came up
+  without IPv6 — with nothing in the UI to indicate why. Both now ship.
+
+- **Disabled outbound VPNs are no longer offered as a Security Profile's
+  outbound route.** The VPN picker on the profile's WAN / Internet tab listed
+  every VPN, including disabled ones — and picking one silently cut that
+  profile off the Internet, since a disabled VPN's tunnel never comes up. The
+  picker now lists only enabled VPNs, and the router refuses a profile pointed
+  at a disabled — or nonexistent — VPN, so the command line can't create the
+  same dead end.
+
+  The same applied to VPN chaining, where it was quieter and worse: a disabled
+  VPN could be picked as another VPN's **Connects to** target, and the chain
+  then silently collapsed to a single hop. The downstream VPN connected
+  normally — straight out your Internet connection instead of through the VPN
+  you chained it to — and every screen reported success. Disabled VPNs are no
+  longer offered as chain targets, and the router rejects one outright.
+
+- **The bottom of the screen is no longer cut off on shorter displays.** On
+  screens shorter than a page's contextual help content, the sidebar's
+  Collapse button and the bottom of the page — including a form's Cancel/Save
+  buttons, even when scrolled all the way down — were clipped, whether or not
+  the help panel was open. The layout now always fits the screen exactly, and
+  long help content scrolls within its panel.
+
+- **A narrow window no longer cuts off the right side of the page.** Below
+  the mobile-layout width, page content is laid out at the width the collapsed
+  sidebar leaves free; with the sidebar still expanded, that layout ran under
+  the window's right edge — hiding a form's Cancel/Save buttons and other
+  right-edge content — with no way to scroll to it. The sidebar now collapses
+  automatically when the window becomes that narrow (and re-collapses after
+  navigating on a phone), and expanding it by hand at that width now shows a
+  horizontal scrollbar, so everything stays reachable either way.
+
+- **Changing a published port no longer briefly drops the firewall.** Applying
+  a port-forward change restarted the firewall, which tears the whole ruleset
+  down and rebuilds it as two separate steps — for a moment in between, the
+  router had no firewall and no NAT, and connections started in that window
+  were unfiltered. It now reloads instead, applying the new ruleset in a single
+  atomic step with no gap, and a ruleset that failed to build leaves the
+  running one untouched rather than leaving nothing in place.
+
+- **Enabling LAN IPv6 no longer silently fails when the Admin profile routes
+  through an IPv4-only VPN.** Saving the LAN IPv6 settings reported success
+  but immediately reverted to disabled: the save re-derived the admin LAN's
+  router advertisements from whether its outbound VPN carries IPv6, undoing
+  the change in the same write. Editing the Admin profile onto an IPv4-only
+  VPN likewise switched LAN IPv6 off behind your back — and kept it off even
+  after switching the outbound back. The LAN IPv6 toggle is now the sole
+  owner of that setting; with an IPv4-only VPN outbound, LAN devices still
+  get local (ULA) IPv6 addresses while internet-bound IPv6 remains blocked
+  by the VPN kill switch, so nothing leaks around the tunnel. That same
+  fault could also leave a router where the LAN IPv6 page read "Disabled"
+  while individual Security Profiles carried on handing out IPv6 addresses —
+  the page and the network disagreeing, with no way to bring them back into
+  line. Routers left in that state are now repaired automatically on the
+  first start after updating, which turns IPv6 off for those profiles too;
+  turn it back on from the LAN IPv6 page if you want it, and this time it
+  applies everywhere at once.
+
+- **Turning IPv6 off now tells your devices to drop their IPv6 addresses.**
+  Devices choose their own IPv6 addresses from a prefix the router advertises,
+  and the only way to take one back is to advertise it one last time as
+  expired. The router was restarting its advertisement service instead of
+  reloading it, which skips that goodbye entirely — so after disabling IPv6
+  (on the LAN, on a Security Profile, or on the WAN) devices carried on using
+  addresses that no longer worked, for up to 90 minutes, until the addresses
+  timed out on their own. The notice is now sent while the prefix is still
+  live. A device that is asleep or misses the notice still falls back to the
+  timeout.
+
+- **The Devices list no longer shows IPv6 addresses a device has given up.**
+  The router remembers a neighbouring address long after the device stops
+  using it, so a device could keep displaying an IPv6 address for hours after
+  it dropped it — most visibly after turning IPv6 off, where the address on
+  screen suggested nothing had changed. The router now confirms the device
+  still answers on an address before showing it, and leaves the field empty
+  when it does not.
+
+- **Published ports no longer reshuffle their order on every refresh.** The
+  list is auto-refreshed every few seconds, and each refresh returned the
+  rows in an arbitrary order, so the table visibly jumped around. Published
+  ports now appear in a stable order, sorted by label.
+
+- **A device that missed its one chance to share its name over mDNS/Bonjour is
+  no longer stuck with a generic label until the router reboots.** The name
+  lookup was attempted exactly once per device, and it usually fired at the
+  worst moment — the instant the device first appeared (before its Bonjour
+  service finished starting), or during the reconnection rush right after a
+  router reboot — and sleeping phones and laptops don't answer at all. The
+  router now retries silent devices on a backoff schedule (about a minute
+  after the first miss, stretching to a day) before concluding the device has
+  no name to share; a device that answers is remembered permanently.
+
+- **IPv6 published-port rules now follow the target device when it changes
+  its address.** Devices assign their own IPv6 addresses and change them
+  routinely — privacy addresses rotate daily, and most operating systems
+  derive new addresses whenever the ISP rotates the delegated prefix — but
+  rules were only re-resolved on a prefix change, so a device-side change
+  silently broke the forward. The router now watches the network for
+  neighbor changes and retargets affected rules within seconds. Rules also
+  now pin the device's long-lived (stable) address instead of whichever
+  address happened to be observed first, which could be a short-lived
+  privacy address that expired within days. The **Endpoints** column shows
+  that same stable address, so the endpoint you copy always matches the rule.
+
+- Browsers could keep serving a stale, cached copy of the web UI after a
+  firmware update — the router previously sent no cache headers, leaving cache
+  behavior to per-browser heuristics (Firefox/Safari could silently run an old
+  UI against the new backend). The embedded UI is now served with explicit
+  headers: stable-named files (`index.html`, `assets/`) revalidate on every
+  load against a per-build `ETag` (a cheap `304 Not Modified` when unchanged),
+  while Angular's content-hashed bundles are cached as `immutable`. Requests
+  for assets from an older build now get a `404` instead of a mis-typed
+  `index.html` fallback.
+- The "Updated to vX" confirmation shown after a firmware update is now
+  translated instead of always appearing in English.
+
+- **Documentation corrected against the code in a full docs-vs-code audit.** The
+  user guide no longer misstates product behavior: backups _do_ preserve assigned
+  device names and data-usage history; a Fresh Start reflash sets a new admin
+  password rather than clearing it; published-port statuses do not detect CGNAT;
+  Ethernet profile changes apply immediately (there is no Save button); inbound
+  VPN client configs must be captured when the client is created (the private
+  key is never stored). Also refreshed drifted UI labels throughout the guide,
+  corrected `API_CONTRACT.md` wire types and documented the previously missing
+  endpoints, and fixed stale paths, commands, and structure descriptions across
+  the developer docs.
+
+- **Cloudflare Dynamic DNS now saves a working configuration.** The saved
+  config was missing fields the update client requires (the Bearer-token
+  marker and the zone), so Cloudflare updates could never succeed. The form
+  now asks for the **Zone** — the domain registered with Cloudflare, e.g.
+  `example.com` — instead of a Zone ID. Previously saved Cloudflare
+  configurations must be re-saved with the zone filled in. Note that the
+  DNS record must already exist in Cloudflare (the client updates records,
+  it does not create them), and the API token needs Zone:Read and DNS:Edit
+  permissions. Proxied (orange-cloud) records are supported: the client
+  reads the registered IP through the Cloudflare API rather than DNS, which
+  would only ever see the proxy's address.
+
+- **Dynamic DNS now actually updates your provider.** The image was missing
+  the `ddns-scripts` update client (and its Cloudflare and No-IP extensions),
+  so DDNS settings were saved but no DNS record was ever updated. The FreeDNS
+  provider also pointed at a service name (`freedns.afraid.org`) that modern
+  `ddns-scripts` no longer recognizes; it now uses the afraid.org update-key
+  service (`afraid.org-keyauth`), and configurations saved with the old name
+  are still read back correctly. DDNS configurations are also bound to the
+  WAN interface, so an update fires the moment the connection comes back up
+  (e.g. after a modem reboot or PPPoE reconnect) instead of waiting for the
+  next scheduled check.
+
+- **Published Ports endpoints no longer disappear when a WAN setting can't be
+  read.** A network interface hand-configured with a protocol StartWRT doesn't
+  manage (e.g. a `6in4` tunnel on `wan6`) made the WAN/LAN IPv6 settings
+  endpoints error, and the Published Ports page treated that one failure as
+  fatal — every port's IPv4 endpoint showed `—` even though the forwards were
+  active. Unmanaged protocols now read back gracefully (reported as IPv6
+  disabled) and are preserved untouched on disk, and the page now loads each
+  WAN setting independently, so one failure can no longer blank out the
+  endpoint list.
+
+- **A published port is now reachable from your other Security Profiles at the
+  router's public address.** Reaching a published port by the router's public
+  address — or a domain name pointing at it — rather than the device's LAN
+  address only worked from the target device's own profile. From any other
+  profile the router answered instead of the published service, so an app or
+  bookmark holding a public address worked on one network and not another. A
+  published port is a public resource, so those connections are now delivered
+  to the device from every profile that could reach it from the Internet and
+  from every profile with Access to the device's profile — and from those only.
+  A profile could reach it from the Internet when its WAN Access is All, a
+  Blacklist that does not block the router's public address, or a Whitelist
+  that includes it, outside any blackout window. The routes follow your
+  Security Profile settings and your public address as they change, apply to
+  the device's global IPv6 address as well (where a Whitelist or Blacklist
+  entry counts by the device's address), and cover ports opened through
+  automatic port forwarding (UPnP/PCP) the same way. Nothing else on the device
+  is opened: a profile without Access still cannot reach it at its LAN address
+  or on any other port.
+
+### Security
+
+- **A published port restricted by Source is no longer reachable from your own
+  network at the router's public address.** The restriction applied to
+  connections arriving from the Internet, but a device on your own network
+  could reach the port through the router's public address regardless of it.
+  Restricted rules are no longer served that way; reach them from inside your
+  network at the device's own LAN address.
+
+## [1.0.1]
+
+### Added
+
+- **`startwrt-cli verify` now checks the EEPROM WiFi password.** The factory
+  QC utility reads EEPROM tag 0x2F, verifies it satisfies the password
+  constraints (valid TLV, 12 characters from the non-ambiguous charset), and
+  prints the password for visual comparison against the device sticker. On
+  failure it reports the specific violation (invalid TLV, missing tag, wrong
+  length and/or bytes outside the charset).
+
+### Changed
+
+- **The Inbound VPN dialog no longer steals focus when it opens**, which on
+  mobile raised the keyboard the instant the dialog appeared.
+
+## [1.0.0]
+
+First stable release of StartWRT — Start9's OpenWrt-based router OS for home
+self-hosting, built around per-device Security Profiles (assigned by Ethernet
+port, WiFi password, or inbound VPN), with inbound/outbound WireGuard VPNs and
+VPN chaining, WiFi schedules, dynamic DNS, and published-port forwarding.
+Ships as a flashable image for the SpaceMiT K1 (BananaPi-F3), with OTA updates
+delivered through the Start9 registry.
+
+## [0.1.0-beta.4]
+
+### Added
+
+- **`--version` flag.** `startwrt --version` now reports the StartWRT version (e.g.
+  `0.1.0-beta.4`); the CLI previously exposed no `--version`.
+
+### Changed
+
+- OpenWrt base upgraded **25.12.4 → 25.12.5** (`r33051-f5dae5ece4`), picking up
+  the upstream stable-branch fixes. All three Start9 build-infra patches apply
+  unchanged, and no upstream path collides with the Start9 overlay.
+
+- The OpenWrt image now builds from **pristine upstream OpenWrt** (the release
+  tarball pinned by sha256 in `build/openwrt-version`) with the Start9 delta
+  applied at build time from in-repo `openwrt-patches/` (3 build-infra patches)
+  and `openwrt-overlay/` (the SpacemiT K1 target + boot packages). The
+  `Start9Labs/openwrt` fork and the monorepo's last git submodule are retired;
+  cloning no longer needs `--recursive`, and the `openwrt/` build workspace
+  contains no git repo at all. The prepared tree is byte-identical to the
+  former fork (verified by git tree hash), so image contents are unchanged.
+
+- Relocated into the `start-technologies` monorepo as the `start-wrt` product. The
+  three backend crates (`startwrt-core`/`ctrl`, `uciedit`, `uciedit_macros`) are now
+  members of the root Cargo workspace and build against the **shared** `start-core`
+  crate (`shared-libs/crates/start-core`, pulled in aliased as `startos`), the
+  vendored `rpc-toolkit`, and the vendored `imbl-value` — replacing the previously
+  embedded `start-os` submodule and the git/crates.io copies of those deps.
+- Build orchestration moved from the standalone product `Makefile` to
+  `projects/start-wrt/build.mk` (included by the root `Makefile`): `make start-wrt`,
+  `make start-wrt-image`, `make start-wrt-update`.
+- The Angular web UI is now a project (`start-wrt`) in the **root Angular workspace**
+  instead of a standalone app. It shares the root `package.json`/`node_modules`/
+  `tsconfig.json` and builds via `npm run build:wrt` (serve `npm run start:wrt`,
+  type-check `npm run check:wrt`) — and so upgrades in lockstep with the other Start9
+  Angular apps. `RELATIVE_URL`, `pauseFor`, and the markdown pipe now come from
+  `@start9labs/shared`. The HTTP/RPC/connection stack (its aborting-timeout, code-0
+  reconnect flow is deliberately different from shared's), the bespoke error surfacing,
+  `WorkspaceConfig`, the WebSocket progress types, and the i18n-routed `validation-errors`
+  provider stay local where the shared code would regress behavior or the shapes don't fit.
+- `@start9labs/shared` is now marked `sideEffects: false` so importing a few symbols from
+  its barrel tree-shakes cleanly (start-wrt's embedded UI bundle would otherwise pull in
+  ~875 kB of unused shared code). This also shrinks the other apps' bundles.
+- Restored the release CI that the monorepo migration had dropped, then folded StartWRT
+  into the monorepo-wide release tool: `start-wrt.yaml` again has a `deploy` job, but it
+  now _only_ uploads the built images to S3 (`s3://startwrt-images`) — the CDN the registry
+  serves from. To match `startos-iso.yaml`, it is `workflow_dispatch`-gated on a `deploy:
+release` input (rather than the old standalone workflow's `v*`-tag push) and reads the
+  version from `backend/ctrl/Cargo.toml` (the standalone workflow read the now-removed
+  `web/package.json`). Tagging, cutting the GitHub release, and the registry publishing are
+  now driven by the top-level `scripts/manage-release.sh` (a new `wrt` project kind alongside
+  os/cli/deb/npm), which replaces the standalone
+  `projects/start-wrt/scripts/manage-release.sh`. Registry publishing mirrors the OS's staged
+  flow: `register start-wrt` indexes a CI build into a beta registry, where beta routers
+  (UCI `startwrt.system.registry` pointed at it) soak the version as a normal OTA update, and
+  `release start-wrt` then promotes it into the production registry — both deliberate local,
+  developer-key-gated steps. Releases are cut on `Start9Labs/start-technologies` with the
+  monorepo's `<project>/v<version>` tag convention (`start-wrt/v<version>`), since the
+  monorepo hosts every product's releases on independent cadences. Release assets follow the
+  startos naming convention —
+  `startwrt-<version>-<git hash>_spacemit-k1-{sdcard.img.gz,sysupgrade.img.gz}` — instead
+  of the raw OpenWrt output names, which carried no product, version, or hash; the sdcard
+  image is now gzipped (it was previously published raw), and balenaEtcher flashes the
+  `.img.gz` directly.
+- Restored the OpenWrt download-cache keying the migration had narrowed: the `image` job's
+  cache key again includes `build/feeds.conf` (so changing the feed set busts the cache) and
+  carries a `restore-keys` fallback (so a partial older cache can seed a fresh run).
+
+### Fixed
+
+- Changing the admin password now enforces the 12-character minimum. The
+  Settings → Password form and its `auth.set-password` backend endpoint (also
+  reached via the `startwrt auth set-password` CLI) accepted passwords shorter
+  than 12 characters, even though first-time setup required it and the docs
+  documented the minimum. Both the frontend form and the backend now reject
+  passwords under 12 characters on change, matching initial setup.
+
+- Changing the Router IP can no longer strand the network on a colliding subnet.
+  The LAN IPv4 page exposed a "Router IP" (3rd-octet) field that duplicated the
+  Admin Security Profile's subnet field but, unlike it, had no collision guard —
+  so setting the router onto a subnet already used by another profile put two
+  interfaces on the same /24, producing overlapping routes that silently broke
+  all access to the router (unrecoverable even by a keep-settings reflash). The
+  duplicate field is removed (the LAN page now only selects the /16 network
+  block; the Admin profile is the single source of truth for the 3rd octet), and
+  the backend now rejects `profiles.create`/`profiles.edit` requests whose /24
+  collides with an existing profile (including the admin LAN). The `lan.ipv4-set`
+  endpoint (reached via the CLI) is covered by the same guard, so a direct
+  RPC/CLI call can't strand the router either.
+
+- The Settings → General **Build** field no longer goes stale after new commits.
+  `build.mk` had lost the wiring that refreshes `build/env/GIT_HASH.txt` on every
+  build and treats it as a prerequisite of `web/config.json`, so the UI's `gitHash`
+  froze at whatever it was when `config.json` was first generated. `build.mk` now
+  refreshes `GIT_HASH.txt` at parse time and re-stamps `config.json` whenever `HEAD`
+  moves.
+- The **Build** field now shows the `-modified` marker on a dirty build. It shortened
+  the 40-char hash with `slice(0, 12)`, which dropped the trailing `-modified` suffix;
+  it now preserves any trailing marker (matching the `-dirty` indicator the
+  `startwrt verify` CLI already shows).
+- Adding an Outbound VPN no longer silently does nothing. On submit the dialog
+  called `tuiMarkControlAsTouchedAndValidate`, which re-ran the WireGuard `.conf`
+  async validator and left the form stuck `PENDING` (the in-flight validation is
+  cancelled when the file input remounts during the pending phase), so the create
+  request was never sent. Submit now completes directly when the form is already
+  valid, and only marks fields touched — without re-validating — when it isn't.
+- Web-only changes are now re-embedded into the `startwrt` binary on rebuild. The
+  UI is baked in at compile time via `include_dir!`, which does not register the
+  embedded files as cargo dependencies, so `ctrl`'s `build.rs` now emits a
+  `cargo:rerun-if-changed` for the web `dist` directory. Previously a changed web
+  bundle was silently ignored unless a `.rs` file also changed, shipping a stale
+  UI.
+
+## [0.1.0-beta.3]
+
+StartWRT is Start's fork of OpenWrt — a router OS for home self-hosting built around
+per-device Security Profiles, with profiles assigned by Ethernet port, WiFi password,
+or inbound VPN. Features inbound/outbound WireGuard VPNs with VPN chaining, WiFi
+schedules, dynamic DNS, and published-port forwarding. A Rust backend (`startwrt`
+binary: RPC daemon + CLI over JSON-RPC 2.0, UCI as source of truth) serves an embedded
+Angular + Taiga UI frontend, shipped as a flashable OpenWrt image for the SpaceMiT K1
+(BananaPi-F3).

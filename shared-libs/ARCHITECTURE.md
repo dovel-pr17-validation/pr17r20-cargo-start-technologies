@@ -1,0 +1,104 @@
+# Architecture
+
+`shared-libs/` groups shared Rust crates and TypeScript modules.
+Each sub-library has its own detailed `ARCHITECTURE.md`; this file only explains
+how these libraries relate to the rest of the monorepo.
+
+## Place in the monorepo
+
+`shared-libs/` sits at the repo root and holds `crates/` (the backend and
+supporting Rust crates) and `ts-modules/` (shared TypeScript modules) — that the thin product crates and apps under `projects/`
+consume. It builds nothing of its own. See the root
+[ARCHITECTURE.md](../ARCHITECTURE.md) for the overall monorepo layout.
+
+## `crates/start-core` — Rust backend
+
+The complete StartOS backend, published as Cargo package `start-core` with lib
+name `start_core` (`[lib] name = "start_core"`). It is part of the single root Cargo
+workspace and shares the one `Cargo.lock`.
+
+The OS, CLI, registry, and tunnel binaries are thin wrappers that depend on this crate:
+
+| Binary                         | Product crate    | Source                                |
+| ------------------------------ | ---------------- | ------------------------------------- |
+| `startbox` / `start-container` | `start-os`       | `projects/start-os/src/bin/*.rs`      |
+| `start-cli`                    | `start-cli`      | `projects/start-cli/src/main.rs`      |
+| `registrybox`                  | `start-registry` | `projects/start-registry/src/main.rs` |
+| `tunnelbox`                    | `start-tunnel`   | `projects/start-tunnel/src/main.rs`   |
+
+`startwrt` (`projects/start-wrt/backend/ctrl/src/bin/startwrt.rs`) also depends on
+`start-core`, aliased as `startos`, but owns its router backend rather than wrapping
+the shared entrypoints. Other shared crates include `exver`, `imbl-value`,
+`jsonpath`, `patch-db`, `pi-beep`, `rpc-toolkit`, and `yasi`.
+
+Key module groups under `crates/start-core/src/` include `bins`, `service`,
+`s9pk`, `net`, `db`, `install`, `update`, `lxc`, `os_install`, `backup`, `sign`,
+`version`, `registry`, and `tunnel`. It consumes the patch-db Rust core from the
+first-party `shared-libs/crates/patch-db/` (`patch-db = { path = "../patch-db/core" }`).
+See [`crates/start-core/ARCHITECTURE.md`](crates/start-core/ARCHITECTURE.md) for
+the internal design.
+
+## Reflection and RPC bindings
+
+`crates/visit-rs/` and `visit-rs-derive/` own generic value/type reflection and
+opaque metadata. `VisitFields` for structs and `VisitVariants` for enums preserve
+all raw Rust members and attributes through unconditional `TypeInfo` facts.
+Static traversal presents explicitly opaque storage without stored-type bounds;
+independent `visit_rs::VisitTypeAttributes` traversal collects compiler-resolved
+types from locally selected existing metadata literals.
+
+`rpc-toolkit/ts` owns direction-aware serde normalization, layout/default/hook
+policy, TypeScript rendering, scalar bridges, declaration identity and exports.
+Core and WRT enable that consumer only through their own `ts` features, for their
+binding generators and tests; product binaries build without it. Consumer
+`reflect_ts!` bridges and typed `ts_export!` registrations live beside declarations;
+actual handler traversal and namespace collection share the directional renderer.
+
+## `ts-modules` — shared TypeScript modules (workspace rooted at repo root)
+
+The single Angular workspace root for every front end is at the monorepo root:
+`angular.json`, `package.json`, and `package-lock.json` live at the repo root, and
+app projects define their UIs in their own `web/` subdirectories (e.g.
+`projects/start-os/web/`, `projects/start-tunnel/web/`).
+
+`shared-libs/ts-modules/` holds shared TypeScript modules; two Angular source
+libraries and one non-Angular core lib:
+
+- **`shared-libs/ts-modules/shared/` → `@start9labs/shared`** — API clients, shared
+  components, i18n dictionaries, and global styles used by every UI.
+- **`shared-libs/ts-modules/marketplace/` → `@start9labs/marketplace`** — service
+  discovery / marketplace UI, shared between the StartOS `ui` app and the public
+  `brochure-marketplace` marketplace site.
+- **`shared-libs/ts-modules/start-core/` → `@start9labs/start-core`** — the SDK's core
+  types, ABI, effects interface, and OS bindings (the TS projection of the `start-core`
+  Rust crate). Consumed directly by web and bundled into `@start9labs/start-sdk`.
+  Versionless; not published to npm on its own.
+
+App projects defined in the root `angular.json` (`ui`, `setup-wizard`, `start-tunnel`,
+`start-wrt`, `brochure-marketplace`) reference the two Angular libraries via the TypeScript path
+mappings in the root `tsconfig.json`. The libraries also depend on
+`@start9labs/start-core` (built from `shared-libs/ts-modules/start-core/dist`) and
+`patch-db-client` (built from `shared-libs/crates/patch-db/client`).
+
+## Data flow
+
+```
+shared-libs/crates/patch-db (first-party)
+  ├── core  ──────────────► crates/start-core (Rust)   ──► product binaries
+  └── client ─────────────► projects/*/web (Angular)   ──► product web apps
+                            shared-libs/ts-modules/*
+                                  ▲
+shared-libs/ts-modules/start-core/dist ──┘
+```
+
+The Rust backend emits RFC-6902 JSON Patches via patch-db core; the web client
+applies them via `patch-db-client`. TypeScript types shared with the backend are
+generated by `visit-rs` and `rpc-toolkit` from the actual server handlers and
+standalone exports. Frontend/runtime wrappers infer requests and results from
+those method trees; opaque JSON projections stay at their owning application
+boundaries.
+
+## Further reading
+
+- [README.md](README.md) — what this directory is and how to use it.
+- [AGENTS.md](AGENTS.md) — build/test/format workflow.

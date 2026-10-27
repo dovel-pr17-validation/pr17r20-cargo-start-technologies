@@ -1,0 +1,38 @@
+{
+  "/rpc/**": {
+    "target": "https://<CHANGE_ME>",
+    "secure": false,
+    "changeOrigin": true
+  },
+  "/s9pk/**": {
+    "target": "https://<CHANGE_ME>",
+    "secure": false,
+    "changeOrigin": true
+  },
+  "/registry/**": {
+    "target": "https://<CHANGE_ME>",
+    "secure": false,
+    "changeOrigin": true
+  },
+  "/static/**": {
+    "target": "https://<CHANGE_ME>",
+    "secure": false,
+    "changeOrigin": true
+  },
+  "/public/**": {
+    "target": "https://<CHANGE_ME>",
+    "secure": false,
+    "changeOrigin": true
+  },
+  "/rest/**": {
+    "target": "https://<CHANGE_ME>",
+    "secure": false,
+    "changeOrigin": true
+  },
+  "/ws/**": {
+    "target": "https://<CHANGE_ME>",
+    "secure": false,
+    "changeOrigin": true,
+    "ws": true
+  }
+}

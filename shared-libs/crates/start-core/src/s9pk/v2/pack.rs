@@ -1,0 +1,1279 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::{Arc, LazyLock, OnceLock};
+
+use clap::Parser;
+use futures::future::{BoxFuture, ready};
+use futures::{FutureExt, TryStreamExt};
+use imbl_value::InternedString;
+use itertools::Itertools;
+use serde::{Deserialize, Serialize};
+use tokio::process::Command;
+use tokio::sync::OnceCell;
+use tokio_stream::wrappers::ReadDirStream;
+use tracing::{debug, warn};
+
+use crate::context::CliContext;
+use crate::dependencies::{DependencyMetadata, MetadataSrc};
+use crate::prelude::*;
+use crate::rpc_continuations::Guid;
+use crate::s9pk::S9pk;
+use crate::s9pk::git_hash::GitHash;
+use crate::s9pk::manifest::{LocaleString, Manifest};
+use crate::s9pk::merkle_archive::directory_contents::DirectoryContents;
+use crate::s9pk::merkle_archive::source::http::HttpSource;
+use crate::s9pk::merkle_archive::source::multi_cursor_file::MultiCursorFile;
+use crate::s9pk::merkle_archive::source::{
+    ArchiveSource, DynFileSource, DynRead, FileSource, TmpSource, into_dyn_read,
+};
+use crate::s9pk::merkle_archive::{Entry, MerkleArchive};
+use crate::s9pk::v2::SIG_CONTEXT;
+use crate::util::io::{TmpDir, canonicalize, create_file, open_file};
+use crate::util::serde::IoFormat;
+use crate::util::squashfs::{NodeContents, Squashfs};
+use crate::util::{DataUrl, Invoke, PathOrUrl};
+use crate::{ImageId, PackageId};
+
+pub static PREFER_DOCKER: OnceLock<bool> = OnceLock::new();
+
+pub static CONTAINER_TOOL: LazyLock<&'static str> = LazyLock::new(|| {
+    if *PREFER_DOCKER.get_or_init(|| false) {
+        if std::process::Command::new("which")
+            .arg("docker")
+            .stdout(Stdio::null())
+            .status()
+            .map_or(false, |o| o.success())
+        {
+            "docker"
+        } else {
+            "podman"
+        }
+    } else {
+        "podman"
+    }
+});
+pub static CONTAINER_DATADIR: LazyLock<&'static str> = LazyLock::new(|| {
+    if *CONTAINER_TOOL == "docker" {
+        "/var/lib/docker"
+    } else {
+        "/var/lib/containers"
+    }
+});
+
+pub struct SqfsDir {
+    filesystem: Squashfs<DynFileSource>,
+    tmpdir: Arc<TmpDir>,
+    sqfs: OnceCell<MultiCursorFile>,
+}
+impl SqfsDir {
+    pub fn new<S: FileSource>(mut filesystem: Squashfs<S>, tmpdir: Arc<TmpDir>) -> Self {
+        filesystem.set_inode_modification_time(0);
+        Self {
+            filesystem: filesystem.into_dyn(),
+            tmpdir,
+            sqfs: OnceCell::new(),
+        }
+    }
+
+    pub async fn from_path(path: &Path, tmpdir: Arc<TmpDir>) -> Result<Self, Error> {
+        if path.extension().and_then(|s| s.to_str()) == Some("tar") {
+            Ok(Self::new(
+                Squashfs::from_tar(open_file(path).await?).await?,
+                tmpdir,
+            ))
+        } else {
+            Ok(Self::new(Squashfs::from_directory(path).await?, tmpdir))
+        }
+    }
+
+    async fn file(&self) -> Result<&MultiCursorFile, Error> {
+        self.sqfs
+            .get_or_try_init(|| async {
+                let path = self
+                    .tmpdir
+                    .join(Guid::new().as_ref())
+                    .with_extension("squashfs");
+                self.filesystem
+                    .serialize(&mut create_file(&path).await?)
+                    .await?;
+                Ok(MultiCursorFile::from(open_file(&path).await?))
+            })
+            .await
+    }
+}
+
+async fn javascript_manifest(path: &Path) -> Result<Vec<u8>, Error> {
+    Command::new("node")
+        .arg("-e")
+        .arg("console.log(JSON.stringify(require(process.argv[1]).manifest))")
+        .arg(canonicalize(path, false).await?)
+        .invoke(ErrorKind::ServiceRuntime)
+        .await
+}
+
+fn javascript_mode(mode: u16, directory: bool) -> u16 {
+    mode | if directory { 0o555 } else { 0o444 }
+}
+
+pub(crate) async fn javascript_squashfs(path: &Path) -> Result<Squashfs<PathBuf>, Error> {
+    fn expose_directory<S>(contents: &mut crate::util::squashfs::DirectoryContents<S>) {
+        for (_, entry) in contents.iter_mut() {
+            if let Some(node) = entry.as_node_mut() {
+                match &mut node.contents {
+                    NodeContents::File(_) => {
+                        node.metadata.mode = javascript_mode(node.metadata.mode, false)
+                    }
+                    NodeContents::Directory(children) => {
+                        node.metadata.mode = javascript_mode(node.metadata.mode, true);
+                        expose_directory(children);
+                    }
+                    _ => (),
+                }
+            }
+        }
+    }
+    let mut filesystem = Squashfs::from_directory(path).await?;
+    let root = filesystem.root_metadata_mut();
+    root.mode = javascript_mode(root.mode, true);
+    expose_directory(filesystem.contents_mut());
+    Ok(filesystem)
+}
+
+#[derive(Clone)]
+pub enum PackSource {
+    Buffered(Arc<[u8]>),
+    File(PathBuf),
+    Squashfs(Arc<SqfsDir>),
+}
+impl FileSource for PackSource {
+    type Reader = DynRead;
+    type SliceReader = DynRead;
+    async fn size(&self) -> Result<u64, Error> {
+        match self {
+            Self::Buffered(a) => Ok(a.len() as u64),
+            Self::File(f) => Ok(tokio::fs::metadata(f)
+                .await
+                .with_ctx(|_| (ErrorKind::Filesystem, f.display()))?
+                .len()),
+            Self::Squashfs(dir) => dir.file().await?.size().await.or_not_found("file metadata"),
+        }
+    }
+    async fn reader(&self) -> Result<Self::Reader, Error> {
+        match self {
+            Self::Buffered(a) => Ok(into_dyn_read(FileSource::reader(a).await?)),
+            Self::File(f) => Ok(into_dyn_read(FileSource::reader(f).await?)),
+            Self::Squashfs(dir) => dir.file().await?.fetch_all().await.map(into_dyn_read),
+        }
+    }
+    async fn slice(&self, position: u64, size: u64) -> Result<Self::SliceReader, Error> {
+        match self {
+            Self::Buffered(a) => Ok(into_dyn_read(FileSource::slice(a, position, size).await?)),
+            Self::File(f) => Ok(into_dyn_read(FileSource::slice(f, position, size).await?)),
+            Self::Squashfs(dir) => dir
+                .file()
+                .await?
+                .fetch(position, size)
+                .await
+                .map(into_dyn_read),
+        }
+    }
+}
+impl From<PackSource> for DynFileSource {
+    fn from(value: PackSource) -> Self {
+        DynFileSource::new(value)
+    }
+}
+
+#[derive(Deserialize, Serialize, Parser)]
+#[group(skip)]
+pub struct PackParams {
+    #[arg(help = "help.arg.input-path")]
+    pub path: Option<PathBuf>,
+    #[arg(short, long, help = "help.arg.output-path")]
+    pub output: Option<PathBuf>,
+    #[arg(long, help = "help.arg.javascript-path")]
+    pub javascript: Option<PathBuf>,
+    #[arg(long, help = "help.arg.icon-path")]
+    pub icon: Option<PathBuf>,
+    #[arg(long, help = "help.arg.license-path")]
+    pub license: Option<PathBuf>,
+    #[arg(long, help = "help.arg.instructions-path")]
+    pub instructions: Option<PathBuf>,
+    #[arg(long, conflicts_with = "no_assets", help = "help.arg.assets-path")]
+    pub assets: Option<PathBuf>,
+    #[arg(long, conflicts_with = "assets", help = "help.arg.no-assets")]
+    pub no_assets: bool,
+    #[arg(long, help = "help.arg.architecture-mask")]
+    pub arch: Vec<InternedString>,
+}
+impl PackParams {
+    fn path(&self) -> &Path {
+        self.path.as_deref().unwrap_or(Path::new("."))
+    }
+    fn output(&self, id: &PackageId) -> PathBuf {
+        self.output
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| self.path().join(id).with_extension("s9pk"))
+    }
+    fn javascript(&self) -> PathBuf {
+        self.javascript
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| self.path().join("javascript"))
+    }
+    async fn icon(&self) -> Result<PathBuf, Error> {
+        if let Some(icon) = &self.icon {
+            Ok(icon.clone())
+        } else {
+            ReadDirStream::new(tokio::fs::read_dir(self.path()).await?)
+                .try_filter(|x| {
+                    ready(
+                        x.path()
+                            .file_stem()
+                            .map_or(false, |s| s.eq_ignore_ascii_case("icon")),
+                    )
+                })
+                .map_err(Error::from)
+                .try_fold(
+                    Err(Error::new(eyre!("icon not found"), ErrorKind::NotFound)),
+                    |acc, x| async move {
+                        match acc {
+                            Ok(_) => Err(Error::new(eyre!("multiple icons found in working directory, please specify which to use with `--icon`"), ErrorKind::InvalidRequest)),
+                            Err(e) => Ok({
+                                let path = x.path();
+                                if path
+                                    .file_stem()
+                                    .map_or(false, |s| s.eq_ignore_ascii_case("icon"))
+                                {
+                                    Ok(path)
+                                } else {
+                                    Err(e)
+                                }
+                            }),
+                        }
+                    },
+                )
+                .await?
+        }
+    }
+    async fn license(&self) -> Result<PathBuf, Error> {
+        if let Some(license) = &self.license {
+            Ok(license.clone())
+        } else {
+            ReadDirStream::new(tokio::fs::read_dir(self.path()).await?)
+                .try_filter(|x| {
+                    ready(
+                        x.path()
+                            .file_stem()
+                            .map_or(false, |s| s.eq_ignore_ascii_case("license")),
+                    )
+                })
+                .map_err(Error::from)
+                .try_fold(
+                    Err(Error::new(eyre!("license not found"), ErrorKind::NotFound)),
+                    |acc, x| async move {
+                        match acc {
+                            Ok(_) => Err(Error::new(eyre!("multiple licenses found in working directory, please specify which to use with `--license`"), ErrorKind::InvalidRequest)),
+                            Err(e) => Ok({
+                                let path = x.path();
+                                if path
+                                    .file_stem()
+                                    .map_or(false, |s| s.eq_ignore_ascii_case("license"))
+                                {
+                                    Ok(path)
+                                } else {
+                                    Err(e)
+                                }
+                            }),
+                        }
+                    },
+                )
+                .await?
+        }
+    }
+    async fn instructions(&self) -> Result<PathBuf, Error> {
+        if let Some(instructions) = &self.instructions {
+            Ok(instructions.clone())
+        } else {
+            let candidate = self.path().join("instructions.md");
+            if tokio::fs::metadata(&candidate).await.is_ok() {
+                Ok(candidate)
+            } else {
+                Err(Error::new(
+                    eyre!(
+                        "instructions.md not found at the package root - it is a required file alongside README.md"
+                    ),
+                    ErrorKind::NotFound,
+                ))
+            }
+        }
+    }
+    async fn readme(&self) -> Result<Option<PathBuf>, Error> {
+        let candidate = self.path().join("README.md");
+        Ok(tokio::fs::metadata(&candidate)
+            .await
+            .is_ok()
+            .then_some(candidate))
+    }
+    fn assets(&self) -> PathBuf {
+        self.assets
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| self.path().join("assets"))
+    }
+}
+
+#[derive(Debug, Default, Clone, Serialize, VisitFields)]
+#[serde(rename_all = "camelCase")]
+#[visit(input_wire = "ImageConfigRepr")]
+#[visit(type_attributes(visit::input_wire))]
+pub struct ImageConfig {
+    pub source: ImageSource,
+    pub arch: BTreeSet<InternedString>,
+    pub emulate_missing: bool,
+    #[serde(rename = "emulateMissingAs", skip_serializing_if = "Option::is_none")]
+    #[visit(ts(skip))]
+    legacy_emulate_missing_as: Option<InternedString>,
+    #[serde(default)]
+    pub nvidia_container: bool,
+}
+
+rpc_toolkit::reflect_ts!(ImageConfig);
+rpc_toolkit::ts_export!(ImageConfig, namespaces = [""]);
+impl ImageConfig {
+    fn legacy_emulation_arch(&self) -> Option<&InternedString> {
+        self.legacy_emulate_missing_as
+            .as_ref()
+            .filter(|arch| self.arch.contains(*arch))
+    }
+
+    fn emulation_arch(&self, is_available: impl Fn(&str) -> bool) -> Option<&InternedString> {
+        self.legacy_emulation_arch()
+            .filter(|arch| is_available(arch))
+            .or_else(|| self.arch.iter().find(|arch| is_available(arch)))
+    }
+
+    pub(crate) fn resolve_arch<'a, T>(
+        &'a self,
+        requested: &'a str,
+        image_id: &ImageId,
+        archive: &DirectoryContents<T>,
+    ) -> Option<&'a str> {
+        let is_available = |arch: &str| {
+            archive
+                .get_path(
+                    Path::new("images")
+                        .join(arch)
+                        .join(image_id)
+                        .with_extension("squashfs"),
+                )
+                .and_then(|entry| entry.as_file())
+                .is_some()
+        };
+        if is_available(requested) {
+            Some(requested)
+        } else if self.emulate_missing {
+            self.emulation_arch(is_available).map(|arch| &**arch)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Deserialize, VisitFields)]
+#[serde(rename_all = "camelCase")]
+struct ImageConfigRepr {
+    source: ImageSource,
+    arch: BTreeSet<InternedString>,
+    #[serde(default)]
+    emulate_missing: Option<bool>,
+    #[serde(default)]
+    emulate_missing_as: Option<InternedString>,
+    #[serde(default)]
+    nvidia_container: bool,
+}
+
+rpc_toolkit::reflect_ts!(ImageConfigRepr);
+
+impl<'de> Deserialize<'de> for ImageConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let input = ImageConfigRepr::deserialize(deserializer)?;
+        let legacy_emulate_missing_as = input
+            .emulate_missing_as
+            .filter(|arch| !arch.is_empty() && input.emulate_missing != Some(false));
+        Ok(Self {
+            source: input.source,
+            arch: input.arch,
+            emulate_missing: input
+                .emulate_missing
+                .unwrap_or(legacy_emulate_missing_as.is_some()),
+            legacy_emulate_missing_as,
+            nvidia_container: input.nvidia_container,
+        })
+    }
+}
+
+#[derive(Parser)]
+#[group(skip)]
+struct CliImageConfig {
+    #[arg(long, conflicts_with("docker_tag"), help = "help.arg.docker-build")]
+    docker_build: bool,
+    #[arg(long, requires("docker_build"), help = "help.arg.dockerfile-path")]
+    dockerfile: Option<PathBuf>,
+    #[arg(long, requires("docker_build"), help = "help.arg.workdir-path")]
+    workdir: Option<PathBuf>,
+    #[arg(long, conflicts_with_all(["dockerfile", "workdir"]), help = "help.arg.docker-tag")]
+    docker_tag: Option<String>,
+    #[arg(long, help = "help.arg.architecture-mask")]
+    arch: Vec<InternedString>,
+    #[arg(long, help = "help.arg.no-emulation")]
+    no_emulation: bool,
+    #[arg(long, help = "help.arg.nvidia-container")]
+    nvidia_container: bool,
+}
+impl TryFrom<CliImageConfig> for ImageConfig {
+    type Error = clap::Error;
+    fn try_from(value: CliImageConfig) -> Result<Self, Self::Error> {
+        Ok(Self {
+            source: if value.docker_build {
+                ImageSource::DockerBuild {
+                    dockerfile: value.dockerfile,
+                    workdir: value.workdir,
+                    build_args: None,
+                }
+            } else if let Some(tag) = value.docker_tag {
+                ImageSource::DockerTag(tag)
+            } else {
+                ImageSource::Packed
+            },
+            arch: value.arch.into_iter().collect(),
+            emulate_missing: !value.no_emulation,
+            legacy_emulate_missing_as: None,
+            nvidia_container: value.nvidia_container,
+        })
+    }
+}
+impl clap::Args for ImageConfig {
+    fn augment_args(cmd: clap::Command) -> clap::Command {
+        CliImageConfig::augment_args(cmd)
+    }
+    fn augment_args_for_update(cmd: clap::Command) -> clap::Command {
+        CliImageConfig::augment_args_for_update(cmd)
+    }
+}
+impl clap::FromArgMatches for ImageConfig {
+    fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        Self::try_from(CliImageConfig::from_arg_matches(matches)?)
+    }
+    fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
+        *self = Self::try_from(CliImageConfig::from_arg_matches(matches)?)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, VisitVariants)]
+#[serde(rename_all = "camelCase")]
+#[serde(untagged)]
+pub enum BuildArg {
+    String(String),
+    EnvVar { env: String },
+}
+
+rpc_toolkit::reflect_ts!(BuildArg);
+rpc_toolkit::ts_export!(BuildArg, namespaces = [""]);
+
+#[derive(Debug, Clone, Deserialize, Serialize, VisitVariants)]
+#[serde(rename_all = "camelCase")]
+pub enum ImageSource {
+    Packed,
+    #[serde(rename_all = "camelCase")]
+    DockerBuild {
+        workdir: Option<PathBuf>,
+
+        dockerfile: Option<PathBuf>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        build_args: Option<BTreeMap<String, BuildArg>>,
+    },
+    DockerTag(String),
+    /// A self-contained local OCI image-layout directory or tar archive.
+    #[serde(rename_all = "camelCase")]
+    OciLayout {
+        path: PathBuf,
+        /// Top-level reference annotation, Docker image name, or descriptor digest. Unset selects by platform.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reference: Option<String>,
+    },
+}
+
+rpc_toolkit::reflect_ts!(ImageSource);
+rpc_toolkit::ts_export!(ImageSource, namespaces = [""]);
+impl Default for ImageSource {
+    fn default() -> Self {
+        ImageSource::Packed
+    }
+}
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub(super) struct DockerImageConfig {
+    env: Option<Vec<String>>,
+    #[serde(default)]
+    working_dir: PathBuf,
+    #[serde(default)]
+    user: String,
+    entrypoint: Option<Vec<String>>,
+    cmd: Option<Vec<String>>,
+}
+
+impl DockerImageConfig {
+    pub(super) fn into_parts(self) -> (ImageMetadata, Vec<String>) {
+        (
+            ImageMetadata {
+                workdir: if self.working_dir == Path::new("") {
+                    "/".into()
+                } else {
+                    self.working_dir
+                },
+                user: if self.user.is_empty() {
+                    "root".into()
+                } else {
+                    self.user.into()
+                },
+                entrypoint: self.entrypoint,
+                cmd: self.cmd,
+            },
+            self.env.unwrap_or_default(),
+        )
+    }
+}
+
+pub(super) fn docker_platform(arch: &str) -> String {
+    let arch = super::image::oci_architecture(arch);
+    format!("--platform=linux/{arch}")
+}
+
+fn image_save_command(tool: &str, image: &str, platform: &str) -> Command {
+    let mut command = Command::new(tool);
+    command.arg("image").arg("save");
+    if tool == "docker" {
+        command.arg(platform);
+    } else {
+        command.arg("--format=oci-archive");
+    }
+    command.arg(image);
+    command
+}
+
+impl ImageSource {
+    pub fn ingredients(&self) -> Vec<PathBuf> {
+        match self {
+            Self::Packed => Vec::new(),
+            Self::DockerBuild {
+                dockerfile,
+                workdir,
+                ..
+            } => {
+                vec![dockerfile.clone().unwrap_or_else(|| {
+                    workdir
+                        .as_deref()
+                        .unwrap_or(Path::new("."))
+                        .join("Dockerfile")
+                })]
+            }
+            Self::DockerTag(_) => Vec::new(),
+            Self::OciLayout { path, .. } => vec![path.clone()],
+        }
+    }
+    #[instrument(skip_all)]
+    pub fn load<'a, S: From<TmpSource<PackSource>> + FileSource + Clone>(
+        &'a self,
+        tmp_dir: Arc<TmpDir>,
+        image_id: &'a ImageId,
+        arch: &'a str,
+        into: &'a mut DirectoryContents<S>,
+    ) -> BoxFuture<'a, Result<(), Error>> {
+        async move {
+            let docker_platform = docker_platform(arch);
+            let (filesystem, config) = match self {
+                ImageSource::Packed => return Ok(()),
+                ImageSource::DockerBuild {
+                    workdir,
+                    dockerfile,
+                    build_args,
+                } => {
+                    let workdir = workdir.as_deref().unwrap_or(Path::new("."));
+                    let dockerfile = dockerfile
+                        .clone()
+                        .unwrap_or_else(|| workdir.join("Dockerfile"));
+                    let mut command = Command::new(*CONTAINER_TOOL);
+                    if *CONTAINER_TOOL == "docker" {
+                        command.arg("buildx");
+                    }
+                    command
+                        .arg("build")
+                        .arg(workdir)
+                        .arg("-f")
+                        .arg(dockerfile)
+                        .arg(&docker_platform)
+                        .arg("--build-arg")
+                        .arg(format!("ARCH={}", arch));
+
+                    if let Some(build_args) = build_args {
+                        for (key, value) in build_args {
+                            let build_arg_value = match value {
+                                BuildArg::String(val) => val.to_string(),
+                                BuildArg::EnvVar { env } => match std::env::var(&env) {
+                                    Ok(val) => val,
+                                    Err(_) => continue,
+                                },
+                            };
+
+                            command
+                                .arg("--build-arg")
+                                .arg(format!("{}={}", key, build_arg_value));
+                        }
+                    }
+
+                    if *CONTAINER_TOOL == "docker" {
+                        command.arg("--output=type=oci,dest=-");
+                        image_from_command(&mut command, &docker_platform).await?
+                    } else {
+                        let tag = format!("start9/package-build:{}", Guid::new().as_ref());
+                        command.arg("--format=oci").arg("--tag").arg(&tag);
+                        command.invoke(ErrorKind::Docker).await?;
+                        let image = image_from_command(
+                            &mut image_save_command("podman", &tag, &docker_platform),
+                            &docker_platform,
+                        )
+                        .await;
+                        let removed = Command::new("podman")
+                            .arg("rmi")
+                            .arg(&tag)
+                            .invoke(ErrorKind::Docker)
+                            .await;
+                        let image = image?;
+                        removed?;
+                        image
+                    }
+                }
+                ImageSource::DockerTag(tag) => {
+                    image_from_tag(*CONTAINER_TOOL, tag, &docker_platform).await?
+                }
+                ImageSource::OciLayout { path, reference } => {
+                    super::image::from_path(path, &docker_platform, reference.as_deref()).await?
+                }
+            };
+            write_image((filesystem, config), tmp_dir, image_id, arch, into).await
+        }
+        .boxed()
+    }
+}
+
+pub(super) async fn write_image<S: From<TmpSource<PackSource>> + FileSource + Clone>(
+    image: (Squashfs<DynFileSource>, DockerImageConfig),
+    tmp_dir: Arc<TmpDir>,
+    image_id: &ImageId,
+    arch: &str,
+    into: &mut DirectoryContents<S>,
+) -> Result<(), Error> {
+    let (filesystem, config) = image;
+    let dest = tmp_dir
+        .join(Guid::new().as_ref())
+        .with_extension("squashfs");
+    filesystem.serialize(&mut create_file(&dest).await?).await?;
+    let (metadata, env) = config.into_parts();
+    let base_path = Path::new("images").join(arch).join(image_id);
+    into.insert_path(
+        base_path.with_extension("json"),
+        Entry::file(
+            TmpSource::new(
+                tmp_dir.clone(),
+                PackSource::Buffered(
+                    serde_json::to_vec(&metadata)
+                        .with_kind(ErrorKind::Serialization)?
+                        .into(),
+                ),
+            )
+            .into(),
+        ),
+    )?;
+    into.insert_path(
+        base_path.with_extension("env"),
+        Entry::file(
+            TmpSource::new(
+                tmp_dir.clone(),
+                PackSource::Buffered(env.join("\n").into_bytes().into()),
+            )
+            .into(),
+        ),
+    )?;
+    into.insert_path(
+        base_path.with_extension("squashfs"),
+        Entry::file(TmpSource::new(tmp_dir.clone(), PackSource::File(dest)).into()),
+    )?;
+    Ok(())
+}
+
+async fn image_from_tag(
+    tool: &str,
+    image: &str,
+    platform: &str,
+) -> Result<(Squashfs<DynFileSource>, DockerImageConfig), Error> {
+    match image_from_command(&mut image_save_command(tool, image, platform), platform).await {
+        Err(error)
+            if error.kind == ErrorKind::Docker
+                || error.source.is::<super::image::MissingImagePlatform>() => {}
+        result => return result,
+    }
+    Command::new(tool)
+        .arg("image")
+        .arg("pull")
+        .arg(platform)
+        .arg(image)
+        .invoke(ErrorKind::Docker)
+        .await?;
+    image_from_command(&mut image_save_command(tool, image, platform), platform).await
+}
+
+async fn image_from_command(
+    command: &mut Command,
+    platform: &str,
+) -> Result<(Squashfs<DynFileSource>, DockerImageConfig), Error> {
+    let (mut output, input) = tokio::io::duplex(crate::CAP_1_MiB);
+    let producer = async {
+        let result = command
+            .output_to(&mut output)
+            .invoke(ErrorKind::Docker)
+            .await;
+        drop(output);
+        result
+    };
+    let (_, (filesystem, config)) =
+        tokio::try_join!(producer, super::image::from_image_archive(input, platform))?;
+    Ok((filesystem, config))
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, VisitFields)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageMetadata {
+    pub workdir: PathBuf,
+    pub user: InternedString,
+    pub entrypoint: Option<Vec<String>>,
+    pub cmd: Option<Vec<String>>,
+}
+
+rpc_toolkit::reflect_ts!(ImageMetadata);
+rpc_toolkit::ts_export!(ImageMetadata, namespaces = [""]);
+
+#[instrument(skip_all)]
+pub async fn pack(ctx: CliContext, params: PackParams) -> Result<(), Error> {
+    let tmp_dir = Arc::new(TmpDir::new().await?);
+    let mut files = DirectoryContents::<TmpSource<PackSource>>::new();
+    let js_dir = params.javascript();
+    let manifest: Arc<[u8]> = javascript_manifest(&js_dir.join("index.js")).await?.into();
+    files.insert(
+        "manifest.json".into(),
+        Entry::file(TmpSource::new(
+            tmp_dir.clone(),
+            PackSource::Buffered(manifest.clone()),
+        )),
+    );
+    let icon = params.icon().await?;
+    let icon_ext = icon
+        .extension()
+        .or_not_found("icon file extension")?
+        .to_string_lossy();
+    files.insert(
+        InternedString::from_display(&lazy_format!("icon.{}", icon_ext)),
+        Entry::file(TmpSource::new(tmp_dir.clone(), PackSource::File(icon))),
+    );
+    files.insert(
+        "LICENSE.md".into(),
+        Entry::file(TmpSource::new(
+            tmp_dir.clone(),
+            PackSource::File(params.license().await?),
+        )),
+    );
+    files.insert(
+        "instructions.md".into(),
+        Entry::file(TmpSource::new(
+            tmp_dir.clone(),
+            PackSource::File(params.instructions().await?),
+        )),
+    );
+    if let Some(readme) = params.readme().await? {
+        files.insert(
+            "README.md".into(),
+            Entry::file(TmpSource::new(tmp_dir.clone(), PackSource::File(readme))),
+        );
+    }
+    files.insert(
+        "javascript.squashfs".into(),
+        Entry::file(TmpSource::new(
+            tmp_dir.clone(),
+            PackSource::Squashfs(Arc::new(SqfsDir::new(
+                javascript_squashfs(&js_dir).await?,
+                tmp_dir.clone(),
+            ))),
+        )),
+    );
+
+    let mut s9pk = S9pk::new(
+        MerkleArchive::new(files, ctx.build_key()?, SIG_CONTEXT),
+        None,
+    )
+    .await?;
+
+    let manifest = s9pk.as_manifest_mut();
+    manifest.metadata.git_hash = GitHash::from_path(params.path()).await?;
+    if manifest.metadata.git_hash.is_none() {
+        eprintln!(
+            "{}",
+            t!(
+                "s9pk.pack.git-hash-omitted",
+                path = params.path().display().to_string()
+            )
+        );
+    }
+    if !params.arch.is_empty() {
+        let arches: BTreeSet<InternedString> = match manifest.hardware_requirements.arch.take() {
+            Some(a) => params
+                .arch
+                .iter()
+                .filter(|x| a.contains(*x))
+                .cloned()
+                .collect(),
+            None => params.arch.iter().cloned().collect(),
+        };
+        if arches.is_empty() {
+            return Err(Error::new(
+                eyre!(
+                    "none of the requested architectures ({:?}) are supported by this package",
+                    params.arch
+                ),
+                ErrorKind::InvalidRequest,
+            ));
+        }
+        manifest.images.iter_mut().for_each(|(id, c)| {
+            let has_missing_native_arch = arches.iter().any(|arch| !c.arch.contains(arch));
+            let mut filtered = c
+                .arch
+                .intersection(&arches)
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            if filtered.is_empty() {
+                if c.emulate_missing {
+                    if let Some(arch) = c.emulation_arch(|_| true).cloned() {
+                        tracing::warn!(
+                            "{}",
+                            t!(
+                                "s9pk.pack.image-unavailable-emulating",
+                                image = id.to_string(),
+                                requested = arches.iter().join("/"),
+                                emulated = arch.to_string(),
+                            )
+                        );
+                        c.arch = [arch].into_iter().collect();
+                    } else {
+                        tracing::error!(
+                            "{}",
+                            t!(
+                                "s9pk.pack.image-no-architecture-to-emulate",
+                                image = id.to_string(),
+                            )
+                        );
+                    }
+                } else {
+                    tracing::error!(
+                        "{}",
+                        t!(
+                            "s9pk.pack.image-unavailable",
+                            image = id.to_string(),
+                            requested = arches.iter().join("/"),
+                        )
+                    );
+                }
+            } else {
+                if has_missing_native_arch {
+                    filtered.extend(c.legacy_emulation_arch().cloned());
+                }
+                c.arch = filtered;
+            }
+        });
+        manifest.hardware_requirements.arch = Some(arches);
+    }
+
+    if !params.no_assets {
+        let assets_dir = params.assets();
+        s9pk.as_archive_mut().contents_mut().insert_path(
+            "assets.squashfs",
+            Entry::file(TmpSource::new(
+                tmp_dir.clone(),
+                PackSource::Squashfs(Arc::new(
+                    SqfsDir::from_path(&assets_dir, tmp_dir.clone()).await?,
+                )),
+            )),
+        )?;
+    }
+
+    s9pk.load_images(tmp_dir.clone()).await?;
+
+    let mut to_insert = Vec::new();
+    for (id, dependency) in &mut s9pk.as_manifest_mut().dependencies.0 {
+        if let Some((title, icon)) = match dependency.metadata.take() {
+            Some(MetadataSrc::Metadata(metadata)) => {
+                let icon = match metadata.icon {
+                    PathOrUrl::Path(path) => DataUrl::from_path(path).await?,
+                    PathOrUrl::Url(url) => {
+                        if url.scheme() == "http" || url.scheme() == "https" {
+                            DataUrl::from_response(ctx.client.get(url).send().await?).await?
+                        } else if url.scheme() == "data" {
+                            url.as_str().parse()?
+                        } else {
+                            return Err(Error::new(
+                                eyre!("unknown scheme: {}", url.scheme()),
+                                ErrorKind::InvalidRequest,
+                            ));
+                        }
+                    }
+                };
+                Some((metadata.title, icon))
+            }
+            Some(MetadataSrc::S9pk(Some(s9pk))) => {
+                let s9pk = match s9pk {
+                    PathOrUrl::Path(path) => {
+                        S9pk::deserialize(&MultiCursorFile::from(open_file(path).await?), None)
+                            .await?
+                            .into_dyn()
+                    }
+                    PathOrUrl::Url(url) => {
+                        if url.scheme() == "http" || url.scheme() == "https" {
+                            S9pk::deserialize(
+                                &Arc::new(HttpSource::new(ctx.client.clone(), url).await?),
+                                None,
+                            )
+                            .await?
+                            .into_dyn()
+                        } else {
+                            return Err(Error::new(
+                                eyre!("unknown scheme: {}", url.scheme()),
+                                ErrorKind::InvalidRequest,
+                            ));
+                        }
+                    }
+                };
+                Some((
+                    LocaleString::Translated(s9pk.as_manifest().metadata.title.to_string()),
+                    s9pk.icon_data_url().await?,
+                ))
+            }
+            Some(MetadataSrc::S9pk(None)) | None => {
+                warn!("no metadata specified for {id}, leaving metadata empty");
+                None
+            }
+        } {
+            let dep_path = Path::new("dependencies").join(id);
+            to_insert.push((
+                dep_path.join("metadata.json"),
+                Entry::file(TmpSource::new(
+                    tmp_dir.clone(),
+                    PackSource::Buffered(
+                        IoFormat::Json.to_vec(&DependencyMetadata { title })?.into(),
+                    ),
+                )),
+            ));
+            to_insert.push((
+                dep_path
+                    .join("icon")
+                    .with_extension(icon.canonical_ext().unwrap_or("ico")),
+                Entry::file(TmpSource::new(
+                    tmp_dir.clone(),
+                    PackSource::Buffered(icon.data.into_owned().into()),
+                )),
+            ));
+        }
+    }
+    for (path, source) in to_insert {
+        s9pk.as_archive_mut()
+            .contents_mut()
+            .insert_path(path, source)?;
+    }
+
+    s9pk.validate_and_filter(None)?;
+
+    s9pk.serialize(
+        &mut create_file(params.output(&s9pk.as_manifest().id)).await?,
+        false,
+    )
+    .await?;
+
+    drop(s9pk);
+
+    tmp_dir.gc().await?;
+
+    Ok(())
+}
+
+#[instrument(skip_all)]
+pub async fn list_ingredients(_: CliContext, params: PackParams) -> Result<Vec<PathBuf>, Error> {
+    let js_path = params.javascript().join("index.js");
+    let manifest: Manifest = match async {
+        serde_json::from_slice(&javascript_manifest(&js_path).await?)
+            .with_kind(ErrorKind::Deserialization)
+    }
+    .await
+    {
+        Ok(m) => m,
+        Err(e) => {
+            warn!("failed to load manifest: {e}");
+            debug!("{e:?}");
+            return Ok(vec![
+                js_path,
+                params.icon().await?,
+                params.license().await?,
+                params.instructions().await?,
+            ]
+            .into_iter()
+            .chain(params.readme().await?)
+            .collect());
+        }
+    };
+    let mut ingredients = vec![
+        js_path,
+        params.icon().await?,
+        params.license().await?,
+        params.instructions().await?,
+    ];
+    ingredients.extend(params.readme().await?);
+
+    for (_, dependency) in manifest.dependencies.0 {
+        match dependency.metadata {
+            Some(MetadataSrc::Metadata(crate::dependencies::Metadata {
+                icon: PathOrUrl::Path(icon),
+                ..
+            })) => {
+                ingredients.push(icon);
+            }
+            Some(MetadataSrc::S9pk(Some(PathOrUrl::Path(s9pk)))) => {
+                ingredients.push(s9pk);
+            }
+            _ => (),
+        }
+    }
+
+    if !params.no_assets {
+        let assets_dir = params.assets();
+        ingredients.push(assets_dir);
+    }
+
+    for image in manifest.images.values() {
+        ingredients.extend(image.source.ingredients());
+    }
+
+    Ok(ingredients)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "pack/tests.rs"]
+mod packaging_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "pack/oci_tests.rs"]
+mod oci_tests;
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[cfg(feature = "ts")]
+    #[test]
+    fn image_config_input_binding_matches_the_custom_decoder() {
+        use rpc_toolkit::ts::TSVisitor;
+
+        for (fields, expected) in [
+            (serde_json::json!({}), false),
+            (
+                serde_json::json!({"emulateMissing": null, "emulateMissingAs": null}),
+                false,
+            ),
+            (serde_json::json!({"emulateMissing": true}), true),
+            (serde_json::json!({"emulateMissingAs": "x86_64"}), true),
+            (
+                serde_json::json!({"emulateMissing": false, "emulateMissingAs": "x86_64"}),
+                false,
+            ),
+        ] {
+            let mut input = serde_json::json!({"source": "packed", "arch": ["x86_64"]});
+            input
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            let config: ImageConfig = serde_json::from_value(input).unwrap();
+            assert_eq!(config.emulate_missing, expected);
+            assert_eq!(
+                serde_json::to_value(config).unwrap()["emulateMissing"],
+                expected
+            );
+        }
+        for fields in [
+            serde_json::json!({"emulateMissing": "yes"}),
+            serde_json::json!({"emulateMissingAs": true}),
+            serde_json::json!({"nvidiaContainer": null}),
+        ] {
+            let mut input = serde_json::json!({"source": "packed", "arch": []});
+            input
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            assert!(serde_json::from_value::<ImageConfig>(input).is_err());
+        }
+
+        let mut visitor = TSVisitor::new();
+        visitor.append_type::<ImageConfig>();
+        let schemas = visitor.into_bindings(None, "./schemas").unwrap().schemas;
+        assert!(
+            schemas.contains("= /* @__PURE__ */ wire(ImageConfigRepr, object({"),
+            "{schemas}"
+        );
+        assert!(
+            schemas.contains("\"emulateMissing\": wire(z.boolean().nullable().optional(), z.boolean().nullable())"),
+            "{schemas}"
+        );
+        assert!(
+            schemas.contains("\"emulateMissingAs\": wire(z.string().nullable().optional(), z.string().nullable())"),
+            "{schemas}"
+        );
+        assert!(
+            schemas.contains("\"emulateMissing\": z.boolean()"),
+            "{schemas}"
+        );
+        assert!(
+            !schemas.contains("\"emulateMissingAs\": z.string()"),
+            "{schemas}"
+        );
+    }
+
+    #[test]
+    fn image_save_uses_the_requested_docker_platform() {
+        for (arch, platform) in [
+            ("x86_64", "--platform=linux/amd64"),
+            ("aarch64", "--platform=linux/arm64"),
+            ("riscv64", "--platform=linux/riscv64"),
+        ] {
+            let command = image_save_command("docker", "sha256:index", &docker_platform(arch));
+            assert_eq!(command.as_std().get_program(), "docker");
+            assert_eq!(
+                command.as_std().get_args().collect::<Vec<_>>(),
+                ["image", "save", platform, "sha256:index"]
+            );
+        }
+    }
+
+    #[test]
+    fn podman_saves_oci_without_a_platform_flag() {
+        let command =
+            image_save_command("podman", "sha256:arm64-image", &docker_platform("aarch64"));
+        assert_eq!(command.as_std().get_program(), "podman");
+        assert_eq!(
+            command.as_std().get_args().collect::<Vec<_>>(),
+            [
+                "image",
+                "save",
+                "--format=oci-archive",
+                "sha256:arm64-image"
+            ]
+        );
+    }
+
+    #[test]
+    fn image_config_preserves_original_command_and_defaults() {
+        let config: DockerImageConfig = serde_json::from_str(
+            r#"{
+            "Cmd": ["serve", "--foreground"],
+            "Entrypoint": ["/app/entrypoint"],
+            "Env": ["MODE=production", "EMPTY="],
+            "WorkingDir": "/app",
+            "User": "1000:1000"
+        }"#,
+        )
+        .unwrap();
+        let (metadata, env) = config.into_parts();
+        assert_eq!(metadata.cmd.unwrap(), ["serve", "--foreground"]);
+        assert_eq!(metadata.entrypoint.unwrap(), ["/app/entrypoint"]);
+        assert_eq!(metadata.workdir, Path::new("/app"));
+        assert_eq!(&*metadata.user, "1000:1000");
+        assert_eq!(env, ["MODE=production", "EMPTY="]);
+    }
+
+    #[test]
+    fn image_config_accepts_missing_and_null_optional_fields() {
+        for json in [
+            "{}",
+            r#"{"Env":null,"Entrypoint":null,"Cmd":null,"WorkingDir":"","User":""}"#,
+        ] {
+            let config: DockerImageConfig = serde_json::from_str(json).unwrap();
+            let (metadata, env) = config.into_parts();
+            assert!(metadata.cmd.is_none());
+            assert!(metadata.entrypoint.is_none());
+            assert_eq!(metadata.workdir, Path::new("/"));
+            assert_eq!(&*metadata.user, "root");
+            assert!(env.is_empty());
+        }
+    }
+
+    #[test]
+    fn cli_enables_emulation_by_default() {
+        let config = CliImageConfig::try_parse_from(["image", "--arch", "x86_64"]).unwrap();
+        let config = ImageConfig::try_from(config).unwrap();
+
+        assert!(config.emulate_missing);
+        let serialized = serde_json::to_value(config).unwrap();
+        assert!(serialized.get("emulateMissingAs").is_none());
+    }
+
+    #[test]
+    fn no_emulation_cli_flag_disables_emulation() {
+        let config =
+            CliImageConfig::try_parse_from(["image", "--arch", "x86_64", "--no-emulation"])
+                .unwrap();
+        let config = ImageConfig::try_from(config).unwrap();
+
+        assert!(!config.emulate_missing);
+    }
+
+    #[test]
+    fn old_cli_flags_are_rejected() {
+        for args in [
+            vec!["image", "--arch", "x86_64", "--emulate-missing"],
+            vec![
+                "image",
+                "--arch",
+                "x86_64",
+                "--emulate-missing-as",
+                "x86_64",
+            ],
+        ] {
+            assert!(CliImageConfig::try_parse_from(args).is_err());
+        }
+    }
+
+    #[test]
+    fn legacy_manifest_fallback_remains_the_preferred_emulation_architecture() {
+        let config: ImageConfig = serde_json::from_value(serde_json::json!({
+            "source": "packed",
+            "arch": ["aarch64", "x86_64"],
+            "emulateMissingAs": "x86_64",
+            "nvidiaContainer": false
+        }))
+        .unwrap();
+
+        assert_eq!(
+            config.emulation_arch(|_| true).map(|arch| &**arch),
+            Some("x86_64"),
+        );
+    }
+}

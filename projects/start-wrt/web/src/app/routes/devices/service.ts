@@ -1,0 +1,151 @@
+import { inject, Injectable } from '@angular/core'
+import { FormService } from 'src/app/services/form.service'
+import { ApiService, DeviceFromApi } from 'src/app/services/api/api.service'
+import {
+  DataUsagePeriod,
+  DataUsagePoint,
+  Device,
+  DevicePermissionChanges,
+  DeviceUpdateData,
+} from './utils'
+import { i18nPipe } from 'src/app/i18n/i18n.pipe'
+
+/**
+ * Root-provided service for device API calls.
+ * Used by DevicesService (FormService) and external routes
+ * (published-ports, inbound) that need device data.
+ */
+@Injectable({
+  providedIn: 'root',
+})
+export class DevicesApiService {
+  private readonly api = inject(ApiService)
+
+  async get(): Promise<Device[]> {
+    const devices = await this.api.devicesList()
+    return devices.map(d => this.mapDevice(d))
+  }
+
+  async update(mac: string, data: DeviceUpdateData): Promise<void> {
+    await this.api.devicesUpdate({
+      mac,
+      name: data.name,
+      ipv4_static: data.ipv4Static,
+      ipv4: data.ipv4,
+    })
+  }
+
+  async setAutoForward(mac: string, allow: boolean): Promise<void> {
+    await this.api.devicesSetAutoForward({ mac, allow })
+  }
+
+  async setDnsInjection(mac: string, allow: boolean): Promise<void> {
+    await this.api.devicesSetDnsInjection({ mac, allow })
+  }
+
+  async setRouterAdvertisements(mac: string, allow: boolean): Promise<void> {
+    await this.api.devicesSetRouterAdvertisements({ mac, allow })
+  }
+
+  async forget(mac: string): Promise<void> {
+    await this.api.devicesForget({ mac })
+  }
+
+  async getDataUsage(
+    mac: string,
+    period: DataUsagePeriod,
+  ): Promise<DataUsagePoint[]> {
+    return this.api.devicesDataUsage({ mac, period })
+  }
+
+  private mapDevice(d: DeviceFromApi): Device {
+    return {
+      mac: d.mac,
+      name: d.name, // fully resolved server-side
+      customName: d.custom_name || undefined,
+      hostname: d.hostname || '',
+      status: d.status,
+      connection: d.connection || undefined,
+      ipv4: d.ipv4 || undefined,
+      ipv6: d.ipv6 || undefined,
+      ipv4Static: d.ipv4_static,
+      allowAutoPortForward: d.allow_auto_port_forward,
+      allowDnsInjection: d.allow_dns_injection,
+      allowRouterAdvertisements: d.allow_router_advertisements,
+      securityProfile: d.security_profile || undefined,
+      speed: d.speed || undefined,
+      dataUsage: d.data_usage ?? undefined,
+    }
+  }
+}
+
+@Injectable()
+export class DevicesService extends FormService<Device[]> {
+  private readonly devicesApi = inject(DevicesApiService)
+  private readonly i18n = inject(i18nPipe)
+
+  async load(): Promise<Device[]> {
+    return this.devicesApi.get()
+  }
+
+  async store(): Promise<void> {
+    // List doesn't have a single store operation
+  }
+
+  // One action for the whole Save: one loader, one toast.
+  update(
+    mac: string,
+    data: DeviceUpdateData,
+    permissions: DevicePermissionChanges,
+  ) {
+    const {
+      allowAutoPortForward,
+      allowDnsInjection,
+      allowRouterAdvertisements,
+    } = permissions
+    return this.actions.run(
+      async () => {
+        await this.devicesApi.update(mac, data)
+        if (allowAutoPortForward !== undefined) {
+          await this.devicesApi.setAutoForward(mac, allowAutoPortForward)
+        }
+        if (allowDnsInjection !== undefined) {
+          await this.devicesApi.setDnsInjection(mac, allowDnsInjection)
+        }
+        if (allowRouterAdvertisements !== undefined) {
+          await this.devicesApi.setRouterAdvertisements(
+            mac,
+            allowRouterAdvertisements,
+          )
+        }
+        await this.refreshAndWait()
+      },
+      {
+        loading: this.i18n.transform('Updating device'),
+        success: this.i18n.transform('Device updated'),
+      },
+    )
+  }
+
+  // Forget device - remove entirely
+  forget(mac: string) {
+    return this.actions.run(
+      async () => {
+        await this.devicesApi.forget(mac)
+        await this.refreshAndWait()
+      },
+      {
+        loading: this.i18n.transform('Forgetting device'),
+        success: this.i18n.transform('Device forgotten'),
+      },
+    )
+  }
+
+  // Get historical data usage for a device
+  async getDataUsage(
+    mac: string,
+    period: DataUsagePeriod,
+  ): Promise<DataUsagePoint[]> {
+    return this.devicesApi.getDataUsage(mac, period)
+  }
+}

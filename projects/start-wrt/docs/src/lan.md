@@ -1,0 +1,45 @@
+# LAN Settings
+
+The LAN (Local Area Network) page configures the router's internal network addressing. Most users will not need to change these settings — the defaults work for typical home networks. Navigate to `Network > LAN Settings`.
+
+## IPv4
+
+Configure the router's LAN IPv4 addressing.
+
+- **Network Block** — Select the private IP block for your network. The first octet determines the RFC 1918 block: `192.168.x.x`, `172.16.x.x`, or `10.0.x.x`. The second octet selects which `/16` within that block, and the editable range depends on the block:
+  - `192.168.0.0/16` — the second octet is locked to `168`.
+  - `172.16.0.0/12` — the second octet is editable, `16`–`31`.
+  - `10.0.0.0/8` — the second octet is editable, `0`–`255`.
+
+  The default is `192.168`, so existing networks are unaffected. Only RFC 1918 private ranges are accepted; out-of-range values are flagged inline (e.g. "Allowed: 16–31") and block saving rather than being auto-corrected. Each [Security Profile](security-profiles.md) receives its own `/24` subnet within this block, allowing up to 255 separate subnets. A profile's DHCP hands out addresses `.2`–`.199`; `.200`–`.254` are reserved for its [Inbound VPN](inbound-vpn.md).
+
+- **Router address** — The router's LAN IP is the gateway (`.1`) of the primary **Admin** [Security Profile](security-profiles.md)'s subnet. The first two octets come from the Network Block above; the third octet is set by the Admin profile's **Subnet** field, not on this page. For example, with the `192.168.x.x` block and an Admin subnet of `1`, the router is reachable at `192.168.1.1`. This is the address you use to access the web interface (or simply `router.lan`).
+
+> [!NOTE]
+> DHCP is managed automatically for each Security Profile. You do not need to configure DHCP ranges or lease times. The router does not forward DHCP or IPv6 router advertisements from another device between its ports and Wi-Fi networks, so a modem plugged into a LAN port instead of the WAN port cannot hand addresses to devices on the router's Wi-Fi. A device that needs to send router advertisements, such as a Thread border router, can be allowed to on its [device page](devices.md#device-detail-page).
+
+> [!WARNING]
+> Changing the Network Block changes the router's LAN address. The page reconnects at the new address once your device has an address in the new block. If any inbound VPN servers exist, they will be deleted because their client configurations become invalid with the new addressing.
+
+> [!NOTE]
+> Changing the second octet counts as a subnet change. Like other subnet changes, it is blocked while any device has a static IP reservation. Remove those reservations first.
+
+## IPv6
+
+Configure IPv6 addressing on the LAN.
+
+- **Enable** — Toggle to enable or disable IPv6 on the LAN. IPv6 addressing uses Stateless Address Autoconfiguration (SLAAC): devices generate their own IPv6 addresses from the router's advertised prefix.
+
+- **Prefix Length** — Shown when IPv6 is enabled. A value from `/48` to `/64`, no shorter than the prefix your ISP delegated. The page summary shows that size as **Delegated Prefix** (**None** when the ISP has delegated none). For example, if your ISP delegates a `/56`, you can use `/56`, `/60`, or `/64` for the LAN; on a `/64` delegation, only `/64`. A `/64` is recommended for most home networks.
+
+> [!NOTE]
+> While any enabled [Published Ports](published-ports.md) rule forwards over IPv6, IPv6 cannot be disabled — devices would lose the addresses those rules depend on. Disable or delete those rules first.
+
+> [!NOTE]
+> If you are updating from an older version, this page may have read **Disabled** while some [Security Profiles](security-profiles.md) were still handing out IPv6 addresses. That is corrected on the first start after the update: IPv6 is turned off for those profiles too, and the correction is recorded in [Activity](settings.md). Enable IPv6 here to turn it back on — it now applies to the LAN and every profile together.
+
+> [!NOTE]
+> Because devices choose their own IPv6 addresses, disabling IPv6 asks them to drop the ones they hold rather than taking the addresses away directly. Devices that are connected at the time drop them immediately. A device that is asleep, off the network, or misses the notice keeps its address until it expires on its own — up to about 90 minutes — and reconnecting or rebooting it clears the address right away.
+
+> [!NOTE]
+> If the Admin profile routes through an IPv4-only [Outbound VPN](outbound-vpn.md), LAN devices still receive their IPv6 addresses, but IPv6 internet traffic is blocked by the kill switch so it cannot leak around the tunnel. IPv6 connectivity resumes when the profile routes through an IPv6-capable VPN or directly to the Internet.

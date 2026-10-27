@@ -1,0 +1,26 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH start-cli-server-host-binding 1  "binding "
+.SH NAME
+start\-cli\-server\-host\-binding \- Commands for managing host bindings
+.SH SYNOPSIS
+\fBstart\-cli server host binding\fR [\fB\-h\fR|\fB\-\-help\fR] <\fIsubcommands\fR>
+.SH DESCRIPTION
+Commands for managing host bindings
+.SH OPTIONS
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.SH SUBCOMMANDS
+.TP
+start\-cli\-server\-host\-binding\-list(1)
+List bindings for a host
+.TP
+start\-cli\-server\-host\-binding\-set\-address\-enabled(1)
+Set a gateway address enabled for a binding
+.TP
+start\-cli\-server\-host\-binding\-set\-gua\-wan(1)
+Expose an IPv6 global\-unicast address to the WAN (or revert it to LAN\-only) for a binding
+.TP
+start\-cli\-server\-host\-binding\-set\-range\-address\-enabled(1)
+Set a gateway address enabled for a port\-range binding

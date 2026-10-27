@@ -1,0 +1,388 @@
+use std::time::Duration;
+
+use clap::Parser;
+use imbl_value::InternedString;
+use patch_db::json_ptr::JsonPointer;
+use rpc_toolkit::{Context, HandlerExt, ParentHandler, from_fn_async};
+use serde::{Deserialize, Serialize};
+
+use crate::GatewayId;
+use crate::context::{CliContext, RpcContext};
+use crate::db::model::public::{
+    GatewayType, IpInfo, NetworkInfo, NetworkInterfaceInfo, NetworkInterfaceType,
+};
+use crate::net::host::all_hosts;
+use crate::prelude::*;
+
+pub(crate) const INBOUND_GATEWAY_MARKER: &str = "# inbound: yes";
+
+pub fn tunnel_api<C: Context>() -> ParentHandler<C> {
+    ParentHandler::new()
+        .subcommand(
+            "add",
+            from_fn_async(add_tunnel)
+                .with_about("about.add-new-tunnel")
+                .with_call_remote::<CliContext>(),
+        )
+        .subcommand(
+            "remove",
+            from_fn_async(remove_tunnel)
+                .no_display()
+                .with_about("about.remove-tunnel")
+                .with_call_remote::<CliContext>(),
+        )
+        .subcommand(
+            "update",
+            from_fn_async(update_tunnel)
+                .no_display()
+                .with_about("about.update-tunnel")
+                .with_call_remote::<CliContext>(),
+        )
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Parser, VisitFields)]
+#[group(skip)]
+#[serde(rename_all = "camelCase")]
+pub struct AddTunnelParams {
+    #[arg(help = "help.arg.tunnel-name")]
+    name: InternedString,
+    #[arg(help = "help.arg.wireguard-config")]
+    config: String,
+    #[arg(help = "help.arg.gateway-type")]
+    #[serde(default, rename = "type")]
+    gateway_type: Option<GatewayType>,
+    #[arg(long, help = "help.arg.set-as-default-outbound")]
+    set_as_default_outbound: bool,
+}
+
+rpc_toolkit::reflect_ts!(AddTunnelParams);
+rpc_toolkit::ts_export!(AddTunnelParams, namespaces = [""]);
+
+pub async fn add_tunnel(
+    ctx: RpcContext,
+    AddTunnelParams {
+        name,
+        config,
+        gateway_type,
+        set_as_default_outbound,
+    }: AddTunnelParams,
+) -> Result<GatewayId, Error> {
+    let gateway_type = gateway_type.unwrap_or_else(|| gateway_type_from_config(&config));
+    let wireguard_endpoint_domains = crate::net::gateway::wireguard_config_domains(&config)?;
+
+    let ifaces = ctx.net_controller.net_iface.watcher.subscribe();
+    let mut iface = GatewayId::from(InternedString::intern("wg0"));
+    if !ifaces.send_if_modified(|i| {
+        for id in 1..256 {
+            if !i.contains_key(&iface) {
+                i.insert(
+                    iface.clone(),
+                    NetworkInterfaceInfo {
+                        wireguard_endpoint_domains,
+                        dns: Default::default(),
+                        name: Some(name),
+                        secure: None,
+                        ip_info: None,
+                        gateway_type,
+                        port_map: Default::default(),
+                        dns_update: Default::default(),
+                    },
+                );
+                return true;
+            }
+            iface = InternedString::from_display(&lazy_format!("wg{id}")).into();
+        }
+        false
+    }) {
+        return Err(Error::new(
+            eyre!("too many wireguard interfaces"),
+            ErrorKind::InvalidRequest,
+        ));
+    }
+
+    let mut ip_info = ctx
+        .db
+        .watch(
+            "/public/serverInfo/network/gateways"
+                .parse::<JsonPointer>()
+                .with_kind(ErrorKind::Database)?
+                .join_end(iface.as_str())
+                .join_end("ipInfo"),
+        )
+        .await
+        .typed::<Option<IpInfo>>();
+
+    if let Err(error) = crate::net::gateway::add_wireguard_config(iface.as_str(), &config).await {
+        ifaces.send_if_modified(|interfaces| {
+            if interfaces.get(&iface).is_some_and(|i| i.ip_info.is_none()) {
+                interfaces.remove(&iface);
+                true
+            } else {
+                false
+            }
+        });
+        return Err(error);
+    }
+
+    ip_info.wait_for(|ip_info| ip_info.is_some()).await?;
+
+    if set_as_default_outbound {
+        ctx.db
+            .mutate(|db| {
+                db.as_public_mut()
+                    .as_server_info_mut()
+                    .as_network_mut()
+                    .as_default_outbound_mut()
+                    .ser(&Some(iface.clone()))
+            })
+            .await
+            .result?;
+    }
+
+    // Wait for the sync loop to fully commit gateway state (addresses, hosts)
+    // to the database, with a 15-second timeout.
+    if tokio::time::timeout(Duration::from_secs(15), async {
+        let mut watch = ctx
+            .db
+            .watch("/public/serverInfo/network".parse::<JsonPointer>().unwrap())
+            .await
+            .typed::<NetworkInfo>();
+        watch
+            .wait_for(|network| {
+                network
+                    .gateways
+                    .get(&iface)
+                    .map_or(false, |g| g.ip_info.is_some())
+            })
+            .await?;
+        Ok::<_, Error>(())
+    })
+    .await
+    .is_err()
+    {
+        tracing::warn!(
+            "{}",
+            t!(
+                "net.tunnel.timeout-waiting-for-add",
+                gateway = iface.as_str()
+            )
+        );
+    }
+
+    Ok(iface)
+}
+
+fn gateway_type_from_config(config: &str) -> GatewayType {
+    let has_inbound_marker = config
+        .lines()
+        .any(|line| line.trim() == INBOUND_GATEWAY_MARKER);
+    let legacy_marker = crate::tunnel::wg::START_TUNNEL_MARKER.to_ascii_lowercase();
+    if has_inbound_marker || config.to_ascii_lowercase().contains(&legacy_marker) {
+        GatewayType::InboundOutbound
+    } else {
+        GatewayType::OutboundOnly
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Parser, VisitFields)]
+#[group(skip)]
+pub struct RemoveTunnelParams {
+    #[arg(help = "help.arg.gateway-id")]
+    id: GatewayId,
+}
+
+rpc_toolkit::reflect_ts!(RemoveTunnelParams);
+rpc_toolkit::ts_export!(RemoveTunnelParams, namespaces = [""]);
+pub async fn remove_tunnel(
+    ctx: RpcContext,
+    RemoveTunnelParams { id }: RemoveTunnelParams,
+) -> Result<(), Error> {
+    let Some(existing) = ctx
+        .db
+        .peek()
+        .await
+        .into_public()
+        .into_server_info()
+        .into_network()
+        .into_gateways()
+        .into_idx(&id)
+        .and_then(|e| e.into_ip_info().transpose())
+    else {
+        return Ok(());
+    };
+
+    if existing.as_deref().as_device_type().de()? != Some(NetworkInterfaceType::Wireguard) {
+        return Err(Error::new(
+            eyre!("network interface {id} is not a proxy"),
+            ErrorKind::InvalidRequest,
+        ));
+    }
+
+    ctx.db
+        .mutate(|db| {
+            let hostname = crate::hostname::ServerHostname::load(db.as_public().as_server_info())?;
+            let gateways = db
+                .as_public()
+                .as_server_info()
+                .as_network()
+                .as_gateways()
+                .de()?;
+            let ports = db.as_private().as_available_ports().de()?;
+            for host in all_hosts(db) {
+                let host = host?;
+                host.as_public_domains_mut()
+                    .mutate(|p| Ok(p.retain(|_, v| v.gateway != id)))?;
+                host.update_addresses(&hostname, &gateways, &ports)?;
+            }
+
+            Ok(())
+        })
+        .await
+        .result?;
+
+    ctx.net_controller.net_iface.delete_iface(&id).await?;
+
+    ctx.db
+        .mutate(|db| {
+            let hostname = crate::hostname::ServerHostname::load(db.as_public().as_server_info())?;
+            let gateways = db
+                .as_public()
+                .as_server_info()
+                .as_network()
+                .as_gateways()
+                .de()?;
+            let ports = db.as_private().as_available_ports().de()?;
+            for host in all_hosts(db) {
+                let host = host?;
+                host.as_private_domains_mut().mutate(|d| {
+                    for gateways in d.values_mut() {
+                        gateways.remove(&id);
+                    }
+                    d.retain(|_, gateways| !gateways.is_empty());
+                    Ok(())
+                })?;
+                host.update_addresses(&hostname, &gateways, &ports)?;
+            }
+
+            Ok(())
+        })
+        .await
+        .result?;
+
+    // Wait for the sync loop to fully commit gateway removal to the database,
+    // with a 15-second timeout.
+    if tokio::time::timeout(Duration::from_secs(15), async {
+        let mut watch = ctx
+            .db
+            .watch("/public/serverInfo/network".parse::<JsonPointer>().unwrap())
+            .await
+            .typed::<NetworkInfo>();
+        watch
+            .wait_for(|network| !network.gateways.contains_key(&id))
+            .await?;
+        Ok::<_, Error>(())
+    })
+    .await
+    .is_err()
+    {
+        tracing::warn!(
+            "{}",
+            t!(
+                "net.tunnel.timeout-waiting-for-remove",
+                gateway = id.as_str()
+            )
+        );
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Parser, VisitFields)]
+#[group(skip)]
+pub struct UpdateTunnelParams {
+    #[arg(help = "help.arg.gateway-id")]
+    id: GatewayId,
+    #[arg(help = "help.arg.wireguard-config")]
+    config: String,
+}
+
+rpc_toolkit::reflect_ts!(UpdateTunnelParams);
+rpc_toolkit::ts_export!(UpdateTunnelParams, namespaces = [""]);
+
+/// Replace the WireGuard config behind an existing gateway interface in place,
+/// keeping the gateway id and everything keyed to it (forwards, private/public
+/// domains). Used to re-issue a config — e.g. one that now carries a `DNS =`
+/// line. Applied via D-Bus Update2 + Device.Reapply, so the wg device is never
+/// torn down and the gateway (and the request riding its tunnel) survives.
+pub async fn update_tunnel(
+    ctx: RpcContext,
+    UpdateTunnelParams { id, config }: UpdateTunnelParams,
+) -> Result<(), Error> {
+    let Some(existing) = ctx
+        .db
+        .peek()
+        .await
+        .into_public()
+        .into_server_info()
+        .into_network()
+        .into_gateways()
+        .into_idx(&id)
+        .and_then(|e| e.into_ip_info().transpose())
+    else {
+        return Err(Error::new(
+            eyre!("unknown gateway: {id}"),
+            ErrorKind::NotFound,
+        ));
+    };
+
+    if existing.as_deref().as_device_type().de()? != Some(NetworkInterfaceType::Wireguard) {
+        return Err(Error::new(
+            eyre!("network interface {id} is not a proxy"),
+            ErrorKind::InvalidRequest,
+        ));
+    }
+
+    // Reapply keeps the device carrying this RPC alive.
+    crate::net::gateway::update_wireguard_config(id.as_str(), &config).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inbound_marker_selects_inbound_outbound() {
+        assert_eq!(
+            gateway_type_from_config("[Interface]\n# inbound: yes\n"),
+            GatewayType::InboundOutbound
+        );
+    }
+
+    #[test]
+    fn start_tunnel_marker_remains_inbound_outbound() {
+        assert_eq!(
+            gateway_type_from_config("# starttunnel config for server\n"),
+            GatewayType::InboundOutbound
+        );
+    }
+
+    #[test]
+    fn inbound_marker_requires_a_complete_line() {
+        assert_eq!(
+            gateway_type_from_config("# inbound: yesterday\n"),
+            GatewayType::OutboundOnly
+        );
+        assert_eq!(
+            gateway_type_from_config("# Remove # inbound: yes unless supported\n"),
+            GatewayType::OutboundOnly
+        );
+    }
+
+    #[test]
+    fn unmarked_config_is_outbound_only() {
+        assert_eq!(
+            gateway_type_from_config("[Interface]\nAddress = 192.0.2.2/32\n"),
+            GatewayType::OutboundOnly
+        );
+    }
+}

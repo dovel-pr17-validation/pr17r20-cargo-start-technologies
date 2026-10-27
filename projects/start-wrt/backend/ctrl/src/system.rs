@@ -1,0 +1,1574 @@
+use std::collections::HashSet;
+use std::fs;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::path::Path;
+use std::process::Command as StdCommand;
+
+use chrono::Utc;
+use imbl_value::Value;
+use ipnet::IpNet;
+use nix::sys::signal::{self, Signal};
+use nix::unistd::Pid;
+use rpc_toolkit::{from_fn_async, from_fn_async_local, HandlerExt, ParentHandler};
+use serde::{Deserialize, Serialize};
+use tracing::instrument;
+use uciedit::openwrt::{FirewallRule, FirewallTarget};
+use uciedit::{dump_all, parse_all, Arena, Configs, TypedSection};
+
+use crate::error::{Error, ErrorKind};
+use crate::invoke::Invoke;
+use crate::prelude::*;
+use crate::utils::{DeserializeStdin, HandlerExtSerde as _};
+use crate::{CliContext, CtrlContext, ServerContext};
+
+#[derive(Debug, TypedSection, Default)]
+#[uci(ty = "preferences")]
+pub(crate) struct UciPreferences {
+    #[uci(default_value = "\"en_US\".to_string()")]
+    pub language: String,
+    #[uci(default_value = "\"system\".to_string()")]
+    pub theme: String,
+    #[uci(default_value = "\"default\".to_string()")]
+    pub remote_access: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, visit_rs::VisitFields)]
+#[serde(rename_all = "camelCase")]
+struct SystemInfoResponse {
+    version: String,
+    git_hash: String,
+    language: String,
+    date: String,
+    theme: String,
+    remote_access: String,
+    timezone: String,
+}
+rpc_toolkit::reflect_ts!(SystemInfoResponse);
+
+#[derive(Debug, Serialize, Deserialize, visit_rs::VisitFields)]
+#[serde(rename_all = "camelCase")]
+struct VersionInfo {
+    version: String,
+    release_notes: String,
+}
+rpc_toolkit::reflect_ts!(VersionInfo);
+
+#[derive(Debug, Serialize, Deserialize, visit_rs::VisitFields)]
+#[serde(rename_all = "camelCase")]
+struct SetPreferencesReq {
+    language: Option<String>,
+    theme: Option<String>,
+    remote_access: Option<String>,
+}
+rpc_toolkit::reflect_ts!(SetPreferencesReq);
+
+/// The `startwrt.preferences` section, defaulted when absent.
+pub(crate) fn preferences(cfg: &uciedit::Config<'_>) -> Result<UciPreferences, Error> {
+    let mut prefs = UciPreferences::default();
+    cfg.try_each(|name, p: UciPreferences| {
+        if name == Some("preferences") {
+            prefs = p;
+        }
+        Ok::<_, Error>(())
+    })?;
+    Ok(prefs)
+}
+
+#[instrument(skip_all)]
+async fn info<C: CtrlContext>(ctx: C) -> Result<SystemInfoResponse, Error> {
+    let arena = Arena::new();
+    let cfgs = parse_all(ctx.uci_root(), &arena, &["startwrt"]).await?;
+
+    let prefs = preferences(&cfgs["startwrt"])?;
+
+    // Read timezone from system UCI config (spaces → underscores for IANA format)
+    let timezone = String::from_utf8(
+        tokio::process::Command::new("uci")
+            .args(["get", "system.@system[0].zonename"])
+            .invoke(ErrorKind::Filesystem.into())
+            .await
+            .unwrap_or_default(),
+    )
+    .ok()
+    .map(|s| s.trim().replace(' ', "_"))
+    .unwrap_or_default();
+
+    Ok(SystemInfoResponse {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        // Same stamp the web build bakes into config.json (check-git-hash.sh
+        // format); the UI compares the two to detect a stale cached bundle.
+        git_hash: env!("STARTWRT_GIT_HASH").to_string(),
+        language: prefs.language,
+        date: Utc::now().to_rfc3339(),
+        theme: prefs.theme,
+        remote_access: prefs.remote_access,
+        timezone,
+    })
+}
+
+/// Default registry URL used when no UCI config override exists.
+pub(crate) const DEFAULT_REGISTRY_URL: &str = "https://startwrt-registry.start9.com";
+
+async fn newer_versions(_ctx: ServerContext) -> Result<Vec<VersionInfo>, Error> {
+    // Read registry URL from UCI config (fallback to default)
+    let registry_url = read_registry_url().unwrap_or_else(|| DEFAULT_REGISTRY_URL.to_string());
+
+    let versions = match crate::update::fetch_newer_versions(&registry_url).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("Failed to check for updates: {e}");
+            return Ok(Vec::new());
+        }
+    };
+
+    let platform = crate::registry::device_info::DeviceInfo::load()
+        .map(|d| d.os.platform)
+        .unwrap_or_else(|_| "unknown".to_string());
+
+    let current: &str = env!("CARGO_PKG_VERSION");
+
+    let mut result: Vec<VersionInfo> = versions
+        .into_iter()
+        .filter(|(ver, info)| {
+            // Only include versions that have an asset for our platform
+            // and are newer than the current version (semver comparison)
+            info.asset_for_platform(&platform).is_some() && is_newer_version(ver, current)
+        })
+        .map(|(ver, info)| VersionInfo {
+            version: ver,
+            release_notes: info.release_notes,
+        })
+        .collect();
+    // Sort ascending by semver precedence. The map above iterates in
+    // lexicographic key order, which mis-ranks multi-digit pre-releases
+    // (`0.1.0-beta.10` sorts before `0.1.0-beta.9`); the frontend treats the
+    // last element as the newest, so the ordering must be semver-correct.
+    result.sort_by(|a, b| cmp_versions(&a.version, &b.version));
+    Ok(result)
+}
+
+/// Parse a version string as semver, tolerating an optional leading `v`.
+/// Returns `None` for strings that are not valid semver.
+fn parse_version(v: &str) -> Option<semver::Version> {
+    semver::Version::parse(v.strip_prefix('v').unwrap_or(v)).ok()
+}
+
+/// Compare two version strings by semver precedence.
+///
+/// This honours the pre-release suffix per the semver spec, so
+/// `0.1.0-beta.3 < 0.1.0-beta.4 < 0.1.0`. A plain `(major, minor, patch)`
+/// compare collapses every `0.1.0-beta.N` to `0.1.0`, which makes an OTA
+/// between two betas never register as "newer". Strings that are not valid
+/// semver sort *below* any version that is; two unparseable strings are
+/// `Equal`.
+pub(crate) fn cmp_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    match (parse_version(a), parse_version(b)) {
+        (Some(a), Some(b)) => a.cmp(&b),
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
+/// `true` iff `candidate` is strictly newer than `current` by semver.
+fn is_newer_version(candidate: &str, current: &str) -> bool {
+    cmp_versions(candidate, current) == std::cmp::Ordering::Greater
+}
+
+/// Read the registry URL from UCI config `startwrt.system.registry`.
+pub(crate) fn read_registry_url() -> Option<String> {
+    StdCommand::new("uci")
+        .args(["get", "startwrt.system.registry"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+const VALID_LANGUAGES: &[&str] = &["en_US", "es_ES", "de_DE", "fr_FR", "pl_PL"];
+const VALID_THEMES: &[&str] = &["dark", "light", "system"];
+const VALID_REMOTE_ACCESS: &[&str] = &["default", "never", "always"];
+
+pub(crate) const REMOTE_RULE_PREFIX: &str = "startwrt_remote_";
+const REMOTE_ACCESS_PORTS: &[&str] = &["80", "443", "22"];
+
+const ULA_PREFIX: &str = "fc00::/7";
+
+const RFC1918_BLOCKS: &[(&str, &str)] = &[
+    ("ipv4_10", "10.0.0.0/8"),
+    ("ipv4_172", "172.16.0.0/12"),
+    ("ipv4_192", "192.168.0.0/16"),
+];
+
+fn is_private_ipv4(ip: &Ipv4Addr) -> bool {
+    RFC1918_BLOCKS
+        .iter()
+        .any(|(_, block)| block.parse::<IpNet>().unwrap().contains(&IpAddr::V4(*ip)))
+}
+
+pub(crate) fn has_global_ipv6(addrs: &[Ipv6Addr]) -> bool {
+    addrs.iter().any(|addr| {
+        // 2000::/3 — first 3 bits are 001
+        let first = addr.segments()[0];
+        (0x2000..=0x3fff).contains(&first)
+    })
+}
+
+/// Whether `addr` falls within the `prefix_len`-bit network `prefix` (their top
+/// `prefix_len` bits match). `prefix_len == 0` matches everything; `> 128`
+/// matches nothing.
+pub(crate) fn addr_in_prefix(addr: Ipv6Addr, prefix: Ipv6Addr, prefix_len: u8) -> bool {
+    if prefix_len == 0 {
+        return true;
+    }
+    if prefix_len > 128 {
+        return false;
+    }
+    let mask = u128::MAX << (128 - prefix_len);
+    (u128::from(addr) & mask) == (u128::from(prefix) & mask)
+}
+
+pub(crate) async fn get_wan_ipv4() -> Result<Option<Ipv4Addr>, Error> {
+    let stdout = match tokio::process::Command::new("ubus")
+        .args(["call", "network.interface.wan", "status"])
+        .invoke(ErrorKind::Network.into())
+        .await
+    {
+        Ok(out) => out,
+        Err(_) => return Ok(None),
+    };
+    let json: serde_json::Value = match serde_json::from_slice(&stdout) {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    let addr_str = json
+        .pointer("/ipv4-address/0/address")
+        .and_then(|v| v.as_str());
+    match addr_str {
+        Some(s) => Ok(s.parse().ok()),
+        None => Ok(None),
+    }
+}
+
+/// Every IPv4 address on the `wan` interface, in ubus order. Empty when the
+/// interface is down or ubus is unavailable.
+pub(crate) fn wan_ipv4_addrs() -> Vec<Ipv4Addr> {
+    read_wan_ipv4_addrs().unwrap_or_default()
+}
+
+/// `None` when ubus is unavailable; empty when the interface is down.
+pub(crate) fn read_wan_ipv4_addrs() -> Option<Vec<Ipv4Addr>> {
+    let out = StdCommand::new("ubus")
+        .args(["call", "network.interface.wan", "status"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let json = serde_json::from_slice::<serde_json::Value>(&out.stdout).ok()?;
+    Some(
+        json.get("ipv4-address")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|e| e.get("address")?.as_str()?.parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default(),
+    )
+}
+
+pub async fn get_wan_ipv6s() -> Result<Vec<Ipv6Addr>, Error> {
+    let stdout = match tokio::process::Command::new("ubus")
+        .args(["call", "network.interface.wan6", "status"])
+        .invoke(ErrorKind::Network.into())
+        .await
+    {
+        Ok(out) => out,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let json: serde_json::Value = match serde_json::from_slice(&stdout) {
+        Ok(v) => v,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let mut addrs = Vec::new();
+    if let Some(arr) = json.get("ipv6-address").and_then(|v| v.as_array()) {
+        for entry in arr {
+            if let Some(s) = entry.get("address").and_then(|v| v.as_str()) {
+                if let Ok(addr) = s.parse() {
+                    addrs.push(addr);
+                }
+            }
+        }
+    }
+    // Also check prefix-assignment local addresses (DHCPv6-PD)
+    if let Some(arr) = json
+        .get("ipv6-prefix-assignment")
+        .and_then(|v| v.as_array())
+    {
+        for entry in arr {
+            if let Some(s) = entry
+                .pointer("/local-address/address")
+                .and_then(|v| v.as_str())
+            {
+                if let Ok(addr) = s.parse() {
+                    addrs.push(addr);
+                }
+            }
+        }
+    }
+    Ok(addrs)
+}
+
+/// Length of the largest global prefix delegated to `wan6`, read from netifd.
+/// `None` without a global delegation or when ubus is unavailable.
+pub async fn read_wan6_delegated_prefix_len() -> Option<u8> {
+    let stdout = tokio::process::Command::new("ubus")
+        .args(["call", "network.interface.wan6", "status"])
+        .invoke(ErrorKind::Network.into())
+        .await
+        .ok()?;
+    let json = serde_json::from_slice::<serde_json::Value>(&stdout).ok()?;
+    delegated_prefix_len(&json)
+}
+
+fn delegated_prefix_len(status: &serde_json::Value) -> Option<u8> {
+    status
+        .get("ipv6-prefix")?
+        .as_array()?
+        .iter()
+        .filter(|entry| {
+            entry
+                .get("address")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<Ipv6Addr>().ok())
+                .is_some_and(|addr| has_global_ipv6(&[addr]))
+        })
+        .filter_map(|entry| u8::try_from(entry.get("mask")?.as_u64()?).ok())
+        .min()
+}
+
+struct RemoteAccessRuleSpec {
+    suffix: Option<&'static str>,
+    family: Option<&'static str>,
+    src_ip: Option<&'static str>,
+}
+
+fn remote_access_rule_specs(
+    mode: &str,
+    wan_ipv4: Option<Ipv4Addr>,
+    wan_ipv6s: &[Ipv6Addr],
+) -> Vec<RemoteAccessRuleSpec> {
+    match mode {
+        "always" => vec![RemoteAccessRuleSpec {
+            suffix: None,
+            family: None,
+            src_ip: None,
+        }],
+        "default" => {
+            let mut specs = Vec::new();
+            if wan_ipv4.is_some_and(|ip| is_private_ipv4(&ip)) {
+                for &(suffix, block) in RFC1918_BLOCKS {
+                    specs.push(RemoteAccessRuleSpec {
+                        suffix: Some(suffix),
+                        family: Some("ipv4"),
+                        src_ip: Some(block),
+                    });
+                }
+            }
+            if !wan_ipv6s.is_empty() && !has_global_ipv6(wan_ipv6s) {
+                specs.push(RemoteAccessRuleSpec {
+                    suffix: Some("ipv6"),
+                    family: Some("ipv6"),
+                    src_ip: Some(ULA_PREFIX),
+                });
+            }
+            specs
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn apply_remote_access_config(
+    cfgs: &mut Configs,
+    mode: &str,
+    wan_ipv4: Option<Ipv4Addr>,
+    wan_ipv6s: &[Ipv6Addr],
+) {
+    cfgs["firewall"].sections.retain(|section| {
+        let Ok(rule) = section.get::<FirewallRule>() else {
+            return true;
+        };
+        !rule.name.starts_with(REMOTE_RULE_PREFIX)
+    });
+
+    for spec in remote_access_rule_specs(mode, wan_ipv4, wan_ipv6s) {
+        for &port in REMOTE_ACCESS_PORTS {
+            let name = match spec.suffix {
+                Some(suffix) => format!("{REMOTE_RULE_PREFIX}{port}_{suffix}"),
+                None => format!("{REMOTE_RULE_PREFIX}{port}"),
+            };
+            let rule = FirewallRule {
+                name: name.clone(),
+                src: "wan".to_string(),
+                src_ip: spec.src_ip.map(str::to_string),
+                dest_port: Some(port.to_string()),
+                proto: vec!["tcp".to_string()],
+                target: FirewallTarget::ACCEPT,
+                family: spec.family.map(str::to_string),
+                ..Default::default()
+            };
+            cfgs["firewall"].append(&rule, Some(name.as_str())).ok();
+        }
+    }
+}
+
+/// Decodes an address from `/proc/net/tcp{,6}`: hex 32-bit words in host (little-endian)
+/// byte order, then a hex port. An IPv4-mapped IPv6 address decodes as IPv4.
+fn parse_proc_addr(field: &str) -> Option<(IpAddr, u16)> {
+    let (addr, port) = field.split_once(':')?;
+    let port = u16::from_str_radix(port, 16).ok()?;
+    let mut octets = (0..addr.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(addr.get(i..i + 2)?, 16).ok())
+        .collect::<Option<Vec<u8>>>()?;
+    for word in octets.chunks_mut(4) {
+        word.reverse();
+    }
+    let ip = match octets.len() {
+        4 => IpAddr::from(<[u8; 4]>::try_from(octets).ok()?),
+        16 => IpAddr::from(<[u8; 16]>::try_from(octets).ok()?),
+        _ => return None,
+    };
+    Some((ip.to_canonical(), port))
+}
+
+fn remote_access_admits(
+    mode: &str,
+    source: IpAddr,
+    wan_ipv4: Option<Ipv4Addr>,
+    wan_ipv6s: &[Ipv6Addr],
+) -> bool {
+    remote_access_rule_specs(mode, wan_ipv4, wan_ipv6s)
+        .iter()
+        .any(|spec| {
+            spec.src_ip
+                .is_none_or(|prefix| prefix.parse::<IpNet>().unwrap().contains(&source))
+        })
+}
+
+/// Socket inodes of established SSH sessions to a WAN address from a source `admits` rejects.
+fn rejected_wan_ssh_inodes(
+    table: &str,
+    wan: &[IpAddr],
+    admits: impl Fn(IpAddr) -> bool,
+) -> HashSet<u64> {
+    table
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() < 10 || fields[3] != "01" {
+                return None;
+            }
+            let (local, port) = parse_proc_addr(fields[1])?;
+            let (remote, _) = parse_proc_addr(fields[2])?;
+            if port != 22 || !wan.contains(&local) || admits(remote) {
+                return None;
+            }
+            fields[9].parse::<u64>().ok().filter(|&inode| inode != 0)
+        })
+        .collect()
+}
+
+/// Scan all `/proc/<pid>/fd/` entries for socket inodes matching the given set.
+/// If a match is found and the process is `dropbear`, send SIGTERM.
+fn kill_dropbear_by_inodes(inodes: &HashSet<u64>) {
+    let proc = Path::new("/proc");
+    let Ok(entries) = fs::read_dir(proc) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid_str) = name.to_str() else {
+            continue;
+        };
+        let Ok(pid_num) = pid_str.parse::<i32>() else {
+            continue;
+        };
+
+        let fd_dir = proc.join(pid_str).join("fd");
+        let Ok(fds) = fs::read_dir(&fd_dir) else {
+            continue;
+        };
+
+        let mut matched = false;
+        for fd in fds.flatten() {
+            let Ok(link) = fs::read_link(fd.path()) else {
+                continue;
+            };
+            let link_str = link.to_string_lossy();
+            // symlink target looks like "socket:[12345]"
+            if let Some(inode_str) = link_str
+                .strip_prefix("socket:[")
+                .and_then(|s| s.strip_suffix(']'))
+            {
+                if let Ok(inode) = inode_str.parse::<u64>() {
+                    if inodes.contains(&inode) {
+                        matched = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if matched {
+            // Verify this is a dropbear process before killing
+            let comm_path = proc.join(pid_str).join("comm");
+            if let Ok(comm) = fs::read_to_string(&comm_path) {
+                if comm.trim() == "dropbear" {
+                    let _ = signal::kill(Pid::from_raw(pid_num), Signal::SIGTERM);
+                }
+            }
+        }
+    }
+}
+
+/// Ends WAN-side SSH sessions from sources the Remote Access mode no longer admits.
+fn kill_rejected_wan_ssh_sessions(mode: &str, wan_ipv4: Option<Ipv4Addr>, wan_ipv6s: &[Ipv6Addr]) {
+    let wan: Vec<IpAddr> = wan_ipv4
+        .map(IpAddr::V4)
+        .into_iter()
+        .chain(wan_ipv6s.iter().copied().map(IpAddr::V6))
+        .collect();
+    if wan.is_empty() {
+        return;
+    }
+    let admits = |source| remote_access_admits(mode, source, wan_ipv4, wan_ipv6s);
+    let mut inodes = HashSet::new();
+    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        if let Ok(content) = fs::read_to_string(table) {
+            inodes.extend(rejected_wan_ssh_inodes(&content, &wan, &admits));
+        }
+    }
+    if !inodes.is_empty() {
+        kill_dropbear_by_inodes(&inodes);
+    }
+}
+
+/// Completes before returning: a CLI caller exits once its handler does.
+async fn reload_firewall(mode: &str, wan_ipv4: Option<Ipv4Addr>, wan_ipv6s: &[Ipv6Addr]) {
+    let _ =
+        crate::run_quiet_async(tokio::process::Command::new("/etc/init.d/firewall").arg("reload"))
+            .await;
+    // Established sessions outlive the reload through conntrack.
+    kill_rejected_wan_ssh_sessions(mode, wan_ipv4, wan_ipv6s);
+}
+
+#[instrument(skip_all)]
+pub async fn apply_remote_access<C: CtrlContext>(ctx: C) -> Result<Value, Error> {
+    let mut retries = 4;
+    loop {
+        let arena = Arena::new();
+        let mut cfgs = parse_all(ctx.uci_root(), &arena, &["startwrt", "firewall"]).await?;
+
+        let prefs = preferences(&cfgs["startwrt"])?;
+
+        let (wan_ipv4, wan_ipv6s) = if ctx.effectful() {
+            (get_wan_ipv4().await?, get_wan_ipv6s().await?)
+        } else {
+            (None, Vec::new())
+        };
+
+        apply_remote_access_config(&mut cfgs, &prefs.remote_access, wan_ipv4, &wan_ipv6s);
+
+        match dump_all(ctx.uci_root(), cfgs).await {
+            Err(uciedit::Error::Conflict { .. }) if retries > 0 => {
+                retries -= 1;
+                continue;
+            }
+            Err(err) => {
+                return Err(err.into());
+            }
+            Ok(()) => {
+                if ctx.effectful() {
+                    reload_firewall(&prefs.remote_access, wan_ipv4, &wan_ipv6s).await;
+                    // Apply mode changes to the shared SNI fallback.
+                    if let (Some(pc), Some(wan)) =
+                        (crate::port_control::PORT_CONTROL.get(), wan_ipv4)
+                    {
+                        let pc = pc.clone();
+                        tokio::spawn(async move { pc.sync_sni_fallback(wan).await });
+                    }
+                }
+                return Ok(Value::Null);
+            }
+        }
+    }
+}
+
+#[instrument(skip_all)]
+async fn set_preferences<C: CtrlContext>(
+    ctx: C,
+    DeserializeStdin(req): DeserializeStdin<SetPreferencesReq>,
+) -> Result<Value, Error> {
+    if let Some(lang) = &req.language {
+        if !VALID_LANGUAGES.contains(&lang.as_str()) {
+            return Err(Error::new(
+                eyre!("invalid language: {lang}"),
+                ErrorKind::InvalidValue,
+            ));
+        }
+    }
+    if let Some(theme) = &req.theme {
+        if !VALID_THEMES.contains(&theme.as_str()) {
+            return Err(Error::new(
+                eyre!("invalid theme: {theme}"),
+                ErrorKind::InvalidValue,
+            ));
+        }
+    }
+    if let Some(ra) = &req.remote_access {
+        if !VALID_REMOTE_ACCESS.contains(&ra.as_str()) {
+            return Err(Error::new(
+                eyre!("invalid remoteAccess: {ra}"),
+                ErrorKind::InvalidValue,
+            ));
+        }
+    }
+
+    let needs_firewall = req.remote_access.is_some();
+    let configs: &[&str] = if needs_firewall {
+        &["startwrt", "firewall"]
+    } else {
+        &["startwrt"]
+    };
+
+    let mut retries = 4;
+    loop {
+        let arena = Arena::new();
+        let mut cfgs = parse_all(ctx.uci_root(), &arena, configs).await?;
+
+        // Find existing preferences section or create one
+        let mut found = false;
+        let mut new_mode = None;
+        for section in &mut cfgs["startwrt"].sections {
+            if section.name().as_deref() == Some("preferences") {
+                if let Some(mut prefs) = section.get_typed::<UciPreferences>()? {
+                    if let Some(lang) = &req.language {
+                        prefs.language = lang.clone();
+                    }
+                    if let Some(theme) = &req.theme {
+                        prefs.theme = theme.clone();
+                    }
+                    if let Some(ra) = &req.remote_access {
+                        new_mode = Some(ra.clone());
+                        prefs.remote_access = ra.clone();
+                    }
+                    section.set(&prefs)?;
+                    found = true;
+                    break;
+                }
+            }
+        }
+
+        if !found {
+            let ra = req
+                .remote_access
+                .clone()
+                .unwrap_or_else(|| "default".to_string());
+            if req.remote_access.is_some() {
+                new_mode = Some(ra.clone());
+            }
+            let prefs = UciPreferences {
+                language: req.language.clone().unwrap_or_else(|| "en_US".to_string()),
+                theme: req.theme.clone().unwrap_or_else(|| "system".to_string()),
+                remote_access: ra,
+            };
+            cfgs["startwrt"].append(&prefs, Some("preferences"))?;
+        }
+
+        // Apply firewall rules if remote_access changed
+        if let Some(mode) = &new_mode {
+            let (wan_ipv4, wan_ipv6s) = if ctx.effectful() {
+                (get_wan_ipv4().await?, get_wan_ipv6s().await?)
+            } else {
+                (None, Vec::new())
+            };
+            apply_remote_access_config(&mut cfgs, mode, wan_ipv4, &wan_ipv6s);
+        }
+
+        match dump_all(ctx.uci_root(), cfgs).await {
+            Err(uciedit::Error::Conflict { .. }) if retries > 0 => {
+                retries -= 1;
+                continue;
+            }
+            Err(err) => {
+                if needs_firewall {
+                    crate::activity::log(
+                        "system",
+                        "remote-access",
+                        false,
+                        &format!(
+                            "Failed to update remote access to '{}'",
+                            new_mode.as_deref().unwrap_or("unknown")
+                        ),
+                        Some(&err.to_string()),
+                    );
+                }
+                return Err(err.into());
+            }
+            Ok(()) => {
+                if let Some(mode) = &new_mode {
+                    crate::activity::log(
+                        "system",
+                        "remote-access",
+                        true,
+                        &format!("Updated remote access to '{}'", mode),
+                        None,
+                    );
+                    if ctx.effectful() {
+                        let (wan_ipv4, wan_ipv6s) = (get_wan_ipv4().await?, get_wan_ipv6s().await?);
+                        reload_firewall(mode, wan_ipv4, &wan_ipv6s).await;
+                    }
+                }
+                return Ok(Value::Null);
+            }
+        }
+    }
+}
+
+#[instrument(skip_all)]
+async fn factory_reset(_ctx: ServerContext) -> Result<(), Error> {
+    if let Err(e) = tokio::process::Command::new("firstboot")
+        .arg("-y")
+        .invoke(ErrorKind::Filesystem.into())
+        .await
+    {
+        crate::activity::log(
+            "system",
+            "factory-reset",
+            false,
+            "Failed to initiate factory reset",
+            Some(&e.to_string()),
+        );
+        return Err(e.into());
+    }
+
+    crate::activity::log(
+        "system",
+        "factory-reset",
+        true,
+        "Factory reset initiated",
+        None,
+    );
+
+    // Spawn reboot after a short delay so the HTTP response can reach the client
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        if let Err(e) = tokio::process::Command::new("reboot")
+            .invoke(ErrorKind::Filesystem.into())
+            .await
+        {
+            tracing::error!("failed to reboot: {e}");
+        }
+    });
+
+    Ok(())
+}
+
+#[instrument(skip_all)]
+async fn restart(_ctx: ServerContext) -> Result<(), Error> {
+    crate::activity::log("system", "restart", true, "System restart initiated", None);
+
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        if let Err(e) = tokio::process::Command::new("reboot")
+            .invoke(ErrorKind::Filesystem.into())
+            .await
+        {
+            tracing::error!("failed to reboot: {e}");
+        }
+    });
+
+    Ok(())
+}
+
+#[derive(Debug, Deserialize, Serialize, visit_rs::VisitFields)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SetTimezoneParams {
+    /// IANA timezone name, e.g. "America/New_York"
+    pub timezone: String,
+}
+rpc_toolkit::reflect_ts!(SetTimezoneParams);
+
+/// Resolve a POSIX TZ string for an IANA name using the on-device LuCI
+/// zoneinfo table — the same authoritative source LuCI itself uses. The table
+/// (`/usr/share/ucode/luci/zoneinfo.uc`, autogenerated from tzdata) is exposed
+/// over ubus as `luci.getTimezones`, which returns
+/// `{ "<IANA>": { "tzstring": "<POSIX>", ... }, ... }`. Returns `None` if the
+/// name isn't in the table. We never ship or hand-maintain this mapping.
+pub(crate) async fn resolve_posix_tz(iana: &str) -> Result<Option<String>, Error> {
+    // UTC isn't in the generated table (LuCI prepends it as a special case); the
+    // POSIX string "UTC" is what OpenWrt ships as the default in /etc/config/system.
+    if iana == "UTC" || iana == "Etc/UTC" {
+        return Ok(Some("UTC".to_string()));
+    }
+    let output = tokio::process::Command::new("ubus")
+        .args(["call", "luci", "getTimezones"])
+        .invoke(ErrorKind::Filesystem.into())
+        .await?;
+    let json: serde_json::Value = serde_json::from_slice(&output)
+        .map_err(|e| Error::new(eyre!("parsing getTimezones: {e}"), ErrorKind::Filesystem))?;
+    Ok(json
+        .get(iana)
+        .and_then(|v| v.get("tzstring"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string()))
+}
+
+/// List every IANA timezone name the device can resolve, sourced from the
+/// on-device LuCI zoneinfo table (`ubus call luci getTimezones`). Backs the
+/// settings dropdown so the offered list is exactly the set the device can set.
+async fn get_timezones(_ctx: ServerContext) -> Result<Vec<String>, Error> {
+    let output = tokio::process::Command::new("ubus")
+        .args(["call", "luci", "getTimezones"])
+        .invoke(ErrorKind::Filesystem.into())
+        .await?;
+    let json: serde_json::Value = serde_json::from_slice(&output)
+        .map_err(|e| Error::new(eyre!("parsing getTimezones: {e}"), ErrorKind::Filesystem))?;
+    let mut zones: Vec<String> = json
+        .as_object()
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+    zones.sort();
+    // UTC isn't in the table; LuCI prepends it as an explicit choice. Mirror that.
+    let mut result = vec!["UTC".to_string()];
+    result.extend(zones);
+    Ok(result)
+}
+
+/// Set the system timezone.
+///
+/// The frontend sends only the IANA name; the backend resolves the matching
+/// POSIX TZ string from the device's authoritative LuCI zoneinfo table
+/// (`resolve_posix_tz`). OpenWrt writes the POSIX string to `/etc/TZ` on
+/// `system reload`, which makes `date`, `cron`, and all libc time functions use
+/// the correct local time. No `zoneinfo` package needed. crond caches the zone
+/// at launch, so we restart it afterward to pick up the new `/etc/TZ`.
+#[instrument(skip_all)]
+pub(crate) async fn set_timezone<C: CtrlContext>(
+    ctx: C,
+    DeserializeStdin(params): DeserializeStdin<SetTimezoneParams>,
+) -> Result<(), Error> {
+    if !ctx.effectful() {
+        return Ok(());
+    }
+
+    // Store the IANA name verbatim (underscores), matching modern LuCI's writer
+    // and the zoneinfo table keys, so `luci.getTimezones`' active flag agrees.
+    let zonename = params.timezone.as_str();
+
+    // Skip if unchanged
+    let current = String::from_utf8(
+        tokio::process::Command::new("uci")
+            .args(["get", "system.@system[0].zonename"])
+            .invoke(ErrorKind::UciEdit.into())
+            .await
+            .unwrap_or_default(),
+    )
+    .unwrap_or_default();
+    if current.trim() == zonename {
+        return Ok(());
+    }
+
+    // Resolve the POSIX TZ string from the device's authoritative table.
+    // An unknown name (e.g. an exotic browser zone during setup) leaves the
+    // device on its existing zone — UTC by default — so log that fallback.
+    let posix_tz = match resolve_posix_tz(&params.timezone).await? {
+        Some(tz) => tz,
+        None => {
+            crate::activity::log(
+                "system",
+                "timezone-updated",
+                false,
+                &format!("Timezone '{}' not recognized; kept UTC", params.timezone),
+                Some("not found in zoneinfo table"),
+            );
+            return Err(Error::new(
+                eyre!("unknown timezone: {}", params.timezone),
+                ErrorKind::InvalidRequest,
+            ));
+        }
+    };
+
+    // Set the display name (IANA)
+    crate::run_quiet_async(
+        tokio::process::Command::new("uci")
+            .args(["set", &format!("system.@system[0].zonename={zonename}")]),
+    )
+    .await
+    .map_err(|e| Error::new(eyre!("setting zonename: {e}"), ErrorKind::UciEdit))?;
+
+    // Set the POSIX TZ string — this is what actually controls time conversion
+    crate::run_quiet_async(
+        tokio::process::Command::new("uci")
+            .args(["set", &format!("system.@system[0].timezone={posix_tz}")]),
+    )
+    .await
+    .map_err(|e| Error::new(eyre!("setting timezone: {e}"), ErrorKind::UciEdit))?;
+
+    crate::run_quiet_async(tokio::process::Command::new("uci").args(["commit", "system"]))
+        .await
+        .map_err(|e| Error::new(eyre!("committing system config: {e}"), ErrorKind::UciEdit))?;
+
+    // Reload writes the POSIX TZ string to /etc/TZ
+    crate::run_quiet_async(tokio::process::Command::new("/etc/init.d/system").arg("reload"))
+        .await
+        .map_err(|e| Error::new(eyre!("reloading system: {e}"), ErrorKind::Filesystem))?;
+
+    // crond reads its zone from /etc/TZ at launch and caches it, so restart it
+    // to re-base wall-clock schedules (WiFi blackout, WAN) on the new local time.
+    crate::run_quiet_async(tokio::process::Command::new("/etc/init.d/cron").arg("restart"))
+        .await
+        .map_err(|e| Error::new(eyre!("restarting cron: {e}"), ErrorKind::Filesystem))?;
+    crate::wifi::apply_blackout(ctx.uci_root()).await?;
+
+    crate::activity::log(
+        "system",
+        "timezone-updated",
+        true,
+        &format!("Set timezone to {}", params.timezone),
+        None,
+    );
+
+    Ok(())
+}
+
+pub fn system<C: CtrlContext>() -> ParentHandler<C> {
+    ParentHandler::new()
+        .subcommand(
+            "info",
+            from_fn_async_local(info::<C>)
+                .with_metadata("authenticated", Value::Bool(false))
+                .with_display_serializable(),
+        )
+        .subcommand(
+            "newer-versions",
+            from_fn_async(newer_versions)
+                .with_metadata("authenticated", Value::Bool(false))
+                .with_display_serializable()
+                .with_call_remote::<CliContext>(),
+        )
+        .subcommand(
+            "update",
+            from_fn_async(crate::update::update_system)
+                .with_display_serializable()
+                .with_call_remote::<CliContext>(),
+        )
+        .subcommand(
+            "set-preferences",
+            from_fn_async_local(set_preferences::<C>).with_display_serializable(),
+        )
+        .subcommand(
+            "apply-remote-access",
+            from_fn_async_local(apply_remote_access::<C>).no_display(),
+        )
+        .subcommand(
+            "restart",
+            from_fn_async(restart)
+                .no_display()
+                .with_about("Reboot the device")
+                .with_call_remote::<CliContext>(),
+        )
+        .subcommand(
+            "factory-reset",
+            from_fn_async(factory_reset)
+                .no_display()
+                .with_about("Wipe overlay and reboot (factory reset)")
+                .with_call_remote::<CliContext>(),
+        )
+        .subcommand(
+            "set-timezone",
+            from_fn_async(set_timezone::<C>).no_display(),
+        )
+        .subcommand(
+            "get-timezones",
+            from_fn_async(get_timezones)
+                .with_metadata("authenticated", Value::Bool(false))
+                .with_display_serializable()
+                .with_call_remote::<CliContext>(),
+        )
+        .subcommand(
+            "logs",
+            from_fn_async(crate::logs::get_logs)
+                .with_display_serializable()
+                .with_call_remote::<CliContext>(),
+        )
+        .subcommand(
+            "logs-follow",
+            from_fn_async(crate::logs::follow_logs)
+                .with_metadata("get_signer", Value::Bool(true))
+                .no_cli(),
+        )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cmp_versions_prerelease() {
+        use std::cmp::Ordering;
+        // Pre-release ordering — the case the old tuple compare got wrong.
+        assert_eq!(cmp_versions("0.1.0-beta.3", "0.1.0-beta.4"), Ordering::Less);
+        assert_eq!(
+            cmp_versions("0.1.0-beta.4", "0.1.0-beta.3"),
+            Ordering::Greater
+        );
+        assert_eq!(
+            cmp_versions("0.1.0-beta.3", "0.1.0-beta.3"),
+            Ordering::Equal
+        );
+        // A pre-release is older than its own final release.
+        assert_eq!(cmp_versions("0.1.0-beta.4", "0.1.0"), Ordering::Less);
+        // The numeric core still dominates the pre-release tag.
+        assert_eq!(cmp_versions("0.2.0-beta.1", "0.1.0"), Ordering::Greater);
+        assert_eq!(cmp_versions("v1.2.3", "1.2.3"), Ordering::Equal);
+        // Unparseable strings sort below anything that parses.
+        assert_eq!(cmp_versions("garbage", "0.1.0-beta.3"), Ordering::Less);
+        assert_eq!(cmp_versions("nonsense", "rubbish"), Ordering::Equal);
+
+        assert!(is_newer_version("0.1.0-beta.4", "0.1.0-beta.3"));
+        assert!(!is_newer_version("0.1.0-beta.3", "0.1.0-beta.4"));
+        assert!(!is_newer_version("0.1.0-beta.3", "0.1.0-beta.3"));
+    }
+
+    #[test]
+    fn test_is_private_ipv4() {
+        // RFC1918 ranges
+        assert!(is_private_ipv4(&"10.0.0.1".parse().unwrap()));
+        assert!(is_private_ipv4(&"10.255.255.255".parse().unwrap()));
+        assert!(is_private_ipv4(&"172.16.0.1".parse().unwrap()));
+        assert!(is_private_ipv4(&"172.31.255.255".parse().unwrap()));
+        assert!(is_private_ipv4(&"192.168.0.1".parse().unwrap()));
+        assert!(is_private_ipv4(&"192.168.255.255".parse().unwrap()));
+
+        // Not private
+        assert!(!is_private_ipv4(&"8.8.8.8".parse().unwrap()));
+        assert!(!is_private_ipv4(&"100.64.0.1".parse().unwrap())); // CGNAT
+        assert!(!is_private_ipv4(&"172.32.0.1".parse().unwrap()));
+        assert!(!is_private_ipv4(&"1.2.3.4".parse().unwrap()));
+    }
+
+    fn proc_addr(ip: &str, port: u16) -> String {
+        let octets: Vec<u8> = match ip.parse::<IpAddr>().unwrap() {
+            IpAddr::V4(ip) => ip.octets().to_vec(),
+            IpAddr::V6(ip) => ip.octets().to_vec(),
+        };
+        let hex: String = octets
+            .chunks(4)
+            .flat_map(|word| word.iter().rev())
+            .map(|byte| format!("{byte:02X}"))
+            .collect();
+        format!("{hex}:{port:04X}")
+    }
+
+    fn proc_table(rows: &[(&str, u16, &str, &str, u64)]) -> String {
+        let mut table = String::from("  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n");
+        for (i, (local, port, remote, state, inode)) in rows.iter().enumerate() {
+            table.push_str(&format!(
+                "{i:4}: {} {} {state} 00000000:00000000 00:00000000 00000000     0        0 {inode} 1 0000000000000000 20 4 30 10 -1\n",
+                proc_addr(local, *port),
+                proc_addr(remote, 50000),
+            ));
+        }
+        table
+    }
+
+    #[test]
+    fn test_parse_proc_addr() {
+        assert_eq!(
+            parse_proc_addr("0100007F:0016"),
+            Some(("127.0.0.1".parse().unwrap(), 22))
+        );
+        assert_eq!(
+            parse_proc_addr("B80D0120000000000000000001000000:0016"),
+            Some(("2001:db8::1".parse().unwrap(), 22))
+        );
+        assert_eq!(
+            parse_proc_addr("0000000000000000FFFF00000200140A:0016"),
+            Some(("10.20.0.2".parse().unwrap(), 22))
+        );
+        assert_eq!(parse_proc_addr("0100007F"), None);
+        assert_eq!(parse_proc_addr("01007F:0016"), None);
+    }
+
+    #[test]
+    fn test_rejected_wan_ssh_inodes_ipv4() {
+        let table = proc_table(&[
+            ("10.20.0.2", 22, "10.20.0.50", "01", 1),
+            ("10.20.0.2", 22, "8.8.8.8", "01", 2),
+            ("10.20.0.2", 443, "8.8.8.8", "01", 3),
+            ("192.168.1.1", 22, "192.168.1.25", "01", 4),
+            ("10.20.0.2", 22, "8.8.4.4", "06", 5),
+        ]);
+        let rejected = |mode: &str, wan: &str| {
+            let wan_ip: Ipv4Addr = wan.parse().unwrap();
+            let mut inodes: Vec<u64> =
+                rejected_wan_ssh_inodes(&table, &[IpAddr::V4(wan_ip)], |src| {
+                    remote_access_admits(mode, src, Some(wan_ip), &[])
+                })
+                .into_iter()
+                .collect();
+            inodes.sort();
+            inodes
+        };
+        assert_eq!(rejected("never", "10.20.0.2"), vec![1, 2]);
+        let dual_stack = proc_table(&[
+            ("::ffff:10.20.0.2", 22, "::ffff:10.20.0.50", "01", 7),
+            ("::ffff:10.20.0.2", 22, "::ffff:8.8.8.8", "01", 8),
+        ]);
+        let wan_ip: Ipv4Addr = "10.20.0.2".parse().unwrap();
+        assert_eq!(
+            rejected_wan_ssh_inodes(&dual_stack, &[IpAddr::V4(wan_ip)], |src| {
+                remote_access_admits("default", src, Some(wan_ip), &[])
+            }),
+            HashSet::from([8])
+        );
+        assert_eq!(rejected("default", "10.20.0.2"), vec![2]);
+        assert_eq!(rejected("always", "10.20.0.2"), Vec::<u64>::new());
+        let public_wan = proc_table(&[("203.0.113.5", 22, "10.20.0.50", "01", 6)]);
+        let wan_ip: Ipv4Addr = "203.0.113.5".parse().unwrap();
+        assert_eq!(
+            rejected_wan_ssh_inodes(&public_wan, &[IpAddr::V4(wan_ip)], |src| {
+                remote_access_admits("default", src, Some(wan_ip), &[])
+            }),
+            HashSet::from([6])
+        );
+    }
+
+    #[test]
+    fn test_rejected_wan_ssh_inodes_ipv6() {
+        let table = proc_table(&[
+            ("fd00::1", 22, "fd12::5", "01", 1),
+            ("fd00::1", 22, "2001:db8::5", "01", 2),
+        ]);
+        let rejected = |wan_ipv6s: &[Ipv6Addr]| {
+            let wan: Vec<IpAddr> = vec!["fd00::1".parse().unwrap()];
+            let mut inodes: Vec<u64> = rejected_wan_ssh_inodes(&table, &wan, |src| {
+                remote_access_admits("default", src, None, wan_ipv6s)
+            })
+            .into_iter()
+            .collect();
+            inodes.sort();
+            inodes
+        };
+        assert_eq!(rejected(&["fd00::1".parse().unwrap()]), vec![2]);
+        assert_eq!(
+            rejected(&["fd00::1".parse().unwrap(), "2001:db8::9".parse().unwrap()]),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn test_remote_access_admits_source_ranges() {
+        let wan_ipv4 = Some("10.20.0.2".parse().unwrap());
+        let wan_ipv6s = ["fd00::1".parse().unwrap()];
+        for source in [
+            "10.0.0.1",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.0.1",
+            "fc00::1",
+            "fdff::1",
+        ] {
+            assert!(
+                remote_access_admits("default", source.parse().unwrap(), wan_ipv4, &wan_ipv6s),
+                "{source}"
+            );
+        }
+        for source in [
+            "100.64.0.1",
+            "172.32.0.1",
+            "8.8.8.8",
+            "fe00::1",
+            "fe80::1",
+            "2001:db8::1",
+        ] {
+            assert!(
+                !remote_access_admits("default", source.parse().unwrap(), wan_ipv4, &wan_ipv6s),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_has_global_ipv6() {
+        let gua: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let ula: Ipv6Addr = "fd00::1".parse().unwrap();
+        let link_local: Ipv6Addr = "fe80::1".parse().unwrap();
+
+        assert!(has_global_ipv6(&[gua]));
+        assert!(has_global_ipv6(&[ula, gua]));
+        assert!(!has_global_ipv6(&[ula]));
+        assert!(!has_global_ipv6(&[link_local]));
+        assert!(!has_global_ipv6(&[]));
+
+        // 2000::/3 boundaries (is_gua now relies on this range).
+        assert!(!has_global_ipv6(&["1fff::1".parse().unwrap()])); // just below
+        assert!(has_global_ipv6(&["2000::1".parse().unwrap()])); // lower edge
+        assert!(has_global_ipv6(&["3fff::1".parse().unwrap()])); // upper edge
+        assert!(!has_global_ipv6(&["4000::1".parse().unwrap()])); // just above
+    }
+
+    fn setup_firewall_config(dir: &std::path::Path, startwrt_content: &str) {
+        std::fs::write(dir.join("startwrt"), startwrt_content).unwrap();
+        std::fs::write(
+            dir.join("firewall"),
+            "\
+config zone wan
+\toption name 'wan'
+\toption input 'REJECT'
+\toption output 'ACCEPT'
+\toption forward 'REJECT'
+",
+        )
+        .unwrap();
+    }
+
+    async fn count_remote_rules(dir: &std::path::Path) -> usize {
+        let arena = Arena::new();
+        let cfgs = parse_all(dir, &arena, &["firewall"]).await.unwrap();
+        cfgs["firewall"]
+            .sections
+            .iter()
+            .filter(|s| {
+                s.get::<FirewallRule>()
+                    .ok()
+                    .map_or(false, |r| r.name.starts_with(REMOTE_RULE_PREFIX))
+            })
+            .count()
+    }
+
+    async fn get_remote_rule_families(dir: &std::path::Path) -> Vec<Option<String>> {
+        let arena = Arena::new();
+        let cfgs = parse_all(dir, &arena, &["firewall"]).await.unwrap();
+        cfgs["firewall"]
+            .sections
+            .iter()
+            .filter_map(|s| {
+                let rule = s.get::<FirewallRule>().ok()?;
+                if rule.name.starts_with(REMOTE_RULE_PREFIX) {
+                    Some(rule.family.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    async fn get_remote_rule_src_ips(dir: &std::path::Path) -> Vec<Option<String>> {
+        let arena = Arena::new();
+        let cfgs = parse_all(dir, &arena, &["firewall"]).await.unwrap();
+        cfgs["firewall"]
+            .sections
+            .iter()
+            .filter_map(|s| {
+                let rule = s.get::<FirewallRule>().ok()?;
+                if rule.name.starts_with(REMOTE_RULE_PREFIX) {
+                    Some(rule.src_ip.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_apply_always() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_firewall_config(
+            dir.path(),
+            "config preferences preferences\n\toption remote_access 'always'\n",
+        );
+
+        let arena = Arena::new();
+        let mut cfgs = parse_all(dir.path(), &arena, &["startwrt", "firewall"])
+            .await
+            .unwrap();
+        apply_remote_access_config(&mut cfgs, "always", None, &[]);
+        dump_all(dir.path(), cfgs).await.unwrap();
+
+        assert_eq!(count_remote_rules(dir.path()).await, 3);
+        // All rules should have no family restriction
+        for family in get_remote_rule_families(dir.path()).await {
+            assert_eq!(family, None);
+        }
+        // `always` is an explicit opt-in: rules stay unscoped (any source).
+        for src_ip in get_remote_rule_src_ips(dir.path()).await {
+            assert_eq!(src_ip, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_apply_never() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_firewall_config(
+            dir.path(),
+            "config preferences preferences\n\toption remote_access 'never'\n",
+        );
+
+        // First add some rules
+        let arena = Arena::new();
+        let mut cfgs = parse_all(dir.path(), &arena, &["startwrt", "firewall"])
+            .await
+            .unwrap();
+        apply_remote_access_config(&mut cfgs, "always", None, &[]);
+        dump_all(dir.path(), cfgs).await.unwrap();
+        assert_eq!(count_remote_rules(dir.path()).await, 3);
+
+        // Now apply "never" — should remove them all
+        let arena = Arena::new();
+        let mut cfgs = parse_all(dir.path(), &arena, &["startwrt", "firewall"])
+            .await
+            .unwrap();
+        apply_remote_access_config(&mut cfgs, "never", None, &[]);
+        dump_all(dir.path(), cfgs).await.unwrap();
+        assert_eq!(count_remote_rules(dir.path()).await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_apply_default_ipv4_private_ipv6_public() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_firewall_config(
+            dir.path(),
+            "config preferences preferences\n\toption remote_access 'default'\n",
+        );
+
+        let wan_ipv4: Ipv4Addr = "192.168.1.1".parse().unwrap();
+        let wan_ipv6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+
+        let arena = Arena::new();
+        let mut cfgs = parse_all(dir.path(), &arena, &["startwrt", "firewall"])
+            .await
+            .unwrap();
+        apply_remote_access_config(&mut cfgs, "default", Some(wan_ipv4), &[wan_ipv6]);
+        dump_all(dir.path(), cfgs).await.unwrap();
+
+        // Public IPv6 → no IPv6 rule. IPv4 behind NAT → one rule per RFC1918
+        // range × 3 ports = 9 rules.
+        assert_eq!(count_remote_rules(dir.path()).await, 9);
+        for family in get_remote_rule_families(dir.path()).await {
+            assert_eq!(family, Some("ipv4".to_string()));
+        }
+        let src_ips = get_remote_rule_src_ips(dir.path()).await;
+        assert!(src_ips.iter().all(|s| s.is_some()));
+        assert!(src_ips.iter().any(|s| s.as_deref() == Some("10.0.0.0/8")));
+        assert!(src_ips
+            .iter()
+            .any(|s| s.as_deref() == Some("172.16.0.0/12")));
+        assert!(src_ips
+            .iter()
+            .any(|s| s.as_deref() == Some("192.168.0.0/16")));
+    }
+
+    #[tokio::test]
+    async fn test_apply_default_both_private() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_firewall_config(
+            dir.path(),
+            "config preferences preferences\n\toption remote_access 'default'\n",
+        );
+
+        let wan_ipv4: Ipv4Addr = "10.0.0.1".parse().unwrap();
+        let wan_ipv6: Ipv6Addr = "fd00::1".parse().unwrap();
+
+        let arena = Arena::new();
+        let mut cfgs = parse_all(dir.path(), &arena, &["startwrt", "firewall"])
+            .await
+            .unwrap();
+        apply_remote_access_config(&mut cfgs, "default", Some(wan_ipv4), &[wan_ipv6]);
+        dump_all(dir.path(), cfgs).await.unwrap();
+
+        // Both private — IPv4 gets one rule per RFC1918 range, IPv6 one for the
+        // ULA supernet. (3 ranges + 1) × 3 ports = 12 rules.
+        assert_eq!(count_remote_rules(dir.path()).await, 12);
+        let families = get_remote_rule_families(dir.path()).await;
+        assert_eq!(
+            families
+                .iter()
+                .filter(|f| f.as_deref() == Some("ipv4"))
+                .count(),
+            9
+        );
+        assert_eq!(
+            families
+                .iter()
+                .filter(|f| f.as_deref() == Some("ipv6"))
+                .count(),
+            3
+        );
+        let src_ips = get_remote_rule_src_ips(dir.path()).await;
+        assert!(
+            src_ips.iter().all(|s| s.is_some()),
+            "default-mode rules must be src_ip-scoped: {src_ips:?}"
+        );
+        assert!(src_ips.iter().any(|s| s.as_deref() == Some("10.0.0.0/8")));
+        assert!(src_ips
+            .iter()
+            .any(|s| s.as_deref() == Some("172.16.0.0/12")));
+        assert!(src_ips
+            .iter()
+            .any(|s| s.as_deref() == Some("192.168.0.0/16")));
+        assert!(src_ips.iter().any(|s| s.as_deref() == Some("fc00::/7")));
+    }
+
+    #[tokio::test]
+    async fn test_apply_default_both_public() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_firewall_config(
+            dir.path(),
+            "config preferences preferences\n\toption remote_access 'default'\n",
+        );
+
+        let wan_ipv4: Ipv4Addr = "8.8.8.8".parse().unwrap();
+        let wan_ipv6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+
+        let arena = Arena::new();
+        let mut cfgs = parse_all(dir.path(), &arena, &["startwrt", "firewall"])
+            .await
+            .unwrap();
+        apply_remote_access_config(&mut cfgs, "default", Some(wan_ipv4), &[wan_ipv6]);
+        dump_all(dir.path(), cfgs).await.unwrap();
+
+        // Both public — no rules should be created
+        assert_eq!(count_remote_rules(dir.path()).await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_apply_default_no_wan() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_firewall_config(
+            dir.path(),
+            "config preferences preferences\n\toption remote_access 'default'\n",
+        );
+
+        let arena = Arena::new();
+        let mut cfgs = parse_all(dir.path(), &arena, &["startwrt", "firewall"])
+            .await
+            .unwrap();
+        apply_remote_access_config(&mut cfgs, "default", None, &[]);
+        dump_all(dir.path(), cfgs).await.unwrap();
+
+        // No WAN at all — no rules should be created
+        assert_eq!(count_remote_rules(dir.path()).await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_apply_default_ipv4_only() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_firewall_config(
+            dir.path(),
+            "config preferences preferences\n\toption remote_access 'default'\n",
+        );
+
+        let wan_ipv4: Ipv4Addr = "192.168.1.1".parse().unwrap();
+
+        let arena = Arena::new();
+        let mut cfgs = parse_all(dir.path(), &arena, &["startwrt", "firewall"])
+            .await
+            .unwrap();
+        apply_remote_access_config(&mut cfgs, "default", Some(wan_ipv4), &[]);
+        dump_all(dir.path(), cfgs).await.unwrap();
+
+        // Private IPv4, no IPv6 — one IPv4 rule per RFC1918 range × 3 ports.
+        assert_eq!(count_remote_rules(dir.path()).await, 9);
+        for family in get_remote_rule_families(dir.path()).await {
+            assert_eq!(family, Some("ipv4".to_string()));
+        }
+        let src_ips = get_remote_rule_src_ips(dir.path()).await;
+        assert!(src_ips.iter().any(|s| s.as_deref() == Some("10.0.0.0/8")));
+        assert!(src_ips
+            .iter()
+            .any(|s| s.as_deref() == Some("172.16.0.0/12")));
+        assert!(src_ips
+            .iter()
+            .any(|s| s.as_deref() == Some("192.168.0.0/16")));
+    }
+
+    #[tokio::test]
+    async fn test_apply_default_ipv6_ula_only() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_firewall_config(
+            dir.path(),
+            "config preferences preferences\n\toption remote_access 'default'\n",
+        );
+
+        let wan_ipv6: Ipv6Addr = "fd00::1".parse().unwrap();
+
+        let arena = Arena::new();
+        let mut cfgs = parse_all(dir.path(), &arena, &["startwrt", "firewall"])
+            .await
+            .unwrap();
+        apply_remote_access_config(&mut cfgs, "default", None, &[wan_ipv6]);
+        dump_all(dir.path(), cfgs).await.unwrap();
+
+        // No IPv4, ULA-only IPv6 — IPv6-only rules
+        assert_eq!(count_remote_rules(dir.path()).await, 3);
+        for family in get_remote_rule_families(dir.path()).await {
+            assert_eq!(family, Some("ipv6".to_string()));
+        }
+        // Source-scoped to ULA so a globally-routed client can never match.
+        for src_ip in get_remote_rule_src_ips(dir.path()).await {
+            assert_eq!(src_ip.as_deref(), Some("fc00::/7"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_apply_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_firewall_config(
+            dir.path(),
+            "config preferences preferences\n\toption remote_access 'always'\n",
+        );
+
+        // Apply twice
+        for _ in 0..2 {
+            let arena = Arena::new();
+            let mut cfgs = parse_all(dir.path(), &arena, &["startwrt", "firewall"])
+                .await
+                .unwrap();
+            apply_remote_access_config(&mut cfgs, "always", None, &[]);
+            dump_all(dir.path(), cfgs).await.unwrap();
+        }
+
+        // Should still have exactly 4 rules, not 8
+        assert_eq!(count_remote_rules(dir.path()).await, 3);
+    }
+
+    #[test]
+    fn delegated_prefix_len_reads_netifd_mask() {
+        let status = serde_json::json!({
+            "ipv6-prefix": [
+                { "address": "fd12:3456:789a::", "mask": 48 },
+                { "address": "2001:db8:0:100::", "mask": 64 },
+            ]
+        });
+        assert_eq!(delegated_prefix_len(&status), Some(64));
+
+        let status = serde_json::json!({
+            "ipv6-prefix": [
+                { "address": "2001:db8:0:100::", "mask": 60 },
+                { "address": "2001:db8:1::", "mask": 56 },
+            ]
+        });
+        assert_eq!(delegated_prefix_len(&status), Some(56));
+
+        let status = serde_json::json!({ "ipv6-prefix": [] });
+        assert_eq!(delegated_prefix_len(&status), None);
+        assert_eq!(delegated_prefix_len(&serde_json::json!({})), None);
+    }
+}

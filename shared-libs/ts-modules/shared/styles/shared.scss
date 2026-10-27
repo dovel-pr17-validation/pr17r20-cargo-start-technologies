@@ -1,0 +1,141 @@
+@font-face {
+  font-family: 'Hanken Grotesk';
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url('/assets/fonts/Hanken_Grotesk/hanken-grotesk-latin.woff2')
+    format('woff2');
+  unicode-range:
+    U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC,
+    U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212,
+    U+2215, U+FEFF, U+FFFD;
+}
+
+@font-face {
+  font-family: 'Hanken Grotesk';
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url('/assets/fonts/Hanken_Grotesk/hanken-grotesk-latin-ext.woff2')
+    format('woff2');
+  unicode-range:
+    U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304,
+    U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB,
+    U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+
+body {
+  user-select: text;
+}
+
+a {
+  cursor: pointer;
+  color: inherit;
+  text-decoration: none;
+}
+
+// Password managers (Bitwarden & co.) anchor their injected autofill icon to
+// the input's border-box, which spans the full textfield — landing the icon on
+// top of the field's trailing control (reveal eye, in-field button) and
+// swallowing its clicks. Trading the end padding for margin keeps the text box
+// identical while ending the input's box before that control, so injected icons
+// sit beside it instead of on top. Matching tuiPassword and not only the type
+// keeps this stable while the password is revealed, when the directive swaps
+// the input's type to text.
+tui-textfield:has(tui-icon[tuiPassword], input[type='password'])
+  input[tuiInput] {
+  padding-inline-end: 0;
+  margin-inline-end: calc(
+    var(--t-end) + var(--t-side) + var(--t-padding) + var(--t-space)
+  );
+}
+
+// Taiga 5's notification is a host directive and carries no margin of its own.
+tui-dialog :not([tuiForm]) > [tuiNotification]:not(:last-child) {
+  margin-block-end: 1rem;
+}
+
+// Global utility classes the shared @start9labs/marketplace lib relies on.
+// They live here (loaded by every host) rather than in a single app's
+// stylesheet so the lib's components render identically across the OS UI and
+// the public brochure.
+.g-title {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  text-transform: uppercase;
+  font-weight: bold;
+  font-size: 1rem;
+  line-height: 1.5rem;
+  margin: 2rem 0 1rem;
+  color: var(--tui-text-secondary);
+}
+
+.g-buttons {
+  display: flex;
+  justify-content: flex-end;
+  gap: 1rem;
+  margin-top: 1.5rem;
+}
+
+.g-positive {
+  color: var(--tui-status-positive) !important;
+}
+
+.g-warning {
+  color: var(--tui-status-warning) !important;
+}
+
+.g-negative.g-negative {
+  color: var(--tui-status-negative) !important;
+}
+
+.g-info {
+  color: var(--tui-status-info) !important;
+}
+
+.g-primary {
+  color: var(--tui-text-primary) !important;
+}
+
+.g-secondary {
+  color: var(--tui-text-secondary) !important;
+}
+
+// Body of markdown rendered through `| markdown | dompurify`. The innerHTML it
+// produces is unencapsulated, so these rules have to be global.
+.g-markdown {
+  > :first-child {
+    margin-block-start: 0;
+  }
+
+  > :last-child {
+    margin-block-end: 0;
+  }
+
+  pre {
+    padding: 0.75rem 1rem;
+    border-radius: var(--tui-radius-m);
+    background: var(--tui-background-neutral-1);
+    overflow-x: auto;
+  }
+
+  table {
+    border-collapse: collapse;
+  }
+
+  :is(td, th) {
+    border: 1px solid var(--tui-border-normal);
+    padding: 0.25rem 0.75rem;
+  }
+
+  a {
+    color: var(--tui-text-action);
+    text-decoration: underline;
+    text-decoration-color: color-mix(in lch, currentColor, transparent);
+
+    &:hover {
+      text-decoration-color: currentColor;
+    }
+  }
+}

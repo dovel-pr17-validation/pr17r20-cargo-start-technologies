@@ -1,0 +1,21 @@
+#!/bin/bash
+
+set -e
+
+if [ "$UID" -ne 0 ]; then
+    >&2 echo 'Must be run as root'
+    exit 1
+fi
+
+current_kernel=$(uname -r)
+
+cd /boot || { echo "/boot directory not found!"; exit 1; }
+
+for file in vmlinuz-* initrd.img-* System.map-* config-*; do
+    [ -e "$file" ] || continue
+    if [[ "$file" == *"$current_kernel"* ]]; then
+        continue
+    fi
+    echo "Deleting $file"
+    rm -f "$file"
+done
