@@ -20,8 +20,8 @@ name = "generate_rpc_bindings"
 required-features = ["ts"]
 
 [dependencies]
-arc-swap = "1.7"
-async_cell = "0.2.2"
+arc-swap = "1.9.3"
+async_cell = "0.2.3"
 axum = { version = "0.8.6", features = ["ws", "multipart", "http2"] }
 base64 = "0.22"
 blake3 = "1"
